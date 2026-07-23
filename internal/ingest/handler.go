@@ -205,7 +205,8 @@ func (handler *Handler) RollForward(
 		)
 		return handler.terminalOutcomeLocked(false)
 	}
-	if len(handler.pending) == 0 {
+	newBatch := len(handler.pending) == 0
+	if newBatch {
 		handler.firstStaged = handler.config.Now().UTC()
 	}
 	handler.pending = append(handler.pending, staged)
@@ -215,7 +216,9 @@ func (handler *Handler) RollForward(
 		len(handler.pending)-1,
 		staged.encodedBytes,
 	)
-	handler.armTimerLocked()
+	if newBatch {
+		handler.armTimerLocked()
+	}
 	if handler.atLimitLocked() {
 		handler.flushLocked(ctx)
 		if handler.terminalErr != nil {

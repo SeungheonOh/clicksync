@@ -119,6 +119,61 @@ func TestHandlerStagesThenFinalizesExactCommittedTail(t *testing.T) {
 	}
 }
 
+func TestPhysicalBatchTimerStaysAnchoredToFirstStagedBlock(t *testing.T) {
+	publisher := &fakePublisher{}
+	handler := newTestHandler(t, publisher)
+	first := adapterTestBlock{
+		slot:   11,
+		number: 11,
+		hash:   adapterHash(0x11),
+	}
+	second := adapterTestBlock{
+		slot:   12,
+		number: 12,
+		hash:   adapterHash(0x12),
+	}
+	if _, err := handler.RollForward(
+		context.Background(),
+		first,
+		adapterTip(first),
+		adapterEvidence(adapterTip(first)),
+	); err != nil {
+		t.Fatal(err)
+	}
+	firstTimer := handler.timer
+	if firstTimer == nil {
+		t.Fatal("first staged block did not arm physical batch timer")
+	}
+	if _, err := handler.RollForward(
+		context.Background(),
+		second,
+		adapterTip(second),
+		adapterEvidence(adapterTip(second)),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if handler.timer != firstTimer {
+		t.Fatal("later staged block reset the first-staged flush deadline")
+	}
+	if err := handler.RollbackObserved(
+		context.Background(),
+		n2n.NewChainPoint(
+			pcommon.NewPoint(first.slot, first.hash.Bytes()),
+			first.number,
+		),
+		adapterTip(second),
+	); err != nil {
+		t.Fatal(err)
+	}
+	handler.flushFromTimer()
+	if len(publisher.batches) != 0 {
+		t.Fatalf(
+			"stale timer published after rollback barrier: %#v",
+			publisher.batches,
+		)
+	}
+}
+
 func TestObservedRollbackBarrierPreventsAttemptFinalizationFromPublishingDescendants(
 	t *testing.T,
 ) {
