@@ -1,61 +1,106 @@
+name: clicksync
+
 services:
   clickhouse:
-    image: clickhouse/clickhouse-server:26.3.12.3
-    restart: unless-stopped
+    image: clickhouse/clickhouse-server@sha256:1f7cd090d5c4e2b8bfe0ea5d8ae6125937e1d932c6371b4d25fbd6088829dc9c
+    container_name: clicksync-clickhouse
+    restart: "no"
     environment:
-      CLICKHOUSE_DB: ${CLICKHOUSE_DATABASE:-clicksync}
-      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:?set CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD}
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
     ports:
-      - "${CLICKHOUSE_HTTP_BIND:-127.0.0.1}:8123:8123"
-      - "${CLICKHOUSE_NATIVE_BIND:-127.0.0.1}:9000:9000"
+      - "127.0.0.1:${CLICKHOUSE_HTTP_PORT:-18125}:8123"
     volumes:
       - clickhouse-data:/var/lib/clickhouse
       - clickhouse-logs:/var/log/clickhouse-server
+      - ./config/clickhouse-logger.xml:/etc/clickhouse-server/config.d/clicksync-logger.xml:ro
+    networks:
+      - clicksync
+    labels:
+      io.clicksync.scope: clicksync
+      io.clicksync.kind: database
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8123/ping"]
+      test: ["CMD-SHELL", "clickhouse-client --user \"$${CLICKHOUSE_USER}\" --password \"$${CLICKHOUSE_PASSWORD}\" --query 'SELECT 1'"]
       interval: 2s
       timeout: 2s
       retries: 30
-
-  # Optional sidecar for an already-running cardano-node. The directory must
-  # contain node.socket. Start with: docker compose --profile ogmios up -d
-  ogmios:
-    profiles: ["ogmios", "full"]
-    image: cardanosolutions/ogmios:v7.0.0
-    restart: unless-stopped
-    command:
-      - --node-socket
-      - /ipc/node.socket
-      - --node-config
-      - /config/${CARDANO_NETWORK:-mainnet}/cardano-node/config.json
-      - --host
-      - 0.0.0.0
-    ports:
-      - "${OGMIOS_BIND:-127.0.0.1}:1337:1337"
-    volumes:
-      - ${CARDANO_NODE_SOCKET_DIR:-./ipc}:/ipc:ro
+    cpus: 2
+    mem_limit: 3g
+    pids_limit: 2048
+    logging:
+      driver: none
 
   clicksync:
-    profiles: ["full"]
-    build: .
-    restart: "on-failure:5"
-    env_file:
-      - path: .env
-        required: false
-    environment:
-      CLICKHOUSE_URL: http://clickhouse:8123
-      OGMIOS_HOST: ogmios
-      OGMIOS_PORT: "1337"
-      OGMIOS_TLS: "false"
-      LOG_PRETTY: "false"
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: clicksync:local
+    container_name: clicksync
+    deploy:
+      replicas: 1
+    restart: "no"
+    init: true
     depends_on:
       clickhouse:
         condition: service_healthy
-      ogmios:
-        condition: service_started
+    command: ["sync"]
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_NATIVE_PORT: "9000"
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:?set CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DATABASE: clicksync
+      CARDANO_NETWORK_NAME: ${CARDANO_NETWORK_NAME:-mainnet}
+      CARDANO_NETWORK_MAGIC: ${CARDANO_NETWORK_MAGIC:-764824073}
+      CARDANO_PEERS: ${CARDANO_PEERS:-backbone.cardano.iog.io:3001,backbone.mainnet.cardanofoundation.org:3001}
+      CARDANO_CORROBORATION: ${CARDANO_CORROBORATION:-2}
+      CLICKSYNC_START: ${CLICKSYNC_START:-intersection}
+      CLICKSYNC_START_POINT: ${CLICKSYNC_START_POINT:-}
+      CLICKSYNC_MAX_BLOCKS: ${CLICKSYNC_MAX_BLOCKS:-0}
+      CLICKSYNC_STOP_AT_TIP: ${CLICKSYNC_STOP_AT_TIP:-false}
+      CLICKSYNC_QUEUE_CAPACITY: ${CLICKSYNC_QUEUE_CAPACITY:-4}
+      CLICKSYNC_LOCK_PATH: /var/lib/clicksync-state/writer.lock
+      CLICKSYNC_WRITER_COORDINATION: single-host-flock
+      CLICKSYNC_ACTIVE_DATA_LIMIT_BYTES: ${CLICKSYNC_ACTIVE_DATA_LIMIT_BYTES:-75161927680}
+      CLICKSYNC_WARNING_BYTES: ${CLICKSYNC_WARNING_BYTES:-64424509440}
+      CLICKSYNC_PROJECT_LIMIT_BYTES: ${CLICKSYNC_PROJECT_LIMIT_BYTES:-107374182400}
+    volumes:
+      - clicksync-state:/var/lib/clicksync-state
+    networks:
+      - clicksync
+    labels:
+      io.clicksync.scope: clicksync
+      io.clicksync.kind: ingestion
+    cpus: 1
+    mem_limit: 1g
+    pids_limit: 256
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: "3"
+
+networks:
+  clicksync:
+    name: clicksync
+    labels:
+      io.clicksync.scope: clicksync
 
 volumes:
   clickhouse-data:
+    name: clicksync-data
+    labels:
+      io.clicksync.scope: clicksync
+      io.clicksync.kind: data
   clickhouse-logs:
+    name: clicksync-logs
+    labels:
+      io.clicksync.scope: clicksync
+      io.clicksync.kind: logs
+  clicksync-state:
+    name: clicksync-state
+    labels:
+      io.clicksync.scope: clicksync
+      io.clicksync.kind: writer-coordination

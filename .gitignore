@@ -1,7 +1,8 @@
-node_modules/
-dist/
 .env
-coverage/
+bin/
+.cache/
 .DS_Store
 *.log
 clickhouse-data/
+clicksync-state/
+evidence.local/

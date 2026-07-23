@@ -1,0 +1,10 @@
+<clickhouse>
+    <!-- Both files live on the Clicksync-owned, footprint-counted logs volume. -->
+    <logger>
+        <level>information</level>
+        <log>/var/log/clickhouse-server/clickhouse-server.log</log>
+        <errorlog>/var/log/clickhouse-server/clickhouse-server.err.log</errorlog>
+        <size>64M</size>
+        <count>8</count>
+    </logger>
+</clickhouse>

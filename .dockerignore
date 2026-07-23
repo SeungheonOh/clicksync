@@ -1,6 +1,9 @@
-node_modules
-dist
 .git
+.env
+bin
+.cache
 clickhouse-data
-coverage
-*.log
+clicksync-state
+evidence.local
+clickout
+docs/evidence
