@@ -19,17 +19,24 @@ import (
 )
 
 type fakePublisher struct {
-	batches   []publication.Batch
-	rollbacks []publication.RollbackRequest
-	publish   func(publication.Batch) (publication.BatchResult, error)
-	rollback  func(publication.RollbackRequest) error
+	batches        []publication.Batch
+	rollbacks      []publication.RollbackRequest
+	publish        func(publication.Batch) (publication.BatchResult, error)
+	publishContext func(
+		context.Context,
+		publication.Batch,
+	) (publication.BatchResult, error)
+	rollback func(publication.RollbackRequest) error
 }
 
 func (publisher *fakePublisher) PublishBatch(
-	_ context.Context,
+	ctx context.Context,
 	batch publication.Batch,
 ) (publication.BatchResult, error) {
 	publisher.batches = append(publisher.batches, batch)
+	if publisher.publishContext != nil {
+		return publisher.publishContext(ctx, batch)
+	}
 	if publisher.publish != nil {
 		return publisher.publish(batch)
 	}
@@ -222,6 +229,220 @@ func TestExpiredPhysicalBatchTimerFlushesAfterHandlerMutexContention(t *testing.
 	if len(publisher.batches) != 1 ||
 		len(publisher.batches[0].Items) != 2 {
 		t.Fatalf("timer batches = %#v", publisher.batches)
+	}
+}
+
+func TestTimerWaitingOnMutexDefersToExhaustedSharedShutdownBudget(t *testing.T) {
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	budget, err := syncer.NewShutdownBudget(30 * time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publisher := &fakePublisher{}
+	handler := newTimerBudgetHandler(
+		t,
+		runCtx,
+		publisher,
+		budget,
+		time.Second,
+	)
+	stageTimerTestBlock(t, handler)
+
+	handler.mu.Lock()
+	if handler.timer == nil || !handler.timer.Stop() {
+		handler.mu.Unlock()
+		t.Fatal("physical batch timer was not armed")
+	}
+	timerDone := make(chan struct{})
+	go func() {
+		handler.flushFromTimer()
+		close(timerDone)
+	}()
+	cancelRun()
+	shutdownCtx, stopShutdown := budget.Context(runCtx)
+	<-shutdownCtx.Done()
+	stopShutdown()
+	handler.mu.Unlock()
+	select {
+	case <-timerDone:
+	case <-time.After(time.Second):
+		t.Fatal("timer callback remained blocked after mutex release")
+	}
+	handler.mu.Lock()
+	pending := len(handler.pending)
+	terminalErr := handler.terminalErr
+	handler.mu.Unlock()
+	if len(publisher.batches) != 0 || pending != 1 || terminalErr != nil {
+		t.Fatalf(
+			"batches=%d pending=%d terminal=%v",
+			len(publisher.batches),
+			pending,
+			terminalErr,
+		)
+	}
+}
+
+func TestTimerPublishBegunBeforeCancellationStopsAtSharedDeadline(t *testing.T) {
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	budget, err := syncer.NewShutdownBudget(30 * time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishStarted := make(chan struct{})
+	publisher := &fakePublisher{
+		publishContext: func(
+			ctx context.Context,
+			_ publication.Batch,
+		) (publication.BatchResult, error) {
+			close(publishStarted)
+			<-ctx.Done()
+			return publication.BatchResult{}, ctx.Err()
+		},
+	}
+	handler := newTimerBudgetHandler(
+		t,
+		runCtx,
+		publisher,
+		budget,
+		time.Second,
+	)
+	stageTimerTestBlock(t, handler)
+	stopTimerForManualCallback(t, handler)
+	timerDone := make(chan struct{})
+	go func() {
+		handler.flushFromTimer()
+		close(timerDone)
+	}()
+	<-publishStarted
+	signaledAt := time.Now()
+	cancelRun()
+	select {
+	case <-timerDone:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("timer publication ignored shared shutdown deadline")
+	}
+	if elapsed := time.Since(signaledAt); elapsed > 180*time.Millisecond {
+		t.Fatalf("timer publication took %s after cancellation", elapsed)
+	}
+	handler.mu.Lock()
+	terminalErr := handler.terminalErr
+	handler.mu.Unlock()
+	if !errors.Is(terminalErr, context.Canceled) {
+		t.Fatalf("timer terminal error = %v", terminalErr)
+	}
+	auditCtx, stopAudit := budget.Context(runCtx)
+	defer stopAudit()
+	if !errors.Is(auditCtx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("shared audit context remained live: %v", auditCtx.Err())
+	}
+}
+
+func TestNormalTimerPublishRetainsIndependentFlushTimeout(t *testing.T) {
+	const (
+		flushTimeout  = 20 * time.Millisecond
+		shutdownLimit = 250 * time.Millisecond
+	)
+	budget, err := syncer.NewShutdownBudget(shutdownLimit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishStarted := make(chan struct{})
+	publisher := &fakePublisher{
+		publishContext: func(
+			ctx context.Context,
+			_ publication.Batch,
+		) (publication.BatchResult, error) {
+			close(publishStarted)
+			<-ctx.Done()
+			return publication.BatchResult{}, ctx.Err()
+		},
+	}
+	handler := newTimerBudgetHandler(
+		t,
+		context.Background(),
+		publisher,
+		budget,
+		flushTimeout,
+	)
+	stageTimerTestBlock(t, handler)
+	stopTimerForManualCallback(t, handler)
+	timerDone := make(chan struct{})
+	startedAt := time.Now()
+	go func() {
+		handler.flushFromTimer()
+		close(timerDone)
+	}()
+	<-publishStarted
+	select {
+	case <-timerDone:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("normal timer ignored its independent flush timeout")
+	}
+	if elapsed := time.Since(startedAt); elapsed > 150*time.Millisecond {
+		t.Fatalf("normal timer took %s for %s timeout", elapsed, flushTimeout)
+	}
+	handler.mu.Lock()
+	terminalErr := handler.terminalErr
+	handler.mu.Unlock()
+	if !errors.Is(terminalErr, context.DeadlineExceeded) {
+		t.Fatalf("normal timer terminal error = %v", terminalErr)
+	}
+	shutdownCtx, stopShutdown := budget.Context(context.Background())
+	defer stopShutdown()
+	deadline, ok := shutdownCtx.Deadline()
+	if !ok || time.Until(deadline) < 150*time.Millisecond {
+		t.Fatalf("normal timer consumed shared shutdown budget: %v", deadline)
+	}
+}
+
+func TestNormalTimerMutexTimeoutRearmsPendingBatch(t *testing.T) {
+	budget, err := syncer.NewShutdownBudget(250 * time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publisher := &fakePublisher{}
+	handler := newTimerBudgetHandler(
+		t,
+		context.Background(),
+		publisher,
+		budget,
+		20*time.Millisecond,
+	)
+	stageTimerTestBlock(t, handler)
+	handler.mu.Lock()
+	if handler.timer == nil || !handler.timer.Stop() {
+		handler.mu.Unlock()
+		t.Fatal("physical batch timer was not armed")
+	}
+	timerDone := make(chan struct{})
+	go func() {
+		handler.flushFromTimer()
+		close(timerDone)
+	}()
+	<-time.After(40 * time.Millisecond)
+	handler.mu.Unlock()
+	select {
+	case <-timerDone:
+	case <-time.After(time.Second):
+		t.Fatal("normal timer remained blocked after mutex release")
+	}
+	handler.mu.Lock()
+	pending := len(handler.pending)
+	rearmed := handler.timer != nil
+	handler.stopTimerLocked()
+	terminalErr := handler.terminalErr
+	handler.mu.Unlock()
+	if len(publisher.batches) != 0 ||
+		pending != 1 ||
+		!rearmed ||
+		terminalErr != nil {
+		t.Fatalf(
+			"batches=%d pending=%d rearmed=%t terminal=%v",
+			len(publisher.batches),
+			pending,
+			rearmed,
+			terminalErr,
+		)
 	}
 }
 
@@ -966,6 +1187,62 @@ func TestRollbackReportsRetainedAdoptionWhenHeaderFailsPrecommit(t *testing.T) {
 
 func newTestHandler(t *testing.T, publisher *fakePublisher) *Handler {
 	return newTestHandlerWithState(t, publisher, &fakeChainState{})
+}
+
+func newTimerBudgetHandler(
+	t *testing.T,
+	runCtx context.Context,
+	publisher *fakePublisher,
+	budget *syncer.ShutdownBudget,
+	flushTimeout time.Duration,
+) *Handler {
+	t.Helper()
+	handler, err := NewHandler(
+		runCtx,
+		publisher,
+		&fakeChainState{},
+		HandlerConfig{
+			NetworkMagic:          n2n.MainnetNetworkMagic,
+			RollbackMaximumDepth:  100,
+			RollbackCorroboration: 2,
+			FlushAfter:            500 * time.Millisecond,
+			FlushTimeout:          flushTimeout,
+			ShutdownBudget:        budget,
+			Now:                   time.Now,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Keep the real timer out of deterministic manual-callback tests.
+	handler.config.FlushAfter = 10 * time.Second
+	return handler
+}
+
+func stageTimerTestBlock(t *testing.T, handler *Handler) {
+	t.Helper()
+	block := adapterTestBlock{
+		slot:   11,
+		number: 11,
+		hash:   adapterHash(0x11),
+	}
+	if _, err := handler.RollForward(
+		context.Background(),
+		block,
+		adapterTip(block),
+		adapterEvidence(adapterTip(block)),
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func stopTimerForManualCallback(t *testing.T, handler *Handler) {
+	t.Helper()
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	if handler.timer == nil || !handler.timer.Stop() {
+		t.Fatal("physical batch timer was not armed")
+	}
 }
 
 func newTestHandlerWithState(

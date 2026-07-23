@@ -44,6 +44,7 @@ type HandlerConfig struct {
 	RollbackCorroboration int
 	FlushAfter            time.Duration
 	FlushTimeout          time.Duration
+	ShutdownBudget        *syncer.ShutdownBudget
 	Now                   func() time.Time
 	Cancel                context.CancelCauseFunc
 }
@@ -593,6 +594,22 @@ func (handler *Handler) stopTimerLocked() {
 }
 
 func (handler *Handler) flushFromTimer() {
+	var (
+		ctx    context.Context
+		cancel context.CancelFunc
+	)
+	if handler.config.ShutdownBudget != nil {
+		ctx, cancel = handler.config.ShutdownBudget.FinalizeContext(
+			handler.runCtx,
+			handler.config.FlushTimeout,
+		)
+	} else {
+		ctx, cancel = context.WithTimeout(
+			context.WithoutCancel(handler.runCtx),
+			handler.config.FlushTimeout,
+		)
+	}
+	defer cancel()
 	handler.mu.Lock()
 	defer handler.mu.Unlock()
 	handler.timer = nil
@@ -601,11 +618,19 @@ func (handler *Handler) flushFromTimer() {
 		len(handler.pending) == 0 {
 		return
 	}
-	ctx, cancel := context.WithTimeout(
-		context.WithoutCancel(handler.runCtx),
-		handler.config.FlushTimeout,
-	)
-	defer cancel()
+	// Once shutdown wins while waiting for the mutex, EndAttempt owns the
+	// pending final flush. The context was created before locking so a later
+	// cancellation cannot open a fresh independent window here.
+	if handler.runCtx.Err() != nil {
+		return
+	}
+	// Normal mutex contention may consume this callback's independent timeout;
+	// retry from the same pending batch rather than stranding it without a
+	// timer.
+	if ctx.Err() != nil {
+		handler.armTimerLocked()
+		return
+	}
 	handler.flushLocked(ctx)
 }
 

@@ -11,6 +11,7 @@ import (
 	pcommon "github.com/blinklabs-io/gouroboros/protocol/common"
 
 	"clicksync/internal/n2n"
+	"clicksync/internal/publication"
 	"clicksync/internal/syncer"
 )
 
@@ -99,6 +100,49 @@ func TestWriterAuditIsAttemptedAfterFinalizerExhaustsShutdownBudget(t *testing.T
 	}
 	if elapsed := time.Since(started); elapsed > timeout+150*time.Millisecond {
 		t.Fatalf("aggregate shutdown took %s for %s budget", elapsed, timeout)
+	}
+}
+
+func TestProductionCheckpointCadenceBoundsFullBatchCrossing(t *testing.T) {
+	if checkpointEveryBlocks != 512 {
+		t.Fatalf("production checkpoint cadence = %d, want 512", checkpointEveryBlocks)
+	}
+	if publication.MaxBatchBlocks != 256 {
+		t.Fatalf(
+			"physical batch maximum = %d; re-audit checkpoint exposure",
+			publication.MaxBatchBlocks,
+		)
+	}
+	calculated := checkpointEveryBlocks +
+		uint64(publication.MaxBatchBlocks) - 1
+	if checkpointMaximumGap != calculated {
+		t.Fatalf(
+			"maximum checkpoint gap %d differs from calculated %d",
+			checkpointMaximumGap,
+			calculated,
+		)
+	}
+	if checkpointMaximumGap != 767 ||
+		checkpointMaximumGap >= checkpointSafetyBound ||
+		checkpointSafetyMargin != 232 {
+		t.Fatalf(
+			"maximum checkpoint gap = %d, cadence=%d batch=%d bound=%d margin=%d",
+			checkpointMaximumGap,
+			checkpointEveryBlocks,
+			publication.MaxBatchBlocks,
+			checkpointSafetyBound,
+			checkpointSafetyMargin,
+		)
+	}
+	before := checkpointEveryBlocks - 1
+	after := before + uint64(publication.MaxBatchBlocks)
+	if before != 511 || after != 767 ||
+		before/checkpointEveryBlocks == after/checkpointEveryBlocks {
+		t.Fatalf(
+			"full boundary-crossing batch did not trigger checkpoint: %d -> %d",
+			before,
+			after,
+		)
 	}
 }
 

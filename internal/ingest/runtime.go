@@ -25,6 +25,15 @@ const (
 	rollbackMaximumDepth = uint32(2160)
 	writerHeartbeatEvery = 30 * time.Second
 	shutdownTimeout      = 45 * time.Second
+	// A checkpoint is corroborated at the first committed batch crossing each
+	// 512-block bucket. With a 256-block physical batch, the latest possible
+	// crossing is 512 + 256 - 1 = 767 committed blocks after the prior bucket.
+	checkpointEveryBlocks uint64 = 512
+	checkpointMaximumGap  uint64 = checkpointEveryBlocks +
+		uint64(publication.MaxBatchBlocks) - 1
+	checkpointSafetyBound  uint64 = 1000
+	checkpointSafetyMargin uint64 = checkpointSafetyBound - 1 -
+		checkpointMaximumGap
 )
 
 func RunSync(
@@ -209,6 +218,7 @@ func RunSync(
 		RollbackCorroboration: cfg.Corroboration,
 		FlushAfter:            defaultFlushAfter,
 		FlushTimeout:          shutdownTimeout,
+		ShutdownBudget:        shutdownBudget,
 		Now:                   time.Now,
 		Cancel:                cancelRun,
 	})
@@ -226,7 +236,7 @@ func RunSync(
 		InitialBackoff:        time.Second,
 		MaxBackoff:            30 * time.Second,
 		RollbackConfirmations: cfg.Corroboration,
-		CheckpointEveryBlocks: 1000,
+		CheckpointEveryBlocks: checkpointEveryBlocks,
 		FinalizeTimeout:       shutdownTimeout,
 		ShutdownBudget:        shutdownBudget,
 	}, db, handler, observer, transport)
