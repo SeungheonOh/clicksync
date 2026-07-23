@@ -1,6 +1,7 @@
 package clickhouse
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -10,6 +11,7 @@ import (
 	"fmt"
 
 	"github.com/clicksync-project/clickout/internal/cursor"
+	"github.com/clicksync-project/clickout/internal/limits"
 	"github.com/clicksync-project/clickout/internal/model"
 	"github.com/clicksync-project/clickout/internal/repository"
 )
@@ -61,8 +63,8 @@ func (store *Store) Address(
 	if query.State != "current" && query.State != "history" {
 		return model.AddressPage{}, nil, errors.New("address state must be current or history")
 	}
-	if query.Limit == 0 {
-		return model.AddressPage{}, nil, errors.New("address limit cannot be zero")
+	if err := limits.ValidatePage(query.Limit); err != nil {
+		return model.AddressPage{}, nil, err
 	}
 	var (
 		key       addressKey
@@ -113,6 +115,16 @@ func (store *Store) Address(
 	if err := rows.Err(); err != nil {
 		return model.AddressPage{}, nil, err
 	}
+	outputs := make([]model.Output, len(items))
+	for index := range items {
+		outputs[index] = items[index].state.Output
+	}
+	if err := store.hydrateInlineDatums(ctx, outputs); err != nil {
+		return model.AddressPage{}, nil, err
+	}
+	for index := range items {
+		items[index].state.Output = outputs[index]
+	}
 
 	truncated := len(items) > int(query.Limit)
 	if truncated {
@@ -139,7 +151,7 @@ func (store *Store) Address(
 		}
 	}
 	page := model.AddressPage{
-		Address: model.Bytes(query.Address),
+		Address: model.Bytes(bytes.Clone(query.Address)),
 		State:   query.State,
 		Items:   make([]model.OutputState, len(items)),
 	}
@@ -169,20 +181,8 @@ func addressSQL(
 	key addressKey,
 	hasCursor bool,
 ) (string, []any, error) {
-	currentFilter := ""
-	if query.State == "current" {
-		currentFilter = `
-  AND (o.tx_hash, o.output_index) NOT IN
-      (
-          SELECT i.source_tx_hash, i.source_output_index
-          FROM inputs AS i
-          INNER JOIN active_publications AS spent_ap
-              ON i.publication_id = spent_ap.publication_id
-          WHERE i.is_consumed
-      )`
-	}
 	cursorFilter := ""
-	arguments := activeArguments(snapshot, string(query.Address))
+	candidateArguments := []any{string(query.Address), string(query.Address)}
 	if hasCursor {
 		hash, err := model.ParseHash32(key.TxHash)
 		if err != nil {
@@ -190,22 +190,141 @@ func addressSQL(
 		}
 		cursorFilter = `
   AND (o.block_number, o.tx_hash, o.output_index, o.publication_id) > (?, ?, ?, ?)`
-		arguments = append(
-			arguments,
+		candidateArguments = append(
+			candidateArguments,
 			key.BlockNumber,
 			hashArgument(hash),
 			key.OutputIndex,
 			key.PublicationID,
 		)
 	}
+	arguments := activeArguments(snapshot, candidateArguments...)
 	arguments = append(arguments, uint64(query.Limit)+1)
-	sql := activePublicationsCTE + `
+	candidate := `
+        SELECT *
+        FROM outputs
+        WHERE address_hash = sipHash64(?)
+          AND address = ?
+          AND publication_id <= publication_watermark` + cursorFilter
+	if query.State == "history" {
+		sql := targetedFactSQL(candidate, `
+SELECT`+outputColumns+`,
+    o.publication_id
+FROM fact_candidates AS o
+INNER JOIN active_candidate_publications AS ap
+    ON o.publication_id = ap.publication_id
+INNER JOIN blocks AS b ON o.publication_id = b.publication_id
+ORDER BY o.block_number, o.tx_hash, o.output_index, o.publication_id
+LIMIT ?`)
+		return sql, arguments, nil
+	}
+	// Current-address lookup still starts with the address projection. Only
+	// inputs whose source ref occurs in that candidate set are considered, and
+	// membership is evaluated for the union of those two bounded fact sets.
+	sql := `
+WITH
+    toUInt64(?) AS snapshot_event,
+    toUInt64(?) AS publication_watermark,
+    output_candidates AS
+    (
+` + candidate + `
+    ),
+    input_candidates AS
+    (
+        SELECT i.*
+        FROM inputs AS i
+        INNER JOIN
+        (
+            SELECT DISTINCT tx_hash, output_index
+            FROM output_candidates
+        ) AS refs
+            ON i.source_tx_hash = refs.tx_hash
+           AND i.source_output_index = refs.output_index
+        WHERE i.is_consumed
+          AND i.publication_id <= publication_watermark
+    ),
+    candidate_publications AS
+    (
+        SELECT publication_id FROM output_candidates
+        UNION DISTINCT
+        SELECT publication_id FROM input_candidates
+    ),
+    candidate_blocks AS
+    (
+        SELECT publication_id, block_hash
+        FROM blocks
+        WHERE publication_id IN
+            (SELECT publication_id FROM candidate_publications)
+          AND publication_id <= publication_watermark
+    ),
+    candidate_invalidations AS
+    (
+        SELECT
+            ce.publication_id,
+            ce.event_seq,
+            ce.active,
+            assumeNotNull(ce.rollback_id) AS rollback_id
+        FROM chain_events AS ce
+        WHERE ce.publication_id IN
+            (SELECT publication_id FROM candidate_publications)
+          AND ce.event_seq <= snapshot_event
+          AND ce.event_kind = 'invalidation'
+    ),
+    candidate_rollback_headers AS
+    (
+        SELECT rb.rollback_id, rb.event_seq
+        FROM rollbacks AS rb
+        WHERE (rb.rollback_id, rb.event_seq) IN
+        (
+            SELECT rollback_id, event_seq
+            FROM candidate_invalidations
+        )
+    ),
+    committed_candidate_membership AS
+    (
+        SELECT ce.publication_id, ce.event_seq, ce.active
+        FROM chain_events AS ce
+        WHERE ce.publication_id IN
+            (SELECT publication_id FROM candidate_publications)
+          AND ce.event_seq <= snapshot_event
+          AND ce.event_kind = 'adoption'
+
+        UNION ALL
+
+        SELECT ci.publication_id, ci.event_seq, ci.active
+        FROM candidate_rollback_headers AS rb
+        INNER JOIN candidate_invalidations AS ci
+            ON rb.rollback_id = ci.rollback_id
+           AND rb.event_seq = ci.event_seq
+    ),
+    active_candidate_publications AS
+    (
+        SELECT publication_id
+        FROM committed_candidate_membership
+        GROUP BY publication_id
+        HAVING argMax(active, event_seq) = 1
+    ),
+    active_outputs AS
+    (
+        SELECT o.*
+        FROM output_candidates AS o
+        INNER JOIN active_candidate_publications AS ap
+            ON o.publication_id = ap.publication_id
+    ),
+    active_spends AS
+    (
+        SELECT i.*
+        FROM input_candidates AS i
+        INNER JOIN active_candidate_publications AS ap
+            ON i.publication_id = ap.publication_id
+    )
 SELECT` + outputColumns + `,
     o.publication_id
-FROM outputs AS o
-INNER JOIN active_publications AS ap ON o.publication_id = ap.publication_id
-INNER JOIN blocks AS b ON o.publication_id = b.publication_id
-WHERE o.address = ?` + currentFilter + cursorFilter + `
+FROM active_outputs AS o
+LEFT ANTI JOIN active_spends AS i
+    ON i.source_tx_hash = o.tx_hash
+   AND i.source_output_index = o.output_index
+INNER JOIN candidate_blocks AS b ON o.publication_id = b.publication_id
 ORDER BY o.block_number, o.tx_hash, o.output_index, o.publication_id
 LIMIT ?`
 	return sql, arguments, nil
@@ -221,12 +340,17 @@ func (store *Store) spendersByRefs(
 		return result, nil
 	}
 	predicate, values := tuplePredicate("i.source_tx_hash", "i.source_output_index", refs)
-	sql := activePublicationsCTE + `
+	sql := targetedFactSQL(`
+        SELECT *
+        FROM inputs AS i
+        WHERE i.is_consumed
+          AND `+predicate+`
+          AND i.publication_id <= publication_watermark
+`, `
 SELECT DISTINCT i.source_tx_hash, i.source_output_index, i.tx_hash
-FROM inputs AS i
-INNER JOIN active_publications AS ap ON i.publication_id = ap.publication_id
-WHERE i.is_consumed
-  AND ` + predicate
+FROM fact_candidates AS i
+INNER JOIN active_candidate_publications AS ap
+    ON i.publication_id = ap.publication_id`)
 	queryCtx, finish := store.instrument(ctx, "address_spends")
 	defer finish()
 	rows, err := store.conn.Query(queryCtx, sql, activeArguments(snapshot, values...)...)

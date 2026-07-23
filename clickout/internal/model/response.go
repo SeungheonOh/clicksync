@@ -8,13 +8,17 @@ const (
 )
 
 type Snapshot struct {
-	Event           uint64 `json:"event"`
-	CompleteHistory bool   `json:"complete_history"`
-	TrustMode       string `json:"trust_mode"`
+	Event                uint64 `json:"event"`
+	PublicationWatermark uint64 `json:"publication_watermark"`
+	CompleteHistory      bool   `json:"complete_history"`
+	TrustMode            string `json:"trust_mode"`
 }
 
 func (snapshot Snapshot) Valid() bool {
 	if snapshot.TrustMode != TrustPeerObserved {
+		return false
+	}
+	if snapshot.Event == 0 && snapshot.PublicationWatermark != 0 {
 		return false
 	}
 	// Origin before the first committed adoption/rollback is event zero.

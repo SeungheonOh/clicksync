@@ -74,6 +74,11 @@ CREATE TABLE IF NOT EXISTS clicksync.blocks
     observed_at DateTime64(6, 'UTC'),
     inserted_at DateTime64(6, 'UTC'),
     INDEX publication_idx publication_id TYPE minmax GRANULARITY 1,
+    PROJECTION blocks_by_publication
+    (
+        SELECT publication_id, block_hash, _part_offset
+        ORDER BY publication_id
+    ),
     CONSTRAINT blocks_structural_verification CHECK synthetic OR (body_hash_verified AND transaction_hashes_verified)
 )
 ENGINE = MergeTree
@@ -93,10 +98,10 @@ CREATE TABLE IF NOT EXISTS clicksync.chain_events
     is_byron_ebb Bool,
     writer_id UUID,
     recorded_at DateTime64(6, 'UTC'),
-    PROJECTION by_event_seq
+    PROJECTION chain_events_by_publication
     (
-        SELECT event_seq, event_kind, publication_id, active, rollback_id, is_byron_ebb
-        ORDER BY (event_seq, event_kind, publication_id)
+        SELECT publication_id, event_seq, event_kind, active, rollback_id, is_byron_ebb, _part_offset
+        ORDER BY (publication_id, event_seq)
     ),
     CONSTRAINT chain_events_kind CHECK
         (event_kind = 'adoption' AND active AND isNull(rollback_id))
@@ -105,7 +110,7 @@ CREATE TABLE IF NOT EXISTS clicksync.chain_events
 )
 ENGINE = MergeTree
 PARTITION BY intDiv(event_seq, 1000000)
-ORDER BY (publication_id, event_seq);
+ORDER BY (event_kind, event_seq, publication_id);
 
 CREATE TABLE IF NOT EXISTS clicksync.rollbacks
 (
@@ -128,6 +133,11 @@ CREATE TABLE IF NOT EXISTS clicksync.rollbacks
     agreement_group Nullable(UUID),
     writer_id UUID,
     recorded_at DateTime64(6, 'UTC'),
+    PROJECTION rollbacks_by_id
+    (
+        SELECT rollback_id, event_seq, _part_offset
+        ORDER BY (rollback_id, event_seq)
+    ),
     CONSTRAINT rollbacks_point CHECK
         (rollback_to_origin AND isNull(rollback_to_slot) AND isNull(rollback_to_hash) AND isNull(rollback_to_block_number) AND NOT rollback_to_is_byron_ebb)
         OR
@@ -234,6 +244,11 @@ CREATE TABLE IF NOT EXISTS clicksync.outputs
     (
         SELECT address_hash, _part_offset
         ORDER BY address_hash
+    ),
+    PROJECTION outputs_by_payment_credential
+    (
+        SELECT payment_credential_kind, payment_credential_hash, _part_offset
+        ORDER BY (payment_credential_kind, payment_credential_hash)
     ),
     CONSTRAINT outputs_asset_arrays CHECK
         length(asset_policy_ids) = length(asset_names)

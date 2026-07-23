@@ -25,7 +25,7 @@ func TestRequiredCommandsParse(t *testing.T) {
 		{"withdrawals", hash},
 		{"trace", "--direction", "forward", "--utxo", hash + "#2"},
 		{"trace", "--direction", "reverse", "--tx", hash, "--asset", policy + "."},
-		{"trace", "--direction", "forward", "--address", "addr1...", "--max-depth", "32", "--max-nodes", "100000"},
+		{"trace", "--direction", "forward", "--address", "addr1...", "--max-depth", "32", "--max-nodes", "100000", "--max-edges", "100000"},
 	}
 	for _, args := range tests {
 		args := args
@@ -49,7 +49,8 @@ func TestTraceDefaultsAndExclusiveSeed(t *testing.T) {
 	}
 	if invocation.Trace.Direction != repository.Forward ||
 		invocation.Trace.Limits.MaxDepth != limits.DefaultTraceDepth ||
-		invocation.Trace.Limits.MaxNodes != limits.DefaultTraceNodes {
+		invocation.Trace.Limits.MaxNodes != limits.DefaultTraceNodes ||
+		invocation.Trace.Limits.MaxEdges != limits.DefaultTraceEdges {
 		t.Fatalf("unexpected invocation: %#v", invocation)
 	}
 	if _, err := Parse([]string{
@@ -65,6 +66,7 @@ func TestHardBoundsAndRequiredAddressState(t *testing.T) {
 	for _, args := range [][]string{
 		{"trace", "--direction", "forward", "--utxo", hash + "#0", "--max-depth", "33"},
 		{"trace", "--direction", "forward", "--utxo", hash + "#0", "--max-nodes", "100001"},
+		{"trace", "--direction", "forward", "--utxo", hash + "#0", "--max-edges", "100001"},
 		{"address", "addr1...", "--state", "current", "--limit", "10001"},
 		{"address", "addr1..."},
 	} {

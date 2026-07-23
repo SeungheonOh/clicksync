@@ -117,6 +117,9 @@ func Open(config Config) (*Store, error) {
 		Compression: &ch.Compression{
 			Method: ch.CompressionLZ4,
 		},
+		Settings: ch.Settings{
+			"min_table_rows_to_use_projection_index": 0,
+		},
 	})
 	if err != nil {
 		return nil, err
@@ -172,15 +175,29 @@ func (store *Store) instrument(parent context.Context, name string) (context.Con
 func (store *Store) Snapshot(ctx context.Context, point model.AtPoint) (model.Snapshot, error) {
 	var event uint64
 	var count uint64
+	var publicationWatermark uint64
 	queryCtx, finish := store.instrument(ctx, "snapshot_event")
 	if point.Tip {
-		err := store.conn.QueryRow(queryCtx, snapshotTipSQL).Scan(&event)
+		err := store.conn.QueryRow(queryCtx, snapshotTipSQL).Scan(
+			&event,
+			&publicationWatermark,
+			&count,
+		)
 		finish()
 		if err != nil {
 			return model.Snapshot{}, err
 		}
+		if event != 0 && count != 1 {
+			return model.Snapshot{}, ErrInvalidDataset
+		}
 	} else if point.BlockHash != nil {
-		err := store.conn.QueryRow(queryCtx, snapshotAtBlockSQL, hashArgument(*point.BlockHash)).Scan(&count, &event)
+		var tip uint64
+		var commitCount uint64
+		err := store.conn.QueryRow(
+			queryCtx,
+			snapshotAtBlockSQL,
+			hashArgument(*point.BlockHash),
+		).Scan(&count, &event, &publicationWatermark, &tip, &commitCount)
 		finish()
 		if err != nil {
 			return model.Snapshot{}, err
@@ -188,17 +205,34 @@ func (store *Store) Snapshot(ctx context.Context, point model.AtPoint) (model.Sn
 		if count == 0 {
 			return model.Snapshot{}, ErrNotFound
 		}
+		if event > tip {
+			return model.Snapshot{}, ErrNotFound
+		}
+		if event != 0 && commitCount != 1 {
+			return model.Snapshot{}, ErrInvalidDataset
+		}
 	} else if point.Event != nil {
+		finish()
+		event = *point.Event
 		var tip uint64
-		err := store.conn.QueryRow(queryCtx, snapshotPinnedSQL, *point.Event).Scan(&tip, &count)
+		queryCtx, finish = store.instrument(ctx, "snapshot_watermark")
+		err := store.conn.QueryRow(
+			queryCtx,
+			snapshotPinnedSQL,
+			event,
+			event,
+			event,
+		).Scan(&tip, &count, &publicationWatermark)
 		finish()
 		if err != nil {
 			return model.Snapshot{}, err
 		}
-		if *point.Event > tip || (*point.Event != 0 && count == 0) {
+		if event > tip || (event != 0 && count == 0) {
 			return model.Snapshot{}, ErrNotFound
 		}
-		event = *point.Event
+		if event != 0 && count != 1 {
+			return model.Snapshot{}, ErrInvalidDataset
+		}
 	} else {
 		finish()
 		return model.Snapshot{}, errors.New("snapshot point must be tip or a block hash")
@@ -214,9 +248,10 @@ func (store *Store) Snapshot(ctx context.Context, point model.AtPoint) (model.Sn
 		return model.Snapshot{}, err
 	}
 	snapshot := model.Snapshot{
-		Event:           event,
-		CompleteHistory: complete,
-		TrustMode:       trust,
+		Event:                event,
+		PublicationWatermark: publicationWatermark,
+		CompleteHistory:      complete,
+		TrustMode:            trust,
 	}
 	if manifestRows == 0 || !snapshot.Valid() {
 		return model.Snapshot{}, ErrInvalidDataset

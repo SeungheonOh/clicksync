@@ -1,6 +1,7 @@
 package clickhouse
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"sort"
@@ -82,13 +83,18 @@ func (store *Store) ExpandForward(
 		return []model.FlowHyperedge{}, nil, nil
 	}
 	predicate, values := tuplePredicate("i.source_tx_hash", "i.source_output_index", sources)
-	sql := activePublicationsCTE + `
+	sql := targetedFactSQL(`
+        SELECT *
+        FROM inputs AS i
+        WHERE i.is_consumed
+          AND `+predicate+`
+          AND i.publication_id <= publication_watermark
+`, `
 SELECT DISTINCT i.tx_hash
-FROM inputs AS i
-INNER JOIN active_publications AS ap ON i.publication_id = ap.publication_id
-WHERE i.is_consumed
-  AND ` + predicate + `
-ORDER BY i.tx_hash`
+FROM fact_candidates AS i
+INNER JOIN active_candidate_publications AS ap
+    ON i.publication_id = ap.publication_id
+ORDER BY i.tx_hash`)
 	queryCtx, finish := store.instrument(ctx, "trace_forward_spends")
 	rows, err := store.conn.Query(queryCtx, sql, activeArguments(snapshot, values...)...)
 	if err != nil {
@@ -141,7 +147,12 @@ func (store *Store) hyperedgesByTx(
 		return []model.FlowHyperedge{}, nil, nil
 	}
 	predicate, values := hashPredicate("t.tx_hash", hashes)
-	headerSQL := activePublicationsCTE + `
+	headerSQL := targetedFactSQL(`
+        SELECT *
+        FROM transactions AS t
+        WHERE `+predicate+`
+          AND t.publication_id <= publication_watermark
+`, `
 SELECT
     t.tx_hash,
     t.effective_fee_lovelace,
@@ -149,10 +160,10 @@ SELECT
     t.mint_policy_ids,
     t.mint_asset_names,
     t.mint_quantities
-FROM transactions AS t
-INNER JOIN active_publications AS ap ON t.publication_id = ap.publication_id
-WHERE ` + predicate + `
-ORDER BY t.tx_hash`
+FROM fact_candidates AS t
+INNER JOIN active_candidate_publications AS ap
+    ON t.publication_id = ap.publication_id
+ORDER BY t.tx_hash`)
 	queryCtx, finish := store.instrument(ctx, "trace_transactions")
 	rows, err := store.conn.Query(queryCtx, headerSQL, activeArguments(snapshot, values...)...)
 	if err != nil {
@@ -190,6 +201,7 @@ ORDER BY t.tx_hash`
 		}
 		edge := &model.FlowHyperedge{
 			Transaction:         tx,
+			Inputs:              make([]model.Spend, 0),
 			ConsumedInputs:      make([]model.UTxORef, 0),
 			ConsumedInputValues: make([]model.Output, 0),
 			ProducedOutputs:     make([]model.Output, 0),
@@ -219,13 +231,27 @@ ORDER BY t.tx_hash`
 	}
 
 	hashPredicateSQL, hashValues := hashPredicate("i.tx_hash", hashes)
-	inputSQL := activePublicationsCTE + `
-SELECT i.source_tx_hash, i.source_output_index, i.tx_hash, i.source_is_resolved
-FROM inputs AS i
-INNER JOIN active_publications AS ap ON i.publication_id = ap.publication_id
-WHERE i.is_consumed
-  AND ` + hashPredicateSQL + `
-ORDER BY i.tx_hash, i.body_ordinal`
+	inputSQL := targetedFactSQL(`
+        SELECT *
+        FROM inputs AS i
+        WHERE `+hashPredicateSQL+`
+          AND i.publication_id <= publication_watermark
+`, `
+SELECT
+    i.source_tx_hash,
+    i.source_output_index,
+    i.tx_hash,
+    b.block_hash,
+    i.block_number,
+    i.role,
+    i.body_ordinal,
+    i.is_consumed,
+    i.source_is_resolved
+FROM fact_candidates AS i
+INNER JOIN active_candidate_publications AS ap
+    ON i.publication_id = ap.publication_id
+INNER JOIN candidate_blocks AS b ON i.publication_id = b.publication_id
+ORDER BY i.tx_hash, i.body_ordinal`)
 	queryCtx, finish = store.instrument(ctx, "trace_consumed_inputs")
 	rows, err = store.conn.Query(queryCtx, inputSQL, activeArguments(snapshot, hashValues...)...)
 	if err != nil {
@@ -234,46 +260,31 @@ ORDER BY i.tx_hash, i.body_ordinal`
 	}
 	boundaries := make([]model.PartialHistoryBoundary, 0)
 	resolvedRefs := make([]model.UTxORef, 0)
-	edgeByInput := make(map[string]*model.FlowHyperedge)
+	type inputLocation struct {
+		edge  *model.FlowHyperedge
+		index int
+	}
+	locations := make(map[string][]inputLocation)
 	for rows.Next() {
-		var sourceHash, txHash []byte
-		var sourceIndex uint32
-		var resolved bool
-		if err := rows.Scan(&sourceHash, &sourceIndex, &txHash, &resolved); err != nil {
-			rows.Close()
-			finish()
-			return nil, nil, err
-		}
-		source, err := model.Hash32FromBytes(sourceHash)
+		input, err := scanSpend(rows)
 		if err != nil {
 			rows.Close()
 			finish()
 			return nil, nil, err
 		}
-		tx, err := model.Hash32FromBytes(txHash)
-		if err != nil {
-			rows.Close()
-			finish()
-			return nil, nil, err
-		}
-		ref := model.UTxORef{TxHash: source, Index: sourceIndex}
-		edge := edges[tx.String()]
+		edge := edges[input.ConsumingTx.String()]
 		if edge == nil {
 			rows.Close()
 			finish()
-			return nil, nil, errors.New("consumed input has no active transaction")
+			return nil, nil, errors.New("input has no active transaction")
 		}
-		edge.ConsumedInputs = append(edge.ConsumedInputs, ref)
-		if existing := edgeByInput[ref.String()]; existing != nil && existing != edge {
-			rows.Close()
-			finish()
-			return nil, nil, ErrConflictingRow
+		edge.Inputs = append(edge.Inputs, input)
+		location := inputLocation{edge: edge, index: len(edge.Inputs) - 1}
+		locations[input.Source.String()] = append(locations[input.Source.String()], location)
+		if input.IsConsumed {
+			edge.ConsumedInputs = append(edge.ConsumedInputs, input.Source)
 		}
-		edgeByInput[ref.String()] = edge
-		// This persisted bit is an assertion/cache. Lookup remains authoritative
-		// so older rows that left it false can still resolve.
-		_ = resolved
-		resolvedRefs = append(resolvedRefs, ref)
+		resolvedRefs = append(resolvedRefs, input.Source)
 	}
 	err = rows.Err()
 	rows.Close()
@@ -282,27 +293,43 @@ ORDER BY i.tx_hash, i.body_ordinal`
 		return nil, nil, err
 	}
 
+	resolvedRefs = uniqueRefs(resolvedRefs)
 	inputValues, valueBoundaries, err := store.outputsByRefs(ctx, snapshot, resolvedRefs)
 	if err != nil {
 		return nil, nil, err
 	}
 	boundaries = append(boundaries, valueBoundaries...)
 	for _, output := range inputValues {
-		edge := edgeByInput[output.Ref.String()]
-		if edge == nil {
-			return nil, nil, errors.New("resolved source output has no consuming hyperedge")
+		inputLocations := locations[output.Ref.String()]
+		if len(inputLocations) == 0 {
+			return nil, nil, errors.New("resolved source output has no input")
 		}
-		edge.ConsumedInputValues = append(edge.ConsumedInputValues, output)
+		for _, location := range inputLocations {
+			source := output
+			location.edge.Inputs[location.index].SourceResolved = true
+			location.edge.Inputs[location.index].SourceOutput = &source
+			if location.edge.Inputs[location.index].IsConsumed {
+				location.edge.ConsumedInputValues = append(
+					location.edge.ConsumedInputValues,
+					output,
+				)
+			}
+		}
 	}
 
 	outputPredicateSQL, outputValues := hashPredicate("o.tx_hash", hashes)
-	outputSQL := activePublicationsCTE + `
-SELECT` + outputColumns + `
-FROM outputs AS o
-INNER JOIN active_publications AS ap ON o.publication_id = ap.publication_id
-INNER JOIN blocks AS b ON o.publication_id = b.publication_id
-WHERE ` + outputPredicateSQL + `
-ORDER BY o.tx_hash, o.body_ordinal`
+	outputSQL := targetedFactSQL(`
+        SELECT *
+        FROM outputs AS o
+        WHERE `+outputPredicateSQL+`
+          AND o.publication_id <= publication_watermark
+`, `
+SELECT`+outputColumns+`
+FROM fact_candidates AS o
+INNER JOIN active_candidate_publications AS ap
+    ON o.publication_id = ap.publication_id
+INNER JOIN candidate_blocks AS b ON o.publication_id = b.publication_id
+ORDER BY o.tx_hash, o.body_ordinal`)
 	queryCtx, finish = store.instrument(ctx, "trace_produced_outputs")
 	rows, err = store.conn.Query(queryCtx, outputSQL, activeArguments(snapshot, outputValues...)...)
 	if err != nil {
@@ -330,15 +357,40 @@ ORDER BY o.tx_hash, o.body_ordinal`
 	if err != nil {
 		return nil, nil, err
 	}
+	produced := make([]model.Output, 0)
+	for _, edge := range edges {
+		produced = append(produced, edge.ProducedOutputs...)
+	}
+	if err := store.hydrateInlineDatums(ctx, produced); err != nil {
+		return nil, nil, err
+	}
+	for _, edge := range edges {
+		edge.ProducedOutputs = edge.ProducedOutputs[:0]
+	}
+	for _, output := range produced {
+		edge := edges[output.ProducingTx.String()]
+		edge.ProducedOutputs = append(edge.ProducedOutputs, output)
+	}
 
 	withdrawalPredicateSQL, withdrawalValues := hashPredicate("w.tx_hash", hashes)
-	withdrawalSQL := activePublicationsCTE + `
-SELECT w.tx_hash, w.reward_account, w.lovelace, w.body_ordinal, w.credential_hash
-FROM withdrawals AS w
-INNER JOIN active_publications AS ap ON w.publication_id = ap.publication_id
-WHERE w.is_applied
-  AND ` + withdrawalPredicateSQL + `
-ORDER BY w.tx_hash, w.body_ordinal`
+	withdrawalSQL := targetedFactSQL(`
+        SELECT *
+        FROM withdrawals AS w
+        WHERE w.is_applied
+          AND `+withdrawalPredicateSQL+`
+          AND w.publication_id <= publication_watermark
+`, `
+SELECT
+    w.tx_hash,
+    w.reward_account,
+    w.lovelace,
+    w.body_ordinal,
+    w.credential_kind,
+    w.credential_hash
+FROM fact_candidates AS w
+INNER JOIN active_candidate_publications AS ap
+    ON w.publication_id = ap.publication_id
+ORDER BY w.tx_hash, w.body_ordinal`)
 	queryCtx, finish = store.instrument(ctx, "trace_applied_withdrawals")
 	rows, err = store.conn.Query(
 		queryCtx,
@@ -351,15 +403,28 @@ ORDER BY w.tx_hash, w.body_ordinal`
 	}
 	for rows.Next() {
 		var txHash, reward, credential []byte
+		var credentialKind string
 		var amount uint64
 		var ordinal uint32
-		if err := rows.Scan(&txHash, &reward, &amount, &ordinal, &credential); err != nil {
+		if err := rows.Scan(
+			&txHash,
+			&reward,
+			&amount,
+			&ordinal,
+			&credentialKind,
+			&credential,
+		); err != nil {
 			rows.Close()
 			finish()
 			return nil, nil, err
 		}
 		tx, err := model.Hash32FromBytes(txHash)
 		if err != nil {
+			rows.Close()
+			finish()
+			return nil, nil, err
+		}
+		if err := validateRewardAccount(reward, credentialKind, credential); err != nil {
 			rows.Close()
 			finish()
 			return nil, nil, err
@@ -372,11 +437,12 @@ ORDER BY w.tx_hash, w.body_ordinal`
 		}
 		edge.AppliedWithdrawals = append(edge.AppliedWithdrawals, model.Withdrawal{
 			TxHash:         tx,
-			RewardAccount:  model.Bytes(reward),
+			RewardAccount:  model.Bytes(bytes.Clone(reward)),
 			Lovelace:       amount,
 			BodyOrdinal:    ordinal,
 			Applied:        true,
-			CredentialHash: model.Bytes(credential),
+			CredentialKind: credentialKind,
+			CredentialHash: model.Bytes(bytes.Clone(credential)),
 		})
 	}
 	err = rows.Err()
@@ -407,13 +473,18 @@ func (store *Store) outputsByRefs(
 		return []model.Output{}, nil, nil
 	}
 	predicate, values := tuplePredicate("o.tx_hash", "o.output_index", refs)
-	sql := activePublicationsCTE + `
-SELECT` + outputColumns + `
-FROM outputs AS o
-INNER JOIN active_publications AS ap ON o.publication_id = ap.publication_id
-INNER JOIN blocks AS b ON o.publication_id = b.publication_id
-WHERE ` + predicate + `
-ORDER BY o.tx_hash, o.output_index`
+	sql := targetedFactSQL(`
+        SELECT *
+        FROM outputs AS o
+        WHERE `+predicate+`
+          AND o.publication_id <= publication_watermark
+`, `
+SELECT`+outputColumns+`
+FROM fact_candidates AS o
+INNER JOIN active_candidate_publications AS ap
+    ON o.publication_id = ap.publication_id
+INNER JOIN candidate_blocks AS b ON o.publication_id = b.publication_id
+ORDER BY o.tx_hash, o.output_index`)
 	queryCtx, finish := store.instrument(ctx, "trace_output_values")
 	defer finish()
 	rows, err := store.conn.Query(queryCtx, sql, activeArguments(snapshot, values...)...)
@@ -437,6 +508,9 @@ ORDER BY o.tx_hash, o.output_index`
 	if err := rows.Err(); err != nil {
 		return nil, nil, err
 	}
+	if err := store.hydrateInlineDatums(ctx, outputs); err != nil {
+		return nil, nil, err
+	}
 	boundaries := make([]model.PartialHistoryBoundary, 0)
 	for _, ref := range refs {
 		if _, exists := found[ref.String()]; exists {
@@ -451,6 +525,23 @@ ORDER BY o.tx_hash, o.output_index`
 		})
 	}
 	return outputs, boundaries, nil
+}
+
+func uniqueRefs(refs []model.UTxORef) []model.UTxORef {
+	seen := make(map[string]model.UTxORef, len(refs))
+	for _, ref := range refs {
+		seen[ref.String()] = ref
+	}
+	keys := make([]string, 0, len(seen))
+	for key := range seen {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	result := make([]model.UTxORef, 0, len(keys))
+	for _, key := range keys {
+		result = append(result, seen[key])
+	}
+	return result
 }
 
 func hashPredicate(column string, hashes []model.Hash32) (string, []any) {

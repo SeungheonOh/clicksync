@@ -1,45 +1,160 @@
 package clickhouse
 
+// A snapshot is a committed event sequence plus the greatest publication ID
+// visible at that event. Publication IDs are monotonic. The second coordinate
+// prevents a fact appended after snapshot capture from leaking into a
+// multi-query request even if its key matches the request.
 const snapshotTipSQL = `
-SELECT max(event_seq)
-FROM
-(
-    SELECT event_seq
-    FROM chain_events
-    WHERE event_kind = 'adoption'
-
-    UNION ALL
-
-    SELECT event_seq
-    FROM rollbacks
-)`
-
-const snapshotAtBlockSQL = `
-SELECT count(), max(ce.event_seq)
-FROM chain_events AS ce
-INNER JOIN blocks AS b ON ce.publication_id = b.publication_id
-WHERE ce.event_kind = 'adoption'
-  AND b.block_hash = ?`
-
-const snapshotPinnedSQL = `
+WITH
+    ifNull(
+        (
+            SELECT event_seq
+            FROM chain_events
+            WHERE event_kind = 'adoption'
+            ORDER BY event_seq DESC
+            LIMIT 1
+        ),
+        0
+    ) AS latest_adoption,
+    ifNull(
+        (
+            SELECT event_seq
+            FROM rollbacks
+            ORDER BY event_seq DESC
+            LIMIT 1
+        ),
+        0
+    ) AS latest_rollback,
+    greatest(latest_adoption, latest_rollback) AS committed_tip
 SELECT
-    max(committed_tip),
-    countIf(event_seq = ?)
-FROM
-(
-    SELECT event_seq, max(event_seq) OVER () AS committed_tip
-    FROM
+    committed_tip,
+    ifNull(
+        (
+            SELECT publication_id
+            FROM chain_events
+            WHERE event_kind = 'adoption'
+              AND event_seq <= committed_tip
+            ORDER BY event_seq DESC
+            LIMIT 1
+        ),
+        0
+    ),
     (
-        SELECT event_seq
+        SELECT count()
         FROM chain_events
         WHERE event_kind = 'adoption'
-
-        UNION ALL
-
-        SELECT event_seq
+          AND event_seq = committed_tip
+    ) +
+    (
+        SELECT count()
         FROM rollbacks
-    )
-)`
+        WHERE event_seq = committed_tip
+    )`
+
+const snapshotAtBlockSQL = `
+WITH
+    block_events AS
+    (
+        SELECT ce.event_seq
+        FROM chain_events AS ce
+        INNER JOIN blocks AS b ON ce.publication_id = b.publication_id
+        WHERE ce.event_kind = 'adoption'
+          AND b.block_hash = ?
+    ),
+    ifNull((SELECT max(event_seq) FROM block_events), 0) AS target_event,
+    ifNull(
+        (
+            SELECT event_seq
+            FROM chain_events
+            WHERE event_kind = 'adoption'
+            ORDER BY event_seq DESC
+            LIMIT 1
+        ),
+        0
+    ) AS latest_adoption,
+    ifNull(
+        (
+            SELECT event_seq
+            FROM rollbacks
+            ORDER BY event_seq DESC
+            LIMIT 1
+        ),
+        0
+    ) AS latest_rollback,
+    greatest(latest_adoption, latest_rollback) AS committed_tip
+SELECT
+    (SELECT count() FROM block_events),
+    target_event,
+    ifNull(
+        (
+            SELECT publication_id
+            FROM chain_events
+            WHERE event_kind = 'adoption'
+              AND event_seq <= target_event
+            ORDER BY event_seq DESC
+            LIMIT 1
+        ),
+        0
+    ),
+    committed_tip,
+    (
+        SELECT count()
+        FROM chain_events
+        WHERE event_kind = 'adoption'
+          AND event_seq = target_event
+    ) +
+    (
+        SELECT count()
+        FROM rollbacks
+        WHERE event_seq = target_event
+    )`
+
+const snapshotPinnedSQL = `
+WITH
+    ifNull(
+        (
+            SELECT event_seq
+            FROM chain_events
+            WHERE event_kind = 'adoption'
+            ORDER BY event_seq DESC
+            LIMIT 1
+        ),
+        0
+    ) AS latest_adoption,
+    ifNull(
+        (
+            SELECT event_seq
+            FROM rollbacks
+            ORDER BY event_seq DESC
+            LIMIT 1
+        ),
+        0
+    ) AS latest_rollback,
+    greatest(latest_adoption, latest_rollback) AS committed_tip
+SELECT
+    committed_tip,
+    (
+        SELECT count()
+        FROM chain_events
+        WHERE event_kind = 'adoption'
+          AND event_seq = ?
+    ) +
+    (
+        SELECT count()
+        FROM rollbacks
+        WHERE event_seq = ?
+    ),
+    ifNull(
+        (
+            SELECT publication_id
+            FROM chain_events
+            WHERE event_kind = 'adoption'
+              AND event_seq <= ?
+            ORDER BY event_seq DESC
+            LIMIT 1
+        ),
+        0
+    )`
 
 const manifestSQL = `
 SELECT
@@ -49,31 +164,81 @@ SELECT
 FROM dataset_manifest
 WHERE manifest_key = 1`
 
-const activePublicationsCTE = `
-WITH committed_membership AS
-(
-    SELECT publication_id, event_seq, active
-    FROM chain_events
-    WHERE event_seq <= ?
-      AND event_kind = 'adoption'
+// targetedFactSQL deliberately finds the small fact set first. Only the
+// publication IDs represented by those candidates are looked up in the
+// append-only event log. This avoids an O(all chain history) active-publication
+// CTE on every point read and BFS frontier expansion.
+func targetedFactSQL(candidate, result string) string {
+	return `
+WITH
+    toUInt64(?) AS snapshot_event,
+    toUInt64(?) AS publication_watermark,
+    fact_candidates AS
+    (
+` + candidate + `
+    ),
+    candidate_publications AS
+    (
+        SELECT DISTINCT publication_id
+        FROM fact_candidates
+    ),
+    candidate_blocks AS
+    (
+        SELECT publication_id, block_hash
+        FROM blocks
+        WHERE publication_id IN
+            (SELECT publication_id FROM candidate_publications)
+          AND publication_id <= publication_watermark
+    ),
+    candidate_invalidations AS
+    (
+        SELECT
+            ce.publication_id,
+            ce.event_seq,
+            ce.active,
+            assumeNotNull(ce.rollback_id) AS rollback_id
+        FROM chain_events AS ce
+        WHERE ce.publication_id IN
+            (SELECT publication_id FROM candidate_publications)
+          AND ce.event_seq <= snapshot_event
+          AND ce.event_kind = 'invalidation'
+    ),
+    candidate_rollback_headers AS
+    (
+        SELECT rb.rollback_id, rb.event_seq
+        FROM rollbacks AS rb
+        WHERE (rb.rollback_id, rb.event_seq) IN
+        (
+            SELECT rollback_id, event_seq
+            FROM candidate_invalidations
+        )
+    ),
+    committed_candidate_membership AS
+    (
+        SELECT ce.publication_id, ce.event_seq, ce.active
+        FROM chain_events AS ce
+        WHERE ce.publication_id IN
+            (SELECT publication_id FROM candidate_publications)
+          AND ce.event_seq <= snapshot_event
+          AND ce.event_kind = 'adoption'
 
-    UNION ALL
+        UNION ALL
 
-    SELECT ce.publication_id, ce.event_seq, ce.active
-    FROM chain_events AS ce
-    INNER JOIN rollbacks AS rb
-        ON ce.rollback_id = rb.rollback_id
-       AND ce.event_seq = rb.event_seq
-    WHERE ce.event_seq <= ?
-      AND ce.event_kind = 'invalidation'
-),
-active_publications AS
-(
-    SELECT publication_id
-    FROM committed_membership
-    GROUP BY publication_id
-    HAVING argMax(active, event_seq)
-)`
+        SELECT ci.publication_id, ci.event_seq, ci.active
+        FROM candidate_rollback_headers AS rb
+        INNER JOIN candidate_invalidations AS ci
+            ON rb.rollback_id = ci.rollback_id
+           AND rb.event_seq = ci.event_seq
+    ),
+    active_candidate_publications AS
+    (
+        SELECT publication_id
+        FROM committed_candidate_membership
+        GROUP BY publication_id
+        HAVING argMax(active, event_seq) = 1
+    )
+` + result
+}
 
 const outputColumns = `
     o.tx_hash,
@@ -82,6 +247,8 @@ const outputColumns = `
     o.block_number,
     o.output_kind,
     o.address,
+    o.payment_credential_kind,
+    o.payment_credential_hash,
     o.lovelace,
     o.asset_policy_ids,
     o.asset_names,
@@ -91,25 +258,65 @@ const outputColumns = `
     o.reference_script_hash,
     o.reference_script_language`
 
-const outputByRefSQL = activePublicationsCTE + `
-SELECT` + outputColumns + `
-FROM outputs AS o
-INNER JOIN active_publications AS ap ON o.publication_id = ap.publication_id
-INNER JOIN blocks AS b ON o.publication_id = b.publication_id
-WHERE o.tx_hash = ?
-  AND o.output_index = ?
-LIMIT 2`
+var outputByRefSQL = targetedFactSQL(`
+        SELECT *
+        FROM outputs
+        WHERE tx_hash = ?
+          AND output_index = ?
+          AND publication_id <= publication_watermark
+`, `
+SELECT`+outputColumns+`
+FROM fact_candidates AS o
+INNER JOIN active_candidate_publications AS ap
+    ON o.publication_id = ap.publication_id
+INNER JOIN candidate_blocks AS b ON o.publication_id = b.publication_id
+LIMIT 2`)
 
-const spendByRefSQL = activePublicationsCTE + `
+var usesByRefSQL = targetedFactSQL(`
+        SELECT *
+        FROM inputs
+        WHERE source_tx_hash = ?
+          AND source_output_index = ?
+          AND publication_id <= publication_watermark
+`, `
+SELECT
+    i.source_tx_hash,
+    i.source_output_index,
+    i.tx_hash,
+    b.block_hash,
+    i.block_number,
+    i.role,
+    i.body_ordinal,
+    i.is_consumed,
+    i.source_is_resolved
+FROM fact_candidates AS i
+INNER JOIN active_candidate_publications AS ap
+    ON i.publication_id = ap.publication_id
+INNER JOIN candidate_blocks AS b ON i.publication_id = b.publication_id
+ORDER BY i.block_number, i.tx_hash, i.body_ordinal
+LIMIT 10001`)
+
+var spendByRefSQL = targetedFactSQL(`
+        SELECT *
+        FROM inputs
+        WHERE source_tx_hash = ?
+          AND source_output_index = ?
+          AND is_consumed
+          AND publication_id <= publication_watermark
+`, `
 SELECT DISTINCT i.tx_hash
-FROM inputs AS i
-INNER JOIN active_publications AS ap ON i.publication_id = ap.publication_id
-WHERE i.source_tx_hash = ?
-  AND i.source_output_index = ?
-  AND i.is_consumed
-LIMIT 2`
+FROM fact_candidates AS i
+INNER JOIN active_candidate_publications AS ap
+    ON i.publication_id = ap.publication_id
+ORDER BY i.tx_hash
+LIMIT 2`)
 
-const transactionHeaderSQL = activePublicationsCTE + `
+var transactionHeaderSQL = targetedFactSQL(`
+        SELECT *
+        FROM transactions
+        WHERE tx_hash = ?
+          AND publication_id <= publication_watermark
+`, `
 SELECT
     t.tx_hash,
     b.block_hash,
@@ -126,33 +333,46 @@ SELECT
     t.mint_policy_ids,
     t.mint_asset_names,
     t.mint_quantities
-FROM transactions AS t
-INNER JOIN active_publications AS ap ON t.publication_id = ap.publication_id
-INNER JOIN blocks AS b ON t.publication_id = b.publication_id
-WHERE t.tx_hash = ?
-LIMIT 2`
+FROM fact_candidates AS t
+INNER JOIN active_candidate_publications AS ap
+    ON t.publication_id = ap.publication_id
+INNER JOIN candidate_blocks AS b ON t.publication_id = b.publication_id
+LIMIT 2`)
 
-const inputsByTxSQL = activePublicationsCTE + `
+var inputsByTxSQL = targetedFactSQL(`
+        SELECT *
+        FROM inputs
+        WHERE tx_hash = ?
+          AND publication_id <= publication_watermark
+`, `
 SELECT
     i.source_tx_hash,
     i.source_output_index,
     i.tx_hash,
+    b.block_hash,
+    i.block_number,
     i.role,
     i.body_ordinal,
     i.is_consumed,
     i.source_is_resolved
-FROM inputs AS i
-INNER JOIN active_publications AS ap ON i.publication_id = ap.publication_id
-WHERE i.tx_hash = ?
-ORDER BY i.body_ordinal`
+FROM fact_candidates AS i
+INNER JOIN active_candidate_publications AS ap
+    ON i.publication_id = ap.publication_id
+INNER JOIN candidate_blocks AS b ON i.publication_id = b.publication_id
+ORDER BY i.body_ordinal`)
 
-const outputsByTxSQL = activePublicationsCTE + `
-SELECT` + outputColumns + `
-FROM outputs AS o
-INNER JOIN active_publications AS ap ON o.publication_id = ap.publication_id
-INNER JOIN blocks AS b ON o.publication_id = b.publication_id
-WHERE o.tx_hash = ?
-ORDER BY o.body_ordinal, o.output_index`
+var outputsByTxSQL = targetedFactSQL(`
+        SELECT *
+        FROM outputs
+        WHERE tx_hash = ?
+          AND publication_id <= publication_watermark
+`, `
+SELECT`+outputColumns+`
+FROM fact_candidates AS o
+INNER JOIN active_candidate_publications AS ap
+    ON o.publication_id = ap.publication_id
+INNER JOIN candidate_blocks AS b ON o.publication_id = b.publication_id
+ORDER BY o.body_ordinal, o.output_index`)
 
 const datumBodySQL = `
 SELECT
@@ -164,44 +384,65 @@ FROM datum_bodies
 WHERE datum_hash = ?
 GROUP BY datum_hash`
 
-const datumObservationsSQL = activePublicationsCTE + `
+var datumObservationsSQL = targetedFactSQL(`
+        SELECT *
+        FROM datum_observations
+        WHERE datum_hash = ?
+          AND publication_id <= publication_watermark
+`, `
 SELECT
     d.datum_hash,
     d.tx_hash,
     b.block_hash,
     d.source_kind
-FROM datum_observations AS d
-INNER JOIN active_publications AS ap ON d.publication_id = ap.publication_id
-INNER JOIN blocks AS b ON d.publication_id = b.publication_id
-WHERE d.datum_hash = ?
-ORDER BY d.block_number, d.tx_order, d.source_kind, d.source_ordinal`
+FROM fact_candidates AS d
+INNER JOIN active_candidate_publications AS ap
+    ON d.publication_id = ap.publication_id
+INNER JOIN candidate_blocks AS b ON d.publication_id = b.publication_id
+ORDER BY d.block_number, d.tx_order, d.source_kind, d.source_ordinal`)
 
-const withdrawalsByTxSQL = activePublicationsCTE + `
+var withdrawalsByTxSQL = targetedFactSQL(`
+        SELECT *
+        FROM withdrawals
+        WHERE tx_hash = ?
+          AND publication_id <= publication_watermark
+`, `
 SELECT
     w.tx_hash,
     w.reward_account,
     w.lovelace,
     w.body_ordinal,
     w.is_applied,
+    w.credential_kind,
     w.credential_hash
-FROM withdrawals AS w
-INNER JOIN active_publications AS ap ON w.publication_id = ap.publication_id
-WHERE w.tx_hash = ?
-ORDER BY w.body_ordinal`
+FROM fact_candidates AS w
+INNER JOIN active_candidate_publications AS ap
+    ON w.publication_id = ap.publication_id
+ORDER BY w.body_ordinal`)
 
-const metadataByTxSQL = activePublicationsCTE + `
+var metadataByTxSQL = targetedFactSQL(`
+        SELECT *
+        FROM transaction_metadata
+        WHERE tx_hash = ?
+          AND publication_id <= publication_watermark
+`, `
 SELECT
     m.tx_hash,
     m.labels,
     m.metadata_cbor,
     m.byte_length,
     m.content_hash
-FROM transaction_metadata AS m
-INNER JOIN active_publications AS ap ON m.publication_id = ap.publication_id
-WHERE m.tx_hash = ?
-LIMIT 2`
+FROM fact_candidates AS m
+INNER JOIN active_candidate_publications AS ap
+    ON m.publication_id = ap.publication_id
+LIMIT 2`)
 
-const redeemersByTxSQL = activePublicationsCTE + `
+var redeemersByTxSQL = targetedFactSQL(`
+        SELECT *
+        FROM redeemers
+        WHERE tx_hash = ?
+          AND publication_id <= publication_watermark
+`, `
 SELECT
     r.tx_hash,
     r.raw_purpose_tag,
@@ -221,7 +462,7 @@ SELECT
     r.target_body_ordinal,
     r.target_identity,
     r.resolved_script_hash
-FROM redeemers AS r
-INNER JOIN active_publications AS ap ON r.publication_id = ap.publication_id
-WHERE r.tx_hash = ?
-ORDER BY r.purpose, r.redeemer_index`
+FROM fact_candidates AS r
+INNER JOIN active_candidate_publications AS ap
+    ON r.publication_id = ap.publication_id
+ORDER BY r.purpose, r.redeemer_index`)

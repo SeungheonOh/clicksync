@@ -9,9 +9,10 @@ import (
 func TestEveryResponseCarriesRequiredDatasetSemantics(t *testing.T) {
 	t.Parallel()
 	snapshot := Snapshot{
-		Event:           41,
-		CompleteHistory: false,
-		TrustMode:       TrustPeerObserved,
+		Event:                41,
+		PublicationWatermark: 39,
+		CompleteHistory:      false,
+		TrustMode:            TrustPeerObserved,
 	}
 	response := NewResponse(snapshot, struct {
 		OK bool `json:"ok"`
@@ -23,6 +24,7 @@ func TestEveryResponseCarriesRequiredDatasetSemantics(t *testing.T) {
 	text := string(encoded)
 	for _, required := range []string{
 		`"event":41`,
+		`"publication_watermark":39`,
 		`"complete_history":false`,
 		`"trust_mode":"peer_observed_structurally_verified"`,
 		`"truncated":false`,

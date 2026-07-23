@@ -1,6 +1,7 @@
 package clickhouse
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -88,7 +89,7 @@ func (store *Store) Redeemers(
 			PurposeTag: rawPurpose,
 			Purpose:    purpose,
 			Index:      index,
-			DataCBOR:   model.Bytes(dataCBOR),
+			DataCBOR:   model.Bytes(bytes.Clone(dataCBOR)),
 			Memory:     memory,
 			Steps:      steps,
 			Applied:    applied,
@@ -127,28 +128,167 @@ func (store *Store) Redeemers(
 			}
 			redeemer.Target.ScriptHash = model.Bytes([]byte(*resolvedScript))
 		}
+		if err := validateRedeemerTarget(redeemer); err != nil {
+			return nil, nil, err
+		}
 		result = append(result, redeemer)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, nil, err
 	}
+	refs := make([]model.UTxORef, 0)
 	for index := range result {
-		if result[index].Purpose != "spend" || result[index].Target.SourceUTxO == nil {
-			continue
+		if result[index].Purpose == "spend" && result[index].Target.SourceUTxO != nil {
+			refs = append(refs, *result[index].Target.SourceUTxO)
 		}
-		output, err := store.outputByRef(ctx, snapshot, *result[index].Target.SourceUTxO)
-		if err == nil {
-			result[index].Target.SourceOutput = &output
-			continue
-		}
-		if errors.Is(err, ErrNotFound) && !snapshot.CompleteHistory {
-			boundaries = append(boundaries, model.PartialHistoryBoundary{
-				UTxO:   *result[index].Target.SourceUTxO,
-				Reason: "resolved spend target output predates this partial-history dataset",
-			})
-			continue
-		}
+	}
+	refs = uniqueRefs(refs)
+	outputs, outputBoundaries, err := store.outputsByRefs(ctx, snapshot, refs)
+	if err != nil {
 		return nil, nil, err
 	}
+	for index := range outputBoundaries {
+		outputBoundaries[index].Reason =
+			"resolved spend target output predates this partial-history dataset"
+	}
+	boundaries = append(boundaries, outputBoundaries...)
+	byRef := make(map[string]model.Output, len(outputs))
+	for _, output := range outputs {
+		byRef[output.Ref.String()] = output
+	}
+	for index := range result {
+		ref := result[index].Target.SourceUTxO
+		if ref == nil {
+			continue
+		}
+		if output, ok := byRef[ref.String()]; ok {
+			if err := validateSpendScriptContext(result[index], output); err != nil {
+				return nil, nil, err
+			}
+			value := output
+			result[index].Target.SourceOutput = &value
+		}
+	}
 	return result, boundaries, nil
+}
+
+func validateRedeemerTarget(redeemer model.Redeemer) error {
+	if redeemer.Target.Status != "resolved" {
+		return fmt.Errorf("unsupported redeemer resolution status %q", redeemer.Target.Status)
+	}
+	switch redeemer.Purpose {
+	case "spend":
+		if redeemer.PurposeTag != 0 || redeemer.Target.SourceUTxO == nil ||
+			redeemer.Target.PolicyID != nil ||
+			len(redeemer.Target.RewardAccount) != 0 ||
+			redeemer.Target.BodyOrdinal != nil ||
+			len(redeemer.Target.ProcedureIdentity) != 0 {
+			return errors.New("spend redeemer target is malformed")
+		}
+	case "mint":
+		if redeemer.PurposeTag != 1 || redeemer.Target.PolicyID == nil ||
+			redeemer.Target.SourceUTxO != nil ||
+			len(redeemer.Target.RewardAccount) != 0 ||
+			redeemer.Target.BodyOrdinal != nil ||
+			len(redeemer.Target.ProcedureIdentity) != 0 ||
+			len(redeemer.Target.ScriptHash) != 28 ||
+			!bytes.Equal(redeemer.Target.ScriptHash, redeemer.Target.PolicyID[:]) {
+			return errors.New("mint redeemer target is malformed")
+		}
+	case "reward":
+		if redeemer.PurposeTag != 3 ||
+			redeemer.Target.SourceUTxO != nil ||
+			redeemer.Target.PolicyID != nil ||
+			redeemer.Target.BodyOrdinal != nil ||
+			len(redeemer.Target.ProcedureIdentity) != 0 {
+			return errors.New("reward redeemer purpose tag is malformed")
+		}
+		reward := []byte(redeemer.Target.RewardAccount)
+		if len(reward) != 29 {
+			return errors.New("reward redeemer account is malformed")
+		}
+		if err := validateRewardAccount(reward, "script", reward[1:]); err != nil {
+			return fmt.Errorf("reward redeemer: %w", err)
+		}
+		if len(redeemer.Target.ScriptHash) != 28 ||
+			!bytes.Equal(redeemer.Target.ScriptHash, reward[1:]) {
+			return errors.New("reward redeemer script hash disagrees with account")
+		}
+	case "certificate":
+		if redeemer.PurposeTag != 2 || redeemer.Target.BodyOrdinal == nil ||
+			redeemer.Target.SourceUTxO != nil ||
+			redeemer.Target.PolicyID != nil ||
+			len(redeemer.Target.RewardAccount) != 0 {
+			return errors.New("certificate redeemer target is malformed")
+		}
+		return validateCompactTargetIdentity(redeemer, 18)
+	case "vote":
+		if redeemer.PurposeTag != 4 || redeemer.Target.BodyOrdinal == nil ||
+			redeemer.Target.SourceUTxO != nil ||
+			redeemer.Target.PolicyID != nil ||
+			len(redeemer.Target.RewardAccount) != 0 ||
+			len(redeemer.Target.ProcedureIdentity) != 29 ||
+			redeemer.Target.ProcedureIdentity[0] > 4 {
+			return errors.New("vote redeemer target identity is malformed")
+		}
+		voterType := redeemer.Target.ProcedureIdentity[0]
+		voterHash := redeemer.Target.ProcedureIdentity[1:]
+		if voterType == 1 || voterType == 3 {
+			if len(redeemer.Target.ScriptHash) != 28 ||
+				!bytes.Equal(redeemer.Target.ScriptHash, voterHash) {
+				return errors.New("vote redeemer script hash disagrees with voter")
+			}
+		} else if len(redeemer.Target.ScriptHash) != 0 {
+			return errors.New("key voter has a resolved script hash")
+		}
+	case "proposal":
+		if redeemer.PurposeTag != 5 || redeemer.Target.BodyOrdinal == nil ||
+			redeemer.Target.SourceUTxO != nil ||
+			redeemer.Target.PolicyID != nil ||
+			len(redeemer.Target.RewardAccount) != 0 {
+			return errors.New("proposal redeemer target is malformed")
+		}
+		return validateCompactTargetIdentity(redeemer, 6)
+	default:
+		return fmt.Errorf("unsupported redeemer purpose %q", redeemer.Purpose)
+	}
+	return nil
+}
+
+func validateCompactTargetIdentity(redeemer model.Redeemer, maximumConstructor byte) error {
+	identity := redeemer.Target.ProcedureIdentity
+	if len(identity) != 34 {
+		return fmt.Errorf("compact target identity has %d bytes, want 34", len(identity))
+	}
+	if identity[0] != redeemer.PurposeTag {
+		return errors.New("compact target identity purpose tag disagrees with redeemer")
+	}
+	if identity[1] > maximumConstructor {
+		return fmt.Errorf(
+			"compact target identity constructor is %d, maximum %d",
+			identity[1],
+			maximumConstructor,
+		)
+	}
+	return nil
+}
+
+func validateSpendScriptContext(redeemer model.Redeemer, output model.Output) error {
+	switch output.PaymentCredentialKind {
+	case "script":
+		if len(output.PaymentCredentialHash) != 28 ||
+			!bytes.Equal(output.PaymentCredentialHash, redeemer.Target.ScriptHash) {
+			return errors.New("spend redeemer script hash disagrees with source output")
+		}
+	case "key", "none":
+		if len(redeemer.Target.ScriptHash) != 0 {
+			return errors.New("non-script source output has a resolved script hash")
+		}
+	default:
+		return fmt.Errorf(
+			"unsupported source payment credential kind %q",
+			output.PaymentCredentialKind,
+		)
+	}
+	return nil
 }

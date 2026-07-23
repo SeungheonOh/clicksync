@@ -1,6 +1,7 @@
 package clickhouse
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 
@@ -28,6 +29,8 @@ type outputValues struct {
 	blockNumber         uint64
 	kind                string
 	address             []byte
+	paymentKind         string
+	paymentHash         *string
 	lovelace            uint64
 	policies            []string
 	names               []string
@@ -47,6 +50,8 @@ func scanOutput(row scanner) (model.Output, error) {
 		&values.blockNumber,
 		&values.kind,
 		&values.address,
+		&values.paymentKind,
+		&values.paymentHash,
 		&values.lovelace,
 		&values.policies,
 		&values.names,
@@ -71,6 +76,8 @@ func scanAddressOutput(row scanner) (model.Output, uint64, error) {
 		&values.blockNumber,
 		&values.kind,
 		&values.address,
+		&values.paymentKind,
+		&values.paymentHash,
 		&values.lovelace,
 		&values.policies,
 		&values.names,
@@ -107,30 +114,81 @@ func makeOutput(values outputValues) (model.Output, error) {
 		}
 		assets[index] = model.OutputAsset{
 			PolicyID: policy,
-			Name:     model.Bytes([]byte(values.names[index])),
+			Name:     model.Bytes(bytes.Clone([]byte(values.names[index]))),
 			Quantity: values.quantities[index],
 		}
+		if assets[index].Quantity == 0 {
+			return model.Output{}, errors.New("output contains a zero asset quantity")
+		}
+		if index > 0 {
+			previous := assets[index-1]
+			if compared := bytes.Compare(previous.PolicyID[:], assets[index].PolicyID[:]); compared > 0 ||
+				(compared == 0 && bytes.Compare(previous.Name, assets[index].Name) >= 0) {
+				return model.Output{}, errors.New("output assets are not strictly sorted and unique")
+			}
+		}
+	}
+	switch model.OutputKind(values.kind) {
+	case model.OutputRegular, model.OutputCollateralReturn, model.OutputGenesis:
+	default:
+		return model.Output{}, fmt.Errorf("unsupported output kind %q", values.kind)
 	}
 	output := model.Output{
 		Ref: model.UTxORef{
 			TxHash: hash,
 			Index:  values.outputIndex,
 		},
-		ProducingTx: hash,
-		BlockHash:   block,
-		BlockHeight: values.blockNumber,
-		Kind:        model.OutputKind(values.kind),
-		Address:     model.Bytes(values.address),
-		Lovelace:    values.lovelace,
-		Assets:      assets,
-		DatumKind:   values.datumKind,
+		ProducingTx:           hash,
+		BlockHash:             block,
+		BlockHeight:           values.blockNumber,
+		Kind:                  model.OutputKind(values.kind),
+		Address:               model.Bytes(bytes.Clone(values.address)),
+		PaymentCredentialKind: values.paymentKind,
+		Lovelace:              values.lovelace,
+		Assets:                assets,
+		DatumKind:             values.datumKind,
 	}
-	if values.datumHash != nil {
+	switch values.paymentKind {
+	case "none":
+		if values.paymentHash != nil {
+			return model.Output{}, errors.New("payment credential kind none has a hash")
+		}
+	case "key", "script":
+		if values.paymentHash == nil {
+			return model.Output{}, errors.New("payment credential hash is missing")
+		}
+		if len(*values.paymentHash) != 28 {
+			return model.Output{}, fmt.Errorf(
+				"payment credential hash has %d bytes",
+				len(*values.paymentHash),
+			)
+		}
+		output.PaymentCredentialHash = model.Bytes(bytes.Clone([]byte(*values.paymentHash)))
+	default:
+		return model.Output{}, fmt.Errorf(
+			"unsupported payment credential kind %q",
+			values.paymentKind,
+		)
+	}
+	switch values.datumKind {
+	case "none":
+		if values.datumHash != nil {
+			return model.Output{}, errors.New("datum kind none has a hash")
+		}
+	case "hash", "inline":
+		if values.datumHash == nil {
+			return model.Output{}, errors.New("datum hash is missing")
+		}
 		value, err := model.Hash32FromBytes([]byte(*values.datumHash))
 		if err != nil {
 			return model.Output{}, err
 		}
 		output.DatumHash = &value
+	default:
+		return model.Output{}, fmt.Errorf("unsupported datum kind %q", values.datumKind)
+	}
+	if (values.referenceScriptHash == nil) != (values.referenceLanguage == nil) {
+		return model.Output{}, errors.New("reference script hash/language presence disagrees")
 	}
 	if values.referenceScriptHash != nil {
 		value, err := model.PolicyIDFromBytes([]byte(*values.referenceScriptHash))
@@ -150,6 +208,8 @@ func scanSpend(row scanner) (model.Spend, error) {
 		sourceHash     []byte
 		sourceIndex    uint32
 		consumingHash  []byte
+		blockHash      []byte
+		blockHeight    uint64
 		role           string
 		ordinal        uint32
 		consumed       bool
@@ -159,6 +219,8 @@ func scanSpend(row scanner) (model.Spend, error) {
 		&sourceHash,
 		&sourceIndex,
 		&consumingHash,
+		&blockHash,
+		&blockHeight,
 		&role,
 		&ordinal,
 		&consumed,
@@ -174,16 +236,30 @@ func scanSpend(row scanner) (model.Spend, error) {
 	if err != nil {
 		return model.Spend{}, err
 	}
+	switch model.InputRole(role) {
+	case model.InputRegular, model.InputCollateral, model.InputReference:
+	default:
+		return model.Spend{}, fmt.Errorf("unsupported input role %q", role)
+	}
+	if model.InputRole(role) == model.InputReference && consumed {
+		return model.Spend{}, errors.New("reference input is marked consumed")
+	}
+	block, err := model.Hash32FromBytes(blockHash)
+	if err != nil {
+		return model.Spend{}, err
+	}
 	return model.Spend{
 		Source: model.UTxORef{
 			TxHash: source,
 			Index:  sourceIndex,
 		},
-		ConsumingTx:    consuming,
-		Role:           model.InputRole(role),
-		BodyOrdinal:    ordinal,
-		IsConsumed:     consumed,
-		SourceResolved: sourceResolved,
+		ConsumingTx:          consuming,
+		ConsumingBlockHash:   block,
+		ConsumingBlockHeight: blockHeight,
+		Role:                 model.InputRole(role),
+		BodyOrdinal:          ordinal,
+		IsConsumed:           consumed,
+		SourceResolved:       sourceResolved,
 	}, nil
 }
 
@@ -199,8 +275,18 @@ func decodeSignedAssets(policies, names []string, quantities []int64) ([]model.S
 		}
 		result[index] = model.SignedAssetQuantity{
 			PolicyID: policy,
-			Name:     model.Bytes([]byte(names[index])),
+			Name:     model.Bytes(bytes.Clone([]byte(names[index]))),
 			Quantity: quantities[index],
+		}
+		if result[index].Quantity == 0 {
+			return nil, errors.New("mint contains a zero quantity")
+		}
+		if index > 0 {
+			previous := result[index-1]
+			if compared := bytes.Compare(previous.PolicyID[:], result[index].PolicyID[:]); compared > 0 ||
+				(compared == 0 && bytes.Compare(previous.Name, result[index].Name) >= 0) {
+				return nil, errors.New("mint assets are not strictly sorted and unique")
+			}
 		}
 	}
 	return result, nil

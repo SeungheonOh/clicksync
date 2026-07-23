@@ -148,6 +148,94 @@ func TestTraceNodeCapIsExplicitlyNotLossless(t *testing.T) {
 	}
 }
 
+func TestTraceEdgeCapIsDeterministicAndExplicit(t *testing.T) {
+	t.Parallel()
+	a := ref(1, 0)
+	b := ref(2, 0)
+	traceLimits := limits.DefaultTrace()
+	traceLimits.MaxEdges = 1
+	reader := &fakeReader{
+		snapshot: model.Snapshot{
+			Event:           5,
+			CompleteHistory: false,
+			TrustMode:       model.TrustPeerObserved,
+		},
+		seeds: repository.TraceSeedResult{UTxOs: []model.UTxORef{b, a}},
+		expandForward: func(
+			context.Context,
+			model.Snapshot,
+			[]model.UTxORef,
+		) ([]model.FlowHyperedge, error) {
+			// Deliberately return reverse lexical order.
+			return []model.FlowHyperedge{
+				{Transaction: hash(9)},
+				{Transaction: hash(8)},
+			}, nil
+		},
+	}
+	result, err := New(reader).Execute(context.Background(), traceInvocation(a, traceLimits))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := result.(model.Response[model.Trace])
+	if !response.Truncation.Truncated || response.Truncation.Reason != "max_edges" ||
+		response.Truncation.LosslessResume ||
+		len(response.Data.Hyperedges) != 1 ||
+		response.Data.Hyperedges[0].Transaction != hash(8) ||
+		len(response.Truncation.ContinuationFrontier) != 2 ||
+		response.Truncation.ContinuationFrontier[0] != a ||
+		response.Truncation.ContinuationFrontier[1] != b {
+		t.Fatalf("unexpected edge-cap response: %#v", response)
+	}
+}
+
+func TestReverseBFSUsesConsumedSourceValues(t *testing.T) {
+	t.Parallel()
+	target := ref(3, 0)
+	sourceA := ref(1, 0)
+	sourceB := ref(2, 0)
+	reader := &fakeReader{
+		snapshot: model.Snapshot{
+			Event:           7,
+			CompleteHistory: true,
+			TrustMode:       model.TrustPeerObserved,
+		},
+		seeds: repository.TraceSeedResult{UTxOs: []model.UTxORef{target}},
+		expandReverse: func(
+			_ context.Context,
+			snapshot model.Snapshot,
+			frontier []model.UTxORef,
+		) ([]model.FlowHyperedge, error) {
+			if snapshot.Event != 7 || len(frontier) != 1 || frontier[0] != target {
+				t.Fatalf("unexpected reverse frontier: %#v at %#v", frontier, snapshot)
+			}
+			return []model.FlowHyperedge{{
+				Transaction: hash(9),
+				ConsumedInputValues: []model.Output{
+					adaOutput(sourceB),
+					adaOutput(sourceA),
+				},
+				ProducedOutputs: []model.Output{adaOutput(target)},
+			}}, nil
+		},
+	}
+	invocation := traceInvocation(target, limits.DefaultTrace())
+	invocation.Trace.Direction = repository.Reverse
+	invocation.Trace.Limits.MaxDepth = 1
+	result, err := New(reader).Execute(context.Background(), invocation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := result.(model.Response[model.Trace])
+	if response.Data.Visited != 3 || len(response.Data.Hyperedges) != 1 ||
+		!response.Truncation.Truncated || response.Truncation.Reason != "max_depth" ||
+		len(response.Truncation.ContinuationFrontier) != 2 ||
+		response.Truncation.ContinuationFrontier[0] != sourceA ||
+		response.Truncation.ContinuationFrontier[1] != sourceB {
+		t.Fatalf("unexpected reverse trace: %#v", response)
+	}
+}
+
 func TestCallerCancellationIsNotReportedAsLayerTimeout(t *testing.T) {
 	t.Parallel()
 	a := ref(1, 0)
@@ -216,6 +304,7 @@ type fakeReader struct {
 	lastAddress   addressCall
 	seeds         repository.TraceSeedResult
 	expandForward func(context.Context, model.Snapshot, []model.UTxORef) ([]model.FlowHyperedge, error)
+	expandReverse func(context.Context, model.Snapshot, []model.UTxORef) ([]model.FlowHyperedge, error)
 }
 
 func (reader *fakeReader) Snapshot(_ context.Context, at model.AtPoint) (model.Snapshot, error) {
@@ -301,10 +390,14 @@ func (reader *fakeReader) ExpandForward(
 }
 
 func (reader *fakeReader) ExpandReverse(
-	context.Context,
-	model.Snapshot,
-	[]model.UTxORef,
-	model.AssetSelector,
+	ctx context.Context,
+	snapshot model.Snapshot,
+	frontier []model.UTxORef,
+	_ model.AssetSelector,
 ) ([]model.FlowHyperedge, []model.PartialHistoryBoundary, error) {
-	return nil, nil, nil
+	if reader.expandReverse == nil {
+		return nil, nil, nil
+	}
+	edges, err := reader.expandReverse(ctx, snapshot, frontier)
+	return edges, nil, err
 }

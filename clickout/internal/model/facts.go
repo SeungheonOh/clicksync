@@ -42,6 +42,8 @@ type Output struct {
 	Kind                    OutputKind    `json:"kind"`
 	Address                 Bytes         `json:"address"`
 	AddressText             string        `json:"address_text,omitempty"`
+	PaymentCredentialKind   string        `json:"payment_credential_kind"`
+	PaymentCredentialHash   Bytes         `json:"payment_credential_hash,omitempty"`
 	Lovelace                uint64        `json:"lovelace"`
 	Assets                  []OutputAsset `json:"assets"`
 	DatumKind               string        `json:"datum_kind"`
@@ -52,18 +54,24 @@ type Output struct {
 }
 
 type Spend struct {
-	Source         UTxORef   `json:"source"`
-	ConsumingTx    Hash32    `json:"consuming_tx"`
-	Role           InputRole `json:"role"`
-	BodyOrdinal    uint32    `json:"body_ordinal"`
-	IsConsumed     bool      `json:"is_consumed"`
-	SourceResolved bool      `json:"source_resolved"`
+	Source               UTxORef   `json:"source"`
+	ConsumingTx          Hash32    `json:"consuming_tx"`
+	ConsumingBlockHash   Hash32    `json:"consuming_block_hash"`
+	ConsumingBlockHeight uint64    `json:"consuming_block_height"`
+	Role                 InputRole `json:"role"`
+	BodyOrdinal          uint32    `json:"body_ordinal"`
+	IsConsumed           bool      `json:"is_consumed"`
+	SourceResolved       bool      `json:"source_resolved"`
+	SourceOutput         *Output   `json:"source_output,omitempty"`
 }
 
 type OutputState struct {
-	Output    Output  `json:"output"`
-	SpentBy   *Hash32 `json:"spent_by,omitempty"`
-	IsCurrent bool    `json:"is_current"`
+	Output        Output         `json:"output"`
+	Uses          []Spend        `json:"uses"`
+	UsesTruncated bool           `json:"uses_truncated"`
+	SpentBy       *Hash32        `json:"spent_by,omitempty"`
+	Consumption   *FlowHyperedge `json:"consumption,omitempty"`
+	IsCurrent     bool           `json:"is_current"`
 }
 
 type Transaction struct {
@@ -113,6 +121,7 @@ type Withdrawal struct {
 	Lovelace       uint64 `json:"lovelace"`
 	BodyOrdinal    uint32 `json:"body_ordinal"`
 	Applied        bool   `json:"is_applied"`
+	CredentialKind string `json:"credential_kind"`
 	CredentialHash Bytes  `json:"credential_hash,omitempty"`
 }
 
@@ -161,6 +170,7 @@ type MintDelta struct {
 
 type FlowHyperedge struct {
 	Transaction         Hash32       `json:"transaction"`
+	Inputs              []Spend      `json:"inputs"`
 	ConsumedInputs      []UTxORef    `json:"consumed_inputs"`
 	ConsumedInputValues []Output     `json:"consumed_input_values"`
 	ProducedOutputs     []Output     `json:"produced_outputs"`

@@ -1,6 +1,7 @@
 package clickhouse
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -12,7 +13,7 @@ import (
 
 func activeArguments(snapshot model.Snapshot, extra ...any) []any {
 	result := make([]any, 0, 2+len(extra))
-	result = append(result, snapshot.Event, snapshot.Event)
+	result = append(result, snapshot.Event, snapshot.PublicationWatermark)
 	return append(result, extra...)
 }
 
@@ -31,6 +32,15 @@ func (store *Store) UTxO(
 		}
 		return model.OutputState{}, nil, err
 	}
+	uses, usesTruncated, err := store.usesByRef(ctx, snapshot, ref)
+	if err != nil {
+		return model.OutputState{}, nil, err
+	}
+	for index := range uses {
+		uses[index].SourceResolved = true
+		source := output
+		uses[index].SourceOutput = &source
+	}
 	consumers, err := store.spendersByRef(ctx, snapshot, ref)
 	if err != nil {
 		return model.OutputState{}, nil, err
@@ -38,9 +48,24 @@ func (store *Store) UTxO(
 	if len(consumers) > 1 {
 		return model.OutputState{}, nil, ErrConflictingRow
 	}
-	state := model.OutputState{Output: output, IsCurrent: len(consumers) == 0}
+	state := model.OutputState{
+		Output:        output,
+		Uses:          uses,
+		UsesTruncated: usesTruncated,
+		IsCurrent:     len(consumers) == 0,
+	}
 	if len(consumers) == 1 {
 		state.SpentBy = &consumers[0]
+		edges, boundaries, err := store.hyperedgesByTx(ctx, snapshot, consumers)
+		if err != nil {
+			return model.OutputState{}, nil, err
+		}
+		if len(edges) != 1 || edges[0].Transaction != consumers[0] {
+			return model.OutputState{}, nil, ErrConflictingRow
+		}
+		edge := edges[0]
+		state.Consumption = &edge
+		return state, boundaries, nil
 	}
 	return state, nil, nil
 }
@@ -76,10 +101,47 @@ func (store *Store) outputByRef(
 	case 0:
 		return model.Output{}, ErrNotFound
 	case 1:
+		if err := store.hydrateInlineDatums(ctx, results); err != nil {
+			return model.Output{}, err
+		}
 		return results[0], nil
 	default:
 		return model.Output{}, ErrConflictingRow
 	}
+}
+
+func (store *Store) usesByRef(
+	ctx context.Context,
+	snapshot model.Snapshot,
+	ref model.UTxORef,
+) ([]model.Spend, bool, error) {
+	queryCtx, finish := store.instrument(ctx, "utxo_uses")
+	defer finish()
+	rows, err := store.conn.Query(
+		queryCtx,
+		usesByRefSQL,
+		activeArguments(snapshot, hashArgument(ref.TxHash), ref.Index)...,
+	)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	result := make([]model.Spend, 0)
+	for rows.Next() {
+		use, err := scanSpend(rows)
+		if err != nil {
+			return nil, false, err
+		}
+		result = append(result, use)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	truncated := len(result) > 10_000
+	if truncated {
+		result = result[:10_000]
+	}
+	return result, truncated, nil
 }
 
 func (store *Store) spendersByRef(
@@ -135,11 +197,18 @@ func (store *Store) Transaction(
 		return model.Transaction{}, nil, err
 	}
 	resolved := make(map[string]struct{}, len(resolvedOutputs))
+	resolvedValues := make(map[string]model.Output, len(resolvedOutputs))
 	for _, output := range resolvedOutputs {
 		resolved[output.Ref.String()] = struct{}{}
+		resolvedValues[output.Ref.String()] = output
 	}
 	for index := range inputs {
-		_, inputs[index].SourceResolved = resolved[inputs[index].Source.String()]
+		key := inputs[index].Source.String()
+		_, inputs[index].SourceResolved = resolved[key]
+		if output, ok := resolvedValues[key]; ok {
+			value := output
+			inputs[index].SourceOutput = &value
+		}
 	}
 	outputs, err := store.outputsByTx(ctx, snapshot, hash)
 	if err != nil {
@@ -301,7 +370,13 @@ func (store *Store) outputsByTx(
 		}
 		outputs = append(outputs, output)
 	}
-	return outputs, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := store.hydrateInlineDatums(ctx, outputs); err != nil {
+		return nil, err
+	}
+	return outputs, nil
 }
 
 func (store *Store) Datum(
@@ -346,7 +421,7 @@ func (store *Store) Datum(
 			finish()
 			return model.Datum{}, errors.New("datum content hash mismatch")
 		}
-		result.BodyCBOR = model.Bytes(body)
+		result.BodyCBOR = model.Bytes(bytes.Clone(body))
 		result.BodyVerified = true
 		bodyRows++
 	}
@@ -425,6 +500,7 @@ func (store *Store) Withdrawals(
 	result := make([]model.Withdrawal, 0)
 	for rows.Next() {
 		var txHash, reward, credential []byte
+		var credentialKind string
 		var amount uint64
 		var ordinal uint32
 		var applied bool
@@ -434,6 +510,7 @@ func (store *Store) Withdrawals(
 			&amount,
 			&ordinal,
 			&applied,
+			&credentialKind,
 			&credential,
 		); err != nil {
 			return nil, err
@@ -442,16 +519,17 @@ func (store *Store) Withdrawals(
 		if err != nil {
 			return nil, err
 		}
-		if len(credential) != 28 {
-			return nil, fmt.Errorf("credential hash has %d bytes", len(credential))
+		if err := validateRewardAccount(reward, credentialKind, credential); err != nil {
+			return nil, err
 		}
 		result = append(result, model.Withdrawal{
 			TxHash:         tx,
-			RewardAccount:  model.Bytes(reward),
+			RewardAccount:  model.Bytes(bytes.Clone(reward)),
 			Lovelace:       amount,
 			BodyOrdinal:    ordinal,
 			Applied:        applied,
-			CredentialHash: model.Bytes(credential),
+			CredentialKind: credentialKind,
+			CredentialHash: model.Bytes(bytes.Clone(credential)),
 		})
 	}
 	return result, rows.Err()
@@ -495,10 +573,17 @@ func (store *Store) Metadata(
 		if content != calculateContentHash(cbor) {
 			return model.TransactionMetadata{}, errors.New("metadata content hash mismatch")
 		}
+		for index := 1; index < len(labels); index++ {
+			if labels[index-1] >= labels[index] {
+				return model.TransactionMetadata{}, errors.New(
+					"metadata labels are not strictly sorted and unique",
+				)
+			}
+		}
 		results = append(results, model.TransactionMetadata{
 			TxHash:      tx,
-			Labels:      labels,
-			MapCBOR:     model.Bytes(cbor),
+			Labels:      append([]uint64(nil), labels...),
+			MapCBOR:     model.Bytes(bytes.Clone(cbor)),
 			ByteLength:  uint64(length),
 			ContentHash: content,
 		})
@@ -514,6 +599,34 @@ func (store *Store) Metadata(
 	default:
 		return model.TransactionMetadata{}, ErrConflictingRow
 	}
+}
+
+func validateRewardAccount(account []byte, kind string, credential []byte) error {
+	if len(account) != 29 {
+		return fmt.Errorf("reward account has %d bytes, want 29", len(account))
+	}
+	if account[0]&0x0f != 1 {
+		return fmt.Errorf("reward account has non-mainnet network id %d", account[0]&0x0f)
+	}
+	var expectedHeader byte
+	switch kind {
+	case "key":
+		expectedHeader = 0xe0
+	case "script":
+		expectedHeader = 0xf0
+	default:
+		return fmt.Errorf("unsupported reward credential kind %q", kind)
+	}
+	if account[0]&0xf0 != expectedHeader {
+		return errors.New("reward credential kind disagrees with account header")
+	}
+	if len(credential) != 28 {
+		return fmt.Errorf("credential hash has %d bytes", len(credential))
+	}
+	if !bytes.Equal(account[1:], credential) {
+		return errors.New("reward credential hash disagrees with account")
+	}
+	return nil
 }
 
 func closeRows(rows driver.Rows) {

@@ -81,6 +81,7 @@ func (engine *Engine) trace(
 		layerCtx, cancel := context.WithTimeout(ctx, invocation.Trace.Limits.LayerTimeout)
 		next := make([]model.UTxORef, 0)
 		layerTimedOut := false
+		layerTruncated := false
 		for offset := 0; offset < len(frontier); offset += int(invocation.Trace.Limits.FrontierBatch) {
 			end := offset + int(invocation.Trace.Limits.FrontierBatch)
 			if end > len(frontier) {
@@ -128,8 +129,21 @@ func (engine *Engine) trace(
 				cancel()
 				return nil, err
 			}
+			sort.Slice(edges, func(left, right int) bool {
+				return edges[left].Transaction.String() < edges[right].Transaction.String()
+			})
 			for _, edge := range edges {
 				if _, exists := seenEdges[edge.Transaction.String()]; !exists {
+					if uint32(len(seenEdges)) >= invocation.Trace.Limits.MaxEdges {
+						response.Truncation.Truncated = true
+						response.Truncation.Reason = "max_edges"
+						response.Truncation.ContinuationFrontier = append(
+							response.Truncation.ContinuationFrontier,
+							frontier[offset:]...,
+						)
+						layerTruncated = true
+						break
+					}
 					seenEdges[edge.Transaction.String()] = struct{}{}
 					response.Data.Hyperedges = append(response.Data.Hyperedges, edge)
 				}
@@ -147,10 +161,13 @@ func (engine *Engine) trace(
 					}
 				}
 			}
+			if layerTruncated {
+				break
+			}
 		}
 		cancel()
 		response.Data.Depth = depth + 1
-		if layerTimedOut {
+		if layerTimedOut || layerTruncated {
 			break
 		}
 		next = uniqueSorted(next)

@@ -144,6 +144,7 @@ func parseTrace(args []string) (Invocation, error) {
 	address := flags.String("address", "", "seed address")
 	maxDepth := flags.Uint("max-depth", uint(limits.DefaultTraceDepth), "maximum depth")
 	maxNodes := flags.Uint("max-nodes", uint(limits.DefaultTraceNodes), "maximum visited UTxOs")
+	maxEdges := flags.Uint("max-edges", uint(limits.DefaultTraceEdges), "maximum transaction hyperedges")
 	asset := flags.String("asset", "ada", "ada or POLICY_HEX.ASSET_NAME_HEX")
 	format := flags.String("format", "jsonl", "jsonl")
 	if err := flags.Parse(args); err != nil {
@@ -158,12 +159,15 @@ func parseTrace(args []string) (Invocation, error) {
 	if *format != "jsonl" {
 		return Invocation{}, usageError("trace --format must be jsonl")
 	}
-	if uint64(*maxDepth) > uint64(^uint32(0)) || uint64(*maxNodes) > uint64(^uint32(0)) {
+	if uint64(*maxDepth) > uint64(^uint32(0)) ||
+		uint64(*maxNodes) > uint64(^uint32(0)) ||
+		uint64(*maxEdges) > uint64(^uint32(0)) {
 		return Invocation{}, usageError("trace bounds overflow")
 	}
 	traceLimits := limits.DefaultTrace()
 	traceLimits.MaxDepth = uint32(*maxDepth)
 	traceLimits.MaxNodes = uint32(*maxNodes)
+	traceLimits.MaxEdges = uint32(*maxEdges)
 	if err := traceLimits.Validate(); err != nil {
 		return Invocation{}, usageError("%v", err)
 	}
