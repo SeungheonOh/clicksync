@@ -138,6 +138,9 @@ func transactionBundle(
 	if err := appendInputs(&ret, tx.ReferenceInputs(), "reference", false); err != nil {
 		return model.Transaction{}, err
 	}
+	if err := rejectSpendingReferenceOverlap(ret.Inputs); err != nil {
+		return model.Transaction{}, err
+	}
 	if valid {
 		for index, output := range tx.Outputs() {
 			facts, observations, err := outputBundle(
@@ -251,6 +254,36 @@ func appendInputs(
 			Role:             role,
 			Consumed:         consumed,
 		})
+	}
+	return nil
+}
+
+func rejectSpendingReferenceOverlap(inputs []model.Input) error {
+	// Conway's UTXO rule rejects BabbageNonDisjointRefInputs:
+	// https://cardano-ledger.cardano.intersectmbo.org/cardano-ledger-conway/src/Cardano.Ledger.Conway.Rules.Utxo.html
+	// Do not extend this to collateral overlaps, which Alonzo UTxO permits:
+	// https://cardano-ledger.cardano.intersectmbo.org/cardano-ledger-alonzo/Cardano-Ledger-Alonzo-UTxO.html
+	type inputRef struct {
+		hash  model.Hash32
+		index uint32
+	}
+	spending := make(map[inputRef]struct{})
+	for _, input := range inputs {
+		if input.Role == "regular" {
+			spending[inputRef{hash: input.SourceHash, index: input.SourceIndex}] = struct{}{}
+		}
+	}
+	for _, input := range inputs {
+		ref := inputRef{hash: input.SourceHash, index: input.SourceIndex}
+		if input.Role == "reference" {
+			if _, overlaps := spending[ref]; overlaps {
+				return fmt.Errorf(
+					"regular input reference %x#%d also appears as reference input",
+					input.SourceHash,
+					input.SourceIndex,
+				)
+			}
+		}
 	}
 	return nil
 }

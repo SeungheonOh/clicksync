@@ -125,6 +125,62 @@ func TestInvalidZeroTotalCollateralRemainsUnknownDuringNormalization(t *testing.
 	}
 }
 
+func TestTransactionBundleRejectsRegularReferenceOverlap(t *testing.T) {
+	shared := ledger.NewShelleyTransactionInput(strings.Repeat("11", 32), 7)
+	tx := testConwayTransaction(t, true, txOptions{
+		inputs:    []ledger.ShelleyTransactionInput{shared},
+		reference: []ledger.ShelleyTransactionInput{shared},
+		fee:       1,
+	})
+	if _, err := transactionBundle(tx, 0, "Conway", bundleDatumCollector{}); err == nil ||
+		!strings.Contains(
+			err.Error(),
+			"regular input reference 1111111111111111111111111111111111111111111111111111111111111111#7 also appears as reference input",
+		) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestTransactionBundleAllowsRegularCollateralOverlap(t *testing.T) {
+	shared := ledger.NewShelleyTransactionInput(strings.Repeat("11", 32), 7)
+	tx := testConwayTransaction(t, true, txOptions{
+		inputs:     []ledger.ShelleyTransactionInput{shared},
+		collateral: []ledger.ShelleyTransactionInput{shared},
+		fee:        1,
+	})
+	got, err := transactionBundle(tx, 0, "Conway", bundleDatumCollector{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Inputs) != 2 ||
+		got.Inputs[0].Role != "regular" || !got.Inputs[0].Consumed ||
+		got.Inputs[0].BodyOrdinal != 0 ||
+		got.Inputs[1].Role != "collateral" || got.Inputs[1].Consumed ||
+		got.Inputs[1].BodyOrdinal != 0 {
+		t.Fatalf("input roles = %#v", got.Inputs)
+	}
+}
+
+func TestTransactionBundleAllowsCollateralReferenceOverlap(t *testing.T) {
+	shared := ledger.NewShelleyTransactionInput(strings.Repeat("11", 32), 7)
+	tx := testConwayTransaction(t, true, txOptions{
+		collateral: []ledger.ShelleyTransactionInput{shared},
+		reference:  []ledger.ShelleyTransactionInput{shared},
+		fee:        1,
+	})
+	got, err := transactionBundle(tx, 0, "Conway", bundleDatumCollector{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Inputs) != 2 ||
+		got.Inputs[0].Role != "collateral" || got.Inputs[0].Consumed ||
+		got.Inputs[0].BodyOrdinal != 0 ||
+		got.Inputs[1].Role != "reference" || got.Inputs[1].Consumed ||
+		got.Inputs[1].BodyOrdinal != 0 {
+		t.Fatalf("input roles = %#v", got.Inputs)
+	}
+}
+
 func TestSpendRedeemerUsesLedgerOrderedInputSetAndPreservesBodyOrdinal(t *testing.T) {
 	wireFirst := ledger.NewShelleyTransactionInput(strings.Repeat("22", 32), 9)
 	ledgerFirst := ledger.NewShelleyTransactionInput(strings.Repeat("11", 32), 7)
