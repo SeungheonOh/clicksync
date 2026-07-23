@@ -45,6 +45,8 @@ services:
       clickhouse:
         condition: service_healthy
     command: ["sync"]
+    # Exceeds the binary's 45s finalization/flush timeout.
+    stop_grace_period: 60s
     environment:
       CLICKHOUSE_HOST: clickhouse
       CLICKHOUSE_NATIVE_PORT: "9000"

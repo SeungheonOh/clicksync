@@ -210,3 +210,30 @@ func TestExecutableRuntimeHasNoArtificialSyncOrStorageCeiling(t *testing.T) {
 		}
 	}
 }
+
+func TestComposeStopGraceExceedsBinaryFinalizationWindow(t *testing.T) {
+	_, file, _, _ := runtime.Caller(0)
+	root := filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+	compose, err := os.ReadFile(filepath.Join(root, "compose.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeSource, err := os.ReadFile(
+		filepath.Join(root, "internal", "ingest", "runtime.go"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(
+		string(runtimeSource),
+		"shutdownTimeout      = 45 * time.Second",
+	) {
+		t.Fatal("binary shutdown timeout changed; re-audit container stop grace")
+	}
+	if !strings.Contains(
+		string(compose),
+		"stop_grace_period: 60s",
+	) {
+		t.Fatal("clicksync service stop grace does not protect final flush")
+	}
+}
