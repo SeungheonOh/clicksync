@@ -24,6 +24,7 @@ import (
 	pcommon "github.com/blinklabs-io/gouroboros/protocol/common"
 
 	"clicksync/p2p/internal/contract"
+	"clicksync/p2p/internal/normalize"
 )
 
 const (
@@ -75,14 +76,11 @@ type peerTip struct {
 }
 
 type probePayload struct {
-	Mode              string   `json:"mode"`
-	DatasetStatus     string   `json:"dataset_status"`
-	TrustDescription  string   `json:"trust_description"`
-	Era               string   `json:"era"`
-	BlockType         int      `json:"block_type"`
-	BlockNumber       uint64   `json:"block_number"`
-	TransactionCount  int      `json:"transaction_count"`
-	CorroboratedPeers []string `json:"corroborated_peers"`
+	Mode              string          `json:"mode"`
+	DatasetStatus     string          `json:"dataset_status"`
+	TrustDescription  string          `json:"trust_description"`
+	CorroboratedPeers []string        `json:"corroborated_peers"`
+	Block             normalize.Block `json:"block"`
 }
 
 func main() {
@@ -230,6 +228,10 @@ func runProbe(ctx context.Context, cfg config, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	blockFacts, err := normalize.BlockFacts(block)
+	if err != nil {
+		return fmt.Errorf("normalize fetched block: %w", err)
+	}
 
 	sessionID, err := newSessionID()
 	if err != nil {
@@ -266,11 +268,8 @@ func runProbe(ctx context.Context, cfg config, logger *slog.Logger) error {
 		Mode:              "probe",
 		DatasetStatus:     "partial_tail",
 		TrustDescription:  trustLabel,
-		Era:               block.Era().Name,
-		BlockType:         block.Type(),
-		BlockNumber:       block.BlockNumber(),
-		TransactionCount:  len(block.Transactions()),
 		CorroboratedPeers: corroborated,
+		Block:             blockFacts,
 	})
 	if err != nil {
 		return err

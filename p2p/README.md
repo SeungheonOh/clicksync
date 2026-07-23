@@ -11,7 +11,17 @@ The initial `probe` command:
 3. selects the oldest observed tip as the least-fresh candidate;
 4. fetches that exact block from each required relay with BlockFetch;
 5. requires identical header and body commitments; and
-6. emits protocol-only, explicitly partial/peer-observed NDJSON.
+6. recomputes transaction and datum identities while projecting only
+   ledger-effective UTxO facts; and
+7. emits protocol-only, explicitly partial/peer-observed NDJSON.
+
+The normalization boundary retains inputs, outputs, fees, mint/burn, raw
+address/asset bytes, datum hashes, and exact datum CBOR bodies. It does not
+emit block/transaction/script CBOR, reference inputs, redeemers, metadata, or
+governance fields. Phase-2-invalid transactions emit only their collateral
+inputs and optional collateral return. A Dijkstra transaction containing
+nested sub-transactions currently fails closed because its output-reference
+semantics have not yet passed an independent golden vector.
 
 The three defaults are the separately operated IOG, EMURGO, and Cardano
 Foundation bootstrap names accepted in decision D-005. A duplicate configured
@@ -54,4 +64,5 @@ The audited checkpoint occupied 213.9 MiB in that volume. It contains
 downloaded Go modules only and may be removed by its exact name; no global
 Docker cleanup is needed.
 
-See `evidence/live-wire-2026-07-23.md` for the first live gate.
+See `evidence/live-wire-2026-07-23.md` for the first transport gate and
+`evidence/live-normalized-2026-07-23.md` for the real UTxO-flow envelope.
