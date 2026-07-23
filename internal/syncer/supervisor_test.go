@@ -1072,6 +1072,191 @@ func TestRollbackRejectsCommittedPrefixTailDifferentFromTarget(t *testing.T) {
 	}
 }
 
+func TestRollbackCommittedPrefixCheckpointUnavailabilityIsNonTerminal(
+	t *testing.T,
+) {
+	primary := actualPeer(
+		testPeer("relay-a:3001", "operator-a"),
+		"198.51.100.1:3001",
+		15,
+	)
+	target := testChainPoint(8, 8, 0x08)
+	branchTip := chainsync.Tip{
+		Point:       testPoint(12, 0x12),
+		BlockNumber: 12,
+	}
+	delegate := &fakeHandler{
+		rollBackward: func(
+			context.Context,
+			n2n.ChainPoint,
+			chainsync.Tip,
+			RollbackEvidence,
+		) (CommitOutcome, error) {
+			tail := cloneChainPoint(target)
+			tip := cloneTip(branchTip)
+			return CommitOutcome{
+				Committed:          true,
+				CommittedBlocks:    1,
+				LastCommittedPoint: &tail,
+				LastCommittedTip:   &tip,
+			}, nil
+		},
+	}
+	transport := &fakeTransport{
+		rollbackProbe: func(
+			context.Context,
+			n2n.Peer,
+			pcommon.Point,
+			pcommon.Point,
+		) (RollbackProbeResult, error) {
+			return RollbackProbeResult{
+				TargetAccepted: true,
+				BranchAccepted: true,
+				Tip:            branchTip,
+				N2NVersion:     15,
+				Address:        "198.51.100.2:3001",
+			}, nil
+		},
+		probe: func(
+			context.Context,
+			n2n.Peer,
+			pcommon.Point,
+		) (ProbeResult, error) {
+			return ProbeResult{}, RetryableTransportError(
+				errors.New("checkpoint relay unavailable"),
+			)
+		},
+	}
+	config := baseConfig()
+	config.CheckpointEveryBlocks = 1
+	supervisor := newTestSupervisor(
+		t,
+		config,
+		&fakeCandidates{},
+		delegate,
+		&fakeObserver{},
+		transport,
+	)
+	attempt := &attemptHandler{
+		supervisor: supervisor,
+		evidence: SourceEvidence{
+			Primary: PeerEvidence{
+				Peer:       primary,
+				Tip:        branchTip,
+				N2NVersion: 15,
+			},
+		},
+		delegate:        delegate,
+		committedBlocks: new(uint64),
+	}
+	err := attempt.RollBackward(
+		context.Background(),
+		target,
+		branchTip,
+		primary,
+	)
+	var transportErr *TransportError
+	var checkpointErr *CheckpointCorroborationUnavailableError
+	if !errors.As(err, &transportErr) ||
+		!errors.As(err, &checkpointErr) ||
+		attempt.terminalErr != nil ||
+		!attempt.committed ||
+		*attempt.committedBlocks != 1 {
+		t.Fatalf(
+			"error=%v terminal=%v committed=%t blocks=%d",
+			err,
+			attempt.terminalErr,
+			attempt.committed,
+			*attempt.committedBlocks,
+		)
+	}
+}
+
+func TestProvenNonDurableRollbackTargetRequestsNonTerminalReplay(t *testing.T) {
+	primary := actualPeer(
+		testPeer("relay-a:3001", "operator-a"),
+		"198.51.100.1:3001",
+		15,
+	)
+	target := testChainPoint(11, 11, 0x11)
+	durable := testChainPoint(10, 10, 0x10)
+	branchTip := chainsync.Tip{
+		Point:       testPoint(12, 0x12),
+		BlockNumber: 12,
+	}
+	delegate := &fakeHandler{
+		rollBackward: func(
+			context.Context,
+			n2n.ChainPoint,
+			chainsync.Tip,
+			RollbackEvidence,
+		) (CommitOutcome, error) {
+			return CommitOutcome{Committed: true},
+				&RollbackReplayRequiredError{
+					ObservedTarget: target,
+					DurableTip:     durable,
+				}
+		},
+	}
+	transport := &fakeTransport{
+		rollbackProbe: func(
+			context.Context,
+			n2n.Peer,
+			pcommon.Point,
+			pcommon.Point,
+		) (RollbackProbeResult, error) {
+			return RollbackProbeResult{
+				TargetAccepted: true,
+				BranchAccepted: true,
+				Tip:            branchTip,
+				N2NVersion:     15,
+				Address:        "198.51.100.2:3001",
+			}, nil
+		},
+	}
+	supervisor := newTestSupervisor(
+		t,
+		baseConfig(),
+		&fakeCandidates{},
+		delegate,
+		&fakeObserver{},
+		transport,
+	)
+	attempt := &attemptHandler{
+		supervisor: supervisor,
+		evidence: SourceEvidence{
+			Primary: PeerEvidence{
+				Peer:       primary,
+				Tip:        branchTip,
+				N2NVersion: 15,
+			},
+		},
+		delegate:        delegate,
+		committedBlocks: new(uint64),
+	}
+	err := attempt.RollBackward(
+		context.Background(),
+		target,
+		branchTip,
+		primary,
+	)
+	var transportErr *TransportError
+	var replay *RollbackReplayRequiredError
+	if !errors.As(err, &transportErr) ||
+		!errors.As(err, &replay) ||
+		attempt.terminalErr != nil ||
+		!attempt.committed ||
+		*attempt.committedBlocks != 0 {
+		t.Fatalf(
+			"error=%v terminal=%v committed=%t blocks=%d",
+			err,
+			attempt.terminalErr,
+			attempt.committed,
+			*attempt.committedBlocks,
+		)
+	}
+}
+
 func TestRollbackDisagreementQuarantinesBeforeHandlerCommit(t *testing.T) {
 	primary := actualPeer(
 		testPeer("relay-a:3001", "operator-a"),
@@ -1446,6 +1631,114 @@ func TestMicrobatchStagesThenFinalizesOnContextShutdown(t *testing.T) {
 	}
 }
 
+func TestShutdownFinalFlushCheckpointUnavailabilityIsNonTerminal(t *testing.T) {
+	point := testChainPoint(13, 13, 0x13)
+	tip := chainsync.Tip{
+		Point:       clonePoint(point.Point),
+		BlockNumber: point.BlockNumber,
+	}
+	handler := &fakeHandler{
+		endAttempt: func(
+			context.Context,
+			AttemptEnd,
+		) (CommitOutcome, error) {
+			tail := cloneChainPoint(point)
+			tailTip := cloneTip(tip)
+			return CommitOutcome{
+				Committed:          true,
+				CommittedBlocks:    1,
+				LastCommittedPoint: &tail,
+				LastCommittedTip:   &tailTip,
+			}, nil
+		},
+	}
+	transport := &fakeTransport{
+		probe: func(
+			context.Context,
+			n2n.Peer,
+			pcommon.Point,
+		) (ProbeResult, error) {
+			return ProbeResult{}, RetryableTransportError(
+				errors.New("checkpoint relay unavailable"),
+			)
+		},
+	}
+	config := baseConfig()
+	config.CheckpointEveryBlocks = 1
+	supervisor := newTestSupervisor(
+		t,
+		config,
+		&fakeCandidates{},
+		handler,
+		&fakeObserver{},
+		transport,
+	)
+	primary := actualPeer(
+		testPeer("relay-a:3001", "operator-a"),
+		"198.51.100.1:3001",
+		15,
+	)
+	attempt := &attemptHandler{
+		supervisor: supervisor,
+		evidence: SourceEvidence{
+			Primary: PeerEvidence{
+				Peer:       primary,
+				Tip:        tip,
+				N2NVersion: 15,
+			},
+		},
+		delegate:        handler,
+		committedBlocks: new(uint64),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := attempt.finish(ctx, "context_shutdown")
+	var transportErr *TransportError
+	var checkpointErr *CheckpointCorroborationUnavailableError
+	if !errors.As(err, &transportErr) ||
+		!errors.As(err, &checkpointErr) ||
+		attempt.terminalErr != nil ||
+		!attempt.committed ||
+		*attempt.committedBlocks != 1 {
+		t.Fatalf(
+			"error=%v terminal=%v committed=%t blocks=%d",
+			err,
+			attempt.terminalErr,
+			attempt.committed,
+			*attempt.committedBlocks,
+		)
+	}
+}
+
+func TestAttemptErrorPrecedencePreservesPrimaryPeerViolation(t *testing.T) {
+	peerData := &n2n.PeerDataViolation{
+		Kind:  "header_body_mismatch",
+		Point: testPoint(13, 0x13),
+		Err:   errors.New("invalid primary body"),
+	}
+	checkpoint := RetryableTransportError(
+		&CheckpointCorroborationUnavailableError{
+			Checkpoint: testChainPoint(12, 12, 0x12),
+			Confirmed:  1,
+			Required:   2,
+			Err:        errors.New("secondary unavailable"),
+		},
+	)
+	got := combineAttemptErrors(peerData, checkpoint)
+	var gotPeerData *n2n.PeerDataViolation
+	var gotCheckpoint *CheckpointCorroborationUnavailableError
+	if !errors.As(got, &gotPeerData) ||
+		!errors.As(got, &gotCheckpoint) {
+		t.Fatalf("combined error lost precedence/evidence: %v", got)
+	}
+
+	unclassified := errors.New("ambiguous Follow failure")
+	if got := combineAttemptErrors(unclassified, checkpoint); !errors.Is(got, unclassified) ||
+		errors.As(got, &gotCheckpoint) {
+		t.Fatalf("unclassified Follow error was masked: %v", got)
+	}
+}
+
 func TestPeriodicCheckpointDisagreementStopsAfterCommittedAdoption(t *testing.T) {
 	start := testPoint(10, 0x10)
 	block := testBlock(11, 11, 0x11)
@@ -1484,6 +1777,93 @@ func TestPeriodicCheckpointDisagreementStopsAfterCommittedAdoption(t *testing.T)
 			pointsEqual(value.Checkpoint, testPoint(11, 0x11))
 	}) {
 		t.Fatalf("observations = %#v", observer.observations)
+	}
+}
+
+func TestPeriodicCheckpointUnavailabilityReconnectsAndRecorroboratesCommittedTip(
+	t *testing.T,
+) {
+	start := testChainPoint(10, 10, 0x10)
+	block := testBlock(11, 11, 0x11)
+	committed := testChainPoint(11, 11, 0x11)
+	candidates := &fakeCandidates{
+		load: func(call int) []n2n.ChainPoint {
+			if call == 1 {
+				return []n2n.ChainPoint{start}
+			}
+			return []n2n.ChainPoint{committed}
+		},
+	}
+	transport := acceptingTransport()
+	unavailable := false
+	transport.probe = func(
+		_ context.Context,
+		peer n2n.Peer,
+		point pcommon.Point,
+	) (ProbeResult, error) {
+		if pointsEqual(point, committed.Point) &&
+			peer.Operator == "operator-b" &&
+			!unavailable {
+			unavailable = true
+			return ProbeResult{}, RetryableTransportError(
+				errors.New("checkpoint relay unavailable"),
+			)
+		}
+		return ProbeResult{
+			Accepted: true,
+			Tip: chainsync.Tip{
+				Point:       testPoint(20, 0x20),
+				BlockNumber: 20,
+			},
+			N2NVersion: 15,
+			Address:    "192.0.2.20:3001",
+		}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	followCalls := 0
+	transport.follow = func(
+		ctx context.Context,
+		peer n2n.Peer,
+		points []n2n.ChainPoint,
+		target n2n.Handler,
+	) error {
+		followCalls++
+		if followCalls == 2 {
+			cancel()
+			return ctx.Err()
+		}
+		peer = prepareFollowPeer(
+			peer,
+			chainsync.Tip{
+				Point:       clonePoint(points[0].Point),
+				BlockNumber: points[0].BlockNumber,
+			},
+		)
+		if err := target.Reconcile(ctx, points[0], peer); err != nil {
+			return err
+		}
+		return target.RollForward(ctx, block, tipForBlock(block), peer)
+	}
+	config := baseConfig()
+	config.CheckpointEveryBlocks = 1
+	supervisor := newTestSupervisor(
+		t,
+		config,
+		candidates,
+		&fakeHandler{rollForward: committingForward},
+		&fakeObserver{},
+		transport,
+	)
+	if err := supervisor.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v", err)
+	}
+	if !unavailable || followCalls != 2 || candidates.calls < 2 {
+		t.Fatalf(
+			"unavailable=%t follows=%d candidate loads=%d",
+			unavailable,
+			followCalls,
+			candidates.calls,
+		)
 	}
 }
 

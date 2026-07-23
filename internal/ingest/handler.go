@@ -56,6 +56,11 @@ type stagedBlock struct {
 	rows         uint64
 }
 
+type observedRollback struct {
+	target           n2n.ChainPoint
+	targetWasPending bool
+}
+
 type Handler struct {
 	publisher Publisher
 	state     ChainState
@@ -68,6 +73,7 @@ type Handler struct {
 	pendingRows  uint64
 	firstStaged  time.Time
 	timer        *time.Timer
+	rollbackSeen *observedRollback
 	unreported   syncer.CommitOutcome
 	terminalErr  error
 	timerStopped bool
@@ -242,6 +248,59 @@ func (handler *Handler) RollBackward(
 		handler.failLocked(err)
 		return handler.terminalOutcomeLocked(false)
 	}
+	if handler.rollbackSeen != nil &&
+		!samePublicationPoint(
+			publicationPoint(handler.rollbackSeen.target),
+			publicationPoint(point),
+		) {
+		handler.failLocked(
+			errors.New(
+				"confirmed rollback target differs from observed barrier target",
+			),
+		)
+		return handler.terminalOutcomeLocked(false)
+	}
+	if handler.rollbackSeen != nil &&
+		handler.rollbackSeen.targetWasPending {
+		durable, durableErr := handler.committedTip(ctx)
+		if durableErr != nil {
+			handler.failLocked(durableErr)
+			return handler.terminalOutcomeLocked(false)
+		}
+		durablePoint, durableErr := chainPointFromPublication(durable)
+		if durableErr != nil {
+			handler.failLocked(durableErr)
+			return handler.terminalOutcomeLocked(false)
+		}
+		request, requestErr := handler.rollbackRequest(
+			durable,
+			"corroborated rollback target was staged only; reconnect from actual durable tip",
+			confirmations,
+		)
+		if requestErr != nil {
+			handler.failLocked(requestErr)
+			return handler.terminalOutcomeLocked(false)
+		}
+		if publishErr := handler.publisher.Rollback(
+			ctx,
+			request,
+		); publishErr != nil {
+			var committed *publication.CommittedError
+			if errors.As(publishErr, &committed) {
+				handler.unreported.Committed = true
+			}
+			handler.failLocked(publishErr)
+			return handler.terminalOutcomeLocked(false)
+		}
+		handler.rollbackSeen = nil
+		outcome := handler.takeUnreportedLocked()
+		outcome.Committed = true
+		return outcome, &syncer.RollbackReplayRequiredError{
+			ObservedTarget: cloneChainPointValue(point),
+			DurableTip:     durablePoint,
+		}
+	}
+	handler.rollbackSeen = nil
 	target := publicationPoint(point)
 	retained := -1
 	for index := range handler.pending {
@@ -286,18 +345,42 @@ func (handler *Handler) RollBackward(
 	return outcome, nil
 }
 
-// RollbackObserved is a non-durable safety barrier. A valid ChainSync
-// rollback means every staged descendant may be off-chain; discard them
-// before network corroboration can block, fail, or be canceled.
+// RollbackObserved is a non-durable safety barrier. Pending blocks are never
+// published after a valid rollback callback. Whether the exact target was
+// pending is remembered so successful proof can acknowledge the actual
+// durable tip and force replay instead of pretending the target was durable.
 func (handler *Handler) RollbackObserved(
 	_ context.Context,
-	_ n2n.ChainPoint,
+	target n2n.ChainPoint,
 	_ chainsync.Tip,
 ) error {
 	handler.mu.Lock()
 	defer handler.mu.Unlock()
 	handler.stopTimerLocked()
+	targetWasPending := false
+	for _, staged := range handler.pending {
+		if samePublicationPoint(
+			publicationPoint(staged.point),
+			publicationPoint(target),
+		) {
+			targetWasPending = true
+			break
+		}
+	}
 	handler.clearPendingLocked()
+	handler.rollbackSeen = &observedRollback{
+		target:           cloneChainPointValue(target),
+		targetWasPending: targetWasPending,
+	}
+	if handler.unreported.LastCommittedPoint != nil &&
+		!samePublicationPoint(
+			publicationPoint(*handler.unreported.LastCommittedPoint),
+			publicationPoint(target),
+		) {
+		// The adoption is durable, but a post-rollback outcome must never
+		// report a descendant as the retained tail.
+		handler.unreported = syncer.CommitOutcome{}
+	}
 	return handler.terminalErr
 }
 
@@ -375,7 +458,10 @@ func (handler *Handler) EndAttempt(
 	handler.mu.Lock()
 	defer handler.mu.Unlock()
 	handler.stopTimerLocked()
-	if handler.terminalErr == nil && len(handler.pending) > 0 {
+	if handler.rollbackSeen != nil {
+		handler.clearPendingLocked()
+		handler.rollbackSeen = nil
+	} else if handler.terminalErr == nil && len(handler.pending) > 0 {
 		handler.flushLocked(ctx)
 	}
 	outcome := handler.takeUnreportedLocked()
@@ -507,7 +593,9 @@ func (handler *Handler) flushFromTimer() {
 	handler.mu.Lock()
 	defer handler.mu.Unlock()
 	handler.timer = nil
-	if handler.timerStopped || handler.terminalErr != nil || len(handler.pending) == 0 {
+	if handler.timerStopped ||
+		handler.terminalErr != nil ||
+		len(handler.pending) == 0 {
 		return
 	}
 	ctx, cancel := context.WithTimeout(
@@ -519,7 +607,8 @@ func (handler *Handler) flushFromTimer() {
 }
 
 func (handler *Handler) flushLocked(ctx context.Context) {
-	if len(handler.pending) == 0 || handler.terminalErr != nil {
+	if len(handler.pending) == 0 ||
+		handler.terminalErr != nil {
 		return
 	}
 	handler.stopTimerLocked()
@@ -736,6 +825,24 @@ func publicationPoint(point n2n.ChainPoint) publication.Point {
 	}
 }
 
+func chainPointFromPublication(
+	point publication.Point,
+) (n2n.ChainPoint, error) {
+	if point.Origin {
+		return n2n.NewChainPointOrigin(), nil
+	}
+	if point.Hash == (model.Hash32{}) {
+		return n2n.ChainPoint{}, errors.New(
+			"durable publication tip has zero hash",
+		)
+	}
+	raw := pcommon.NewPoint(point.Slot, point.Hash[:])
+	if point.IsByronEBB {
+		return n2n.NewByronEBBChainPoint(raw, point.BlockNumber), nil
+	}
+	return n2n.NewChainPoint(raw, point.BlockNumber), nil
+}
+
 func samePublicationPoint(left, right publication.Point) bool {
 	if left.Origin || right.Origin {
 		return left.Origin == right.Origin
@@ -765,11 +872,16 @@ func cloneTipPointer(value chainsync.Tip) *chainsync.Tip {
 }
 
 func cloneChainPointPointer(value n2n.ChainPoint) *n2n.ChainPoint {
-	var ret n2n.ChainPoint
-	if value.IsByronEBB {
-		ret = n2n.NewByronEBBChainPoint(value.Point, value.BlockNumber)
-	} else {
-		ret = n2n.NewChainPoint(value.Point, value.BlockNumber)
-	}
+	ret := cloneChainPointValue(value)
 	return &ret
+}
+
+func cloneChainPointValue(value n2n.ChainPoint) n2n.ChainPoint {
+	if value.IsByronEBB {
+		return n2n.NewByronEBBChainPoint(
+			value.Point,
+			value.BlockNumber,
+		)
+	}
+	return n2n.NewChainPoint(value.Point, value.BlockNumber)
 }

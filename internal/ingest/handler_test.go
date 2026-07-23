@@ -80,7 +80,11 @@ func (state *fakeChainState) CommittedTip(
 
 func TestHandlerStagesThenFinalizesExactCommittedTail(t *testing.T) {
 	publisher := &fakePublisher{}
-	handler := newTestHandler(t, publisher)
+	handler := newTestHandlerWithState(
+		t,
+		publisher,
+		&fakeChainState{tip: publication.Point{Origin: true}},
+	)
 	block := adapterTestBlock{slot: 10, number: 10, hash: adapterHash(0x10)}
 	tip := adapterTip(block)
 	outcome, err := handler.RollForward(
@@ -205,8 +209,11 @@ type rollbackBarrierTransport struct {
 	cancel               context.CancelFunc
 	stopAfterUnavailable bool
 	checkpoint           n2n.ChainPoint
+	rollbackTarget       n2n.ChainPoint
 	block                adapterTestBlock
+	blocks               []adapterTestBlock
 	branchTip            chainsync.Tip
+	beforeRollback       func()
 }
 
 func (transport *rollbackBarrierTransport) Probe(
@@ -251,6 +258,14 @@ func (transport *rollbackBarrierTransport) ProbeRollback(
 	case "context cancellation during proof":
 		transport.cancel()
 		return syncer.RollbackProbeResult{}, context.Canceled
+	case "paired proof success":
+		return syncer.RollbackProbeResult{
+			TargetAccepted: true,
+			BranchAccepted: true,
+			Tip:            transport.branchTip,
+			N2NVersion:     15,
+			Address:        "relay-b:3001",
+		}, nil
 	default:
 		return syncer.RollbackProbeResult{}, errors.New("unknown scenario")
 	}
@@ -271,25 +286,47 @@ func (transport *rollbackBarrierTransport) Follow(
 	if err := handler.Reconcile(ctx, candidates[0], peer); err != nil {
 		return err
 	}
-	if err := handler.RollForward(
-		ctx,
-		transport.block,
-		transport.branchTip,
-		peer,
-	); err != nil {
-		return err
+	blocks := transport.blocks
+	if len(blocks) == 0 {
+		blocks = []adapterTestBlock{transport.block}
 	}
-	return handler.RollBackward(
+	for _, block := range blocks {
+		if err := handler.RollForward(
+			ctx,
+			block,
+			transport.branchTip,
+			peer,
+		); err != nil {
+			return err
+		}
+	}
+	if transport.beforeRollback != nil {
+		transport.beforeRollback()
+	}
+	target := transport.rollbackTarget
+	if len(target.Point.Hash) == 0 {
+		target = transport.checkpoint
+	}
+	err := handler.RollBackward(
 		ctx,
-		transport.checkpoint,
+		target,
 		transport.branchTip,
 		peer,
 	)
+	if err == nil && transport.scenario == "paired proof success" {
+		transport.cancel()
+		return ctx.Err()
+	}
+	return err
 }
 
-func TestRollbackRetainsEligiblePrefixThenRecordsHeader(t *testing.T) {
+func TestProvenPendingRollbackTargetAcknowledgesDurableTipAndReplays(t *testing.T) {
 	publisher := &fakePublisher{}
-	handler := newTestHandler(t, publisher)
+	handler := newTestHandlerWithState(
+		t,
+		publisher,
+		&fakeChainState{tip: publication.Point{Origin: true}},
+	)
 	var blocks []adapterTestBlock
 	for number := uint64(10); number <= 12; number++ {
 		block := adapterTestBlock{
@@ -312,24 +349,279 @@ func TestRollbackRetainsEligiblePrefixThenRecordsHeader(t *testing.T) {
 		pcommon.NewPoint(blocks[0].slot, blocks[0].hash.Bytes()),
 		blocks[0].number,
 	)
+	if err := handler.RollbackObserved(
+		context.Background(),
+		target,
+		adapterTip(blocks[2]),
+	); err != nil {
+		t.Fatal(err)
+	}
 	outcome, err := handler.RollBackward(
 		context.Background(),
 		target,
 		adapterTip(blocks[2]),
 		adapterRollbackEvidence(target, adapterTip(blocks[2])),
 	)
+	var replay *syncer.RollbackReplayRequiredError
+	if !errors.As(err, &replay) {
+		t.Fatalf("error = %T %v", err, err)
+	}
+	if !outcome.Committed ||
+		outcome.CommittedBlocks != 0 ||
+		outcome.LastCommittedPoint != nil {
+		t.Fatalf("rollback outcome = %#v", outcome)
+	}
+	if len(publisher.batches) != 0 {
+		t.Fatalf("staged target was published: %#v", publisher.batches)
+	}
+	if len(publisher.rollbacks) != 1 ||
+		!publisher.rollbacks[0].To.Origin ||
+		!samePublicationPoint(
+			publicationPoint(replay.ObservedTarget),
+			publicationPoint(target),
+		) ||
+		replay.DurableTip.Point.Slot != 0 ||
+		len(replay.DurableTip.Point.Hash) != 0 {
+		t.Fatalf("rollback requests = %#v", publisher.rollbacks)
+	}
+}
+
+func TestUnconfirmedRollbackToPendingTargetPublishesNothing(t *testing.T) {
+	publisher := &fakePublisher{}
+	handler := newTestHandler(t, publisher)
+	var blocks []adapterTestBlock
+	for number := uint64(11); number <= 12; number++ {
+		block := adapterTestBlock{
+			slot:   number,
+			number: number,
+			hash:   adapterHash(byte(number)),
+		}
+		blocks = append(blocks, block)
+		if _, err := handler.RollForward(
+			context.Background(),
+			block,
+			adapterTip(block),
+			adapterEvidence(adapterTip(block)),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	target := n2n.NewChainPoint(
+		pcommon.NewPoint(blocks[0].slot, blocks[0].hash.Bytes()),
+		blocks[0].number,
+	)
+	if err := handler.RollbackObserved(
+		context.Background(),
+		target,
+		adapterTip(blocks[1]),
+	); err != nil {
+		t.Fatal(err)
+	}
+	outcome, err := handler.EndAttempt(
+		context.Background(),
+		syncer.AttemptEnd{Cause: "rollback_proof_unavailable"},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !outcome.Committed || outcome.CommittedBlocks != 1 {
-		t.Fatalf("rollback outcome = %#v", outcome)
+	if outcome.Committed ||
+		outcome.CommittedBlocks != 0 ||
+		len(publisher.batches) != 0 ||
+		len(publisher.rollbacks) != 0 {
+		t.Fatalf(
+			"outcome=%#v batches=%#v rollbacks=%#v",
+			outcome,
+			publisher.batches,
+			publisher.rollbacks,
+		)
 	}
-	if len(publisher.batches) != 1 || len(publisher.batches[0].Items) != 1 {
-		t.Fatalf("retained physical batch = %#v", publisher.batches)
+}
+
+func TestAgedProofNeverPublishesStalePendingPrefix(t *testing.T) {
+	publisher := &fakePublisher{}
+	handler := newTestHandlerWithState(
+		t,
+		publisher,
+		&fakeChainState{tip: publication.Point{Origin: true}},
+	)
+	now := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
+	handler.config.Now = func() time.Time { return now }
+	first := adapterTestBlock{
+		slot:   11,
+		number: 11,
+		hash:   adapterHash(0x11),
 	}
-	if len(publisher.rollbacks) != 1 ||
-		publisher.rollbacks[0].To.Hash != publicationPoint(target).Hash {
-		t.Fatalf("rollback requests = %#v", publisher.rollbacks)
+	second := adapterTestBlock{
+		slot:   12,
+		number: 12,
+		hash:   adapterHash(0x12),
+	}
+	for _, block := range []adapterTestBlock{first, second} {
+		if _, err := handler.RollForward(
+			context.Background(),
+			block,
+			adapterTip(block),
+			adapterEvidence(adapterTip(block)),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	target := n2n.NewChainPoint(
+		pcommon.NewPoint(first.slot, first.hash.Bytes()),
+		first.number,
+	)
+	branchTip := adapterTip(second)
+	if err := handler.RollbackObserved(
+		context.Background(),
+		target,
+		branchTip,
+	); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(publication.MaxBatchAge + time.Second)
+	outcome, err := handler.RollBackward(
+		context.Background(),
+		target,
+		branchTip,
+		adapterRollbackEvidence(target, branchTip),
+	)
+	var replay *syncer.RollbackReplayRequiredError
+	if !errors.As(err, &replay) ||
+		!outcome.Committed ||
+		outcome.CommittedBlocks != 0 ||
+		len(publisher.batches) != 0 ||
+		len(publisher.rollbacks) != 1 ||
+		!publisher.rollbacks[0].To.Origin {
+		t.Fatalf(
+			"outcome=%#v error=%v batches=%#v rollbacks=%#v",
+			outcome,
+			err,
+			publisher.batches,
+			publisher.rollbacks,
+		)
+	}
+}
+
+func TestTimerPublicationBeforeRollbackCannotReportInvalidatedTail(t *testing.T) {
+	publisher := &fakePublisher{}
+	handler := newTestHandler(t, publisher)
+	var blocks []adapterTestBlock
+	for number := uint64(11); number <= 12; number++ {
+		block := adapterTestBlock{
+			slot:   number,
+			number: number,
+			hash:   adapterHash(byte(number)),
+		}
+		blocks = append(blocks, block)
+		if _, err := handler.RollForward(
+			context.Background(),
+			block,
+			adapterTip(block),
+			adapterEvidence(adapterTip(block)),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	handler.flushFromTimer()
+	if len(publisher.batches) != 1 {
+		t.Fatalf("timer batches = %#v", publisher.batches)
+	}
+	target := n2n.NewChainPoint(
+		pcommon.NewPoint(blocks[0].slot, blocks[0].hash.Bytes()),
+		blocks[0].number,
+	)
+	branchTip := adapterTip(blocks[1])
+	if err := handler.RollbackObserved(
+		context.Background(),
+		target,
+		branchTip,
+	); err != nil {
+		t.Fatal(err)
+	}
+	outcome, err := handler.RollBackward(
+		context.Background(),
+		target,
+		branchTip,
+		adapterRollbackEvidence(target, branchTip),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !outcome.Committed ||
+		outcome.CommittedBlocks != 0 ||
+		outcome.LastCommittedPoint != nil ||
+		outcome.LastCommittedTip != nil ||
+		len(publisher.rollbacks) != 1 {
+		t.Fatalf(
+			"outcome=%#v rollbacks=%#v",
+			outcome,
+			publisher.rollbacks,
+		)
+	}
+}
+
+func TestSupervisorAcceptsTimerFlushedRollbackWithoutStaleTail(t *testing.T) {
+	publisher := &fakePublisher{}
+	checkpoint := testAdapterChainPoint(10, 0x10)
+	target := testAdapterChainPoint(11, 0x11)
+	handler := newTestHandlerWithState(
+		t,
+		publisher,
+		&fakeChainState{tip: publicationPoint(checkpoint)},
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	transport := &rollbackBarrierTransport{
+		scenario:       "paired proof success",
+		cancel:         cancel,
+		checkpoint:     checkpoint,
+		rollbackTarget: target,
+		blocks: []adapterTestBlock{
+			{slot: 11, number: 11, hash: adapterHash(0x11)},
+			{slot: 12, number: 12, hash: adapterHash(0x12)},
+		},
+		branchTip: chainsync.Tip{
+			Point:       pcommon.NewPoint(12, adapterHash(0x12).Bytes()),
+			BlockNumber: 12,
+		},
+		beforeRollback: handler.flushFromTimer,
+	}
+	supervisor, err := syncer.New(
+		syncer.Config{
+			Peers: []n2n.Peer{
+				{Host: "relay-a:3001", Operator: "operator-a"},
+				{Host: "relay-b:3001", Operator: "operator-b"},
+			},
+			Corroboration:         2,
+			InitialBackoff:        time.Millisecond,
+			MaxBackoff:            2 * time.Millisecond,
+			RollbackConfirmations: 2,
+			CheckpointEveryBlocks: 100,
+			FinalizeTimeout:       time.Second,
+		},
+		fixedCandidateSource{checkpoint},
+		handler,
+		noopSyncObserver{},
+		transport,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := supervisor.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("supervisor treated stale timer tail as terminal: %v", err)
+	}
+	if len(publisher.batches) != 1 ||
+		len(publisher.batches[0].Items) != 2 ||
+		len(publisher.rollbacks) != 1 ||
+		!samePublicationPoint(
+			publisher.rollbacks[0].To,
+			publicationPoint(target),
+		) {
+		t.Fatalf(
+			"batches=%#v rollbacks=%#v",
+			publisher.batches,
+			publisher.rollbacks,
+		)
 	}
 }
 

@@ -26,9 +26,6 @@ services:
       interval: 2s
       timeout: 2s
       retries: 30
-    cpus: 2
-    mem_limit: 3g
-    pids_limit: 2048
     logging:
       driver: none
 
@@ -71,9 +68,6 @@ services:
     labels:
       io.clicksync.scope: clicksync
       io.clicksync.kind: ingestion
-    cpus: 1
-    mem_limit: 1g
-    pids_limit: 256
     logging:
       driver: local
       options:

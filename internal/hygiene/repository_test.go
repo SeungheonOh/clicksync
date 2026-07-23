@@ -184,6 +184,9 @@ func TestExecutableRuntimeHasNoArtificialSyncOrStorageCeiling(t *testing.T) {
 		"block limit",
 		"tip limit",
 		"runtime limit",
+		"cpus:",
+		"mem_limit:",
+		"pids_limit:",
 	}
 	for _, rel := range executable {
 		data, err := os.ReadFile(filepath.Join(root, rel))

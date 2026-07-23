@@ -96,6 +96,23 @@ const (
 	RollbackProofPairedSingleton RollbackProofMethod = "paired_singleton"
 )
 
+type RollbackReplayRequiredError struct {
+	ObservedTarget n2n.ChainPoint
+	DurableTip     n2n.ChainPoint
+}
+
+func (err *RollbackReplayRequiredError) Error() string {
+	return fmt.Sprintf(
+		"rollback target %d:%x#%d was not durable; reconnect from %d:%x#%d",
+		err.ObservedTarget.Point.Slot,
+		err.ObservedTarget.Point.Hash,
+		err.ObservedTarget.BlockNumber,
+		err.DurableTip.Point.Slot,
+		err.DurableTip.Point.Hash,
+		err.DurableTip.BlockNumber,
+	)
+}
+
 type AttemptEnd struct {
 	Source SourceEvidence
 	Cause  string
@@ -160,6 +177,29 @@ func (err *CorroborationUnavailableError) Error() string {
 }
 
 func (err *CorroborationUnavailableError) Unwrap() error {
+	return err.Err
+}
+
+type CheckpointCorroborationUnavailableError struct {
+	Checkpoint n2n.ChainPoint
+	Confirmed  int
+	Required   int
+	Err        error
+}
+
+func (err *CheckpointCorroborationUnavailableError) Error() string {
+	return fmt.Sprintf(
+		"committed checkpoint corroboration unavailable at %d:%x#%d: got %d of %d operators: %v",
+		err.Checkpoint.Point.Slot,
+		err.Checkpoint.Point.Hash,
+		err.Checkpoint.BlockNumber,
+		err.Confirmed,
+		err.Required,
+		err.Err,
+	)
+}
+
+func (err *CheckpointCorroborationUnavailableError) Unwrap() error {
 	return err.Err
 }
 
@@ -340,9 +380,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		)
 		endCause := classifyAttemptEnd(ctx, err, attempt.terminalErr)
 		finishErr := attempt.finish(ctx, endCause)
-		if finishErr != nil && attempt.terminalErr == nil {
-			attempt.terminalErr = finishErr
-		}
+		err = combineAttemptErrors(err, finishErr)
 		if attempt.started {
 			lastPrimaryHost = primary.Host
 		}
@@ -740,10 +778,10 @@ func (h *attemptHandler) RollForward(
 			outcome.LastCommittedPoint.IsByronEBB,
 			*outcome.LastCommittedTip,
 		); err != nil {
-			return h.terminal(fmt.Errorf(
-				"adoption committed before periodic corroboration failure: %w",
+			return h.postCommitCorroborationFailure(
+				"adoption committed before periodic corroboration failure",
 				err,
-			))
+			)
 		}
 	}
 	if err != nil {
@@ -907,6 +945,18 @@ func (h *attemptHandler) RollBackward(
 			if outcome.Committed {
 				h.committed = true
 			}
+			var replay *RollbackReplayRequiredError
+			if errors.As(err, &replay) {
+				if !outcome.Committed ||
+					outcome.CommittedBlocks != 0 ||
+					outcome.LastCommittedPoint != nil ||
+					outcome.LastCommittedTip != nil {
+					return h.terminal(errors.New(
+						"rollback replay request returned an invalid commit outcome",
+					))
+				}
+				return RetryableTransportError(err)
+			}
 			if outcome.CommittedBlocks > 0 {
 				if tailErr := validateCommittedTail(outcome); tailErr != nil {
 					return h.terminal(fmt.Errorf("rollback committed prefix tail: %w", tailErr))
@@ -929,10 +979,10 @@ func (h *attemptHandler) RollBackward(
 						outcome.LastCommittedPoint.IsByronEBB,
 						*outcome.LastCommittedTip,
 					); corroborateErr != nil {
-						return h.terminal(fmt.Errorf(
-							"rollback prefix adoption committed before periodic corroboration failure: %w",
+						return h.postCommitCorroborationFailure(
+							"rollback prefix adoption committed before periodic corroboration failure",
 							corroborateErr,
-						))
+						)
 					}
 				}
 			}
@@ -973,7 +1023,7 @@ func (h *attemptHandler) confirmPublishedCheckpoint(
 	tip chainsync.Tip,
 ) error {
 	confirmedOperators := map[string]struct{}{
-		h.evidence.Primary.Peer.Operator: {},
+		operatorKey(h.evidence.Primary.Peer.Operator): {},
 	}
 	if err := h.supervisor.observer.Observe(ctx, Observation{
 		Kind:                  "checkpoint",
@@ -990,8 +1040,13 @@ func (h *attemptHandler) confirmPublishedCheckpoint(
 	}); err != nil {
 		return fmt.Errorf("record primary checkpoint: %w", err)
 	}
+	sawUnavailable := false
 	for _, candidatePeer := range h.supervisor.config.Peers {
-		if _, exists := confirmedOperators[candidatePeer.Operator]; exists {
+		key := operatorKey(candidatePeer.Operator)
+		if _, exists := confirmedOperators[key]; exists {
+			continue
+		}
+		if h.operatorQuarantined(candidatePeer.Operator) {
 			continue
 		}
 		result, probeErr := h.supervisor.transport.Probe(ctx, candidatePeer, checkpoint)
@@ -1009,24 +1064,95 @@ func (h *attemptHandler) confirmPublishedCheckpoint(
 			N2NVersion:            result.N2NVersion,
 			ObservedAt:            h.supervisor.now().UTC(),
 		}
+		quarantine := false
+		terminalProbeErr := error(nil)
 		switch {
 		case probeErr != nil:
-			observation.Result = "unavailable"
-			observation.Reason = probeErr.Error()
+			var peerData *n2n.PeerDataViolation
+			var transportError *TransportError
+			switch {
+			case errors.Is(probeErr, context.Canceled),
+				errors.Is(probeErr, context.DeadlineExceeded):
+				observation.Result = "unavailable"
+				observation.Reason = probeErr.Error()
+				terminalProbeErr = probeErr
+			case errors.As(probeErr, &peerData):
+				observation.Kind = "disagreement"
+				observation.Result = "quarantined"
+				observation.Reason = "peer_data_violation: " +
+					probeErr.Error()
+				quarantine = true
+			case errors.As(probeErr, &transportError):
+				observation.Result = "unavailable"
+				observation.Reason = probeErr.Error()
+				sawUnavailable = true
+			default:
+				observation.Result = "unavailable"
+				observation.Reason = "terminal_probe_failure: " +
+					probeErr.Error()
+				terminalProbeErr = fmt.Errorf(
+					"unclassified checkpoint probe failure is terminal: %w",
+					probeErr,
+				)
+			}
 		case !result.Accepted:
 			observation.Kind = "disagreement"
 			observation.Result = "quarantined"
 			observation.Reason = "peer rejected committed checkpoint"
+			quarantine = true
+		case result.Tip.BlockNumber < checkpointBlockNumber ||
+			result.Tip.Point.Slot < checkpoint.Slot:
+			observation.Kind = "disagreement"
+			observation.Result = "quarantined"
+			observation.Reason = "peer tip precedes committed checkpoint"
+			quarantine = true
 		default:
 			observation.Result = "agreed"
 			observation.Reason = "periodic independent checkpoint"
-			confirmedOperators[candidatePeer.Operator] = struct{}{}
+			confirmedOperators[key] = struct{}{}
+		}
+		if quarantine {
+			h.quarantineOperator(candidatePeer.Operator)
 		}
 		if err := h.supervisor.observer.Observe(ctx, observation); err != nil {
 			return fmt.Errorf("record independent checkpoint: %w", err)
 		}
+		if terminalProbeErr != nil {
+			return terminalProbeErr
+		}
+		if quarantine {
+			if err := h.supervisor.requireRemainingOperators(
+				h.quarantined,
+			); err != nil {
+				return err
+			}
+		}
 	}
 	if len(confirmedOperators) < h.supervisor.config.Corroboration {
+		if sawUnavailable &&
+			h.remainingRollbackOperators() >=
+				h.supervisor.config.Corroboration {
+			checkpoint := n2n.NewChainPoint(
+				checkpoint,
+				checkpointBlockNumber,
+			)
+			if checkpointIsByronEBB {
+				checkpoint = n2n.NewByronEBBChainPoint(
+					checkpoint.Point,
+					checkpoint.BlockNumber,
+				)
+			}
+			return RetryableTransportError(
+				&CheckpointCorroborationUnavailableError{
+					Checkpoint: checkpoint,
+					Confirmed:  len(confirmedOperators),
+					Required:   h.supervisor.config.Corroboration,
+					Err: errors.New(
+						"one or more independent operators were transiently unavailable",
+					),
+				},
+			)
+		}
 		return fmt.Errorf(
 			"checkpoint quarantined: got %d of %d independent operators",
 			len(confirmedOperators),
@@ -1034,6 +1160,43 @@ func (h *attemptHandler) confirmPublishedCheckpoint(
 		)
 	}
 	return nil
+}
+
+func (h *attemptHandler) postCommitCorroborationFailure(
+	prefix string,
+	err error,
+) error {
+	wrapped := fmt.Errorf("%s: %w", prefix, err)
+	var transportErr *TransportError
+	if errors.As(err, &transportErr) {
+		return wrapped
+	}
+	if errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) {
+		return RetryableTransportError(wrapped)
+	}
+	return h.terminal(wrapped)
+}
+
+func combineAttemptErrors(followErr, finishErr error) error {
+	switch {
+	case finishErr == nil:
+		return followErr
+	case followErr == nil:
+		return finishErr
+	case errorIsPeerDataViolation(followErr),
+		errorIsRangeUnavailable(followErr):
+		// Preserve the primary source evidence for quarantine/range policy,
+		// while retaining the typed post-commit corroboration requirement.
+		return errors.Join(followErr, finishErr)
+	}
+	var followTransport *TransportError
+	if errors.As(followErr, &followTransport) {
+		return errors.Join(followErr, finishErr)
+	}
+	// An unclassified Follow error is more severe than a retryable finalizer
+	// checkpoint outage and must keep its terminal precedence.
+	return followErr
 }
 
 func (h *attemptHandler) terminal(err error) error {
@@ -1090,10 +1253,10 @@ func (h *attemptHandler) finish(ctx context.Context, cause string) error {
 				outcome.LastCommittedPoint.IsByronEBB,
 				*outcome.LastCommittedTip,
 			); corroborateErr != nil {
-				return h.terminal(fmt.Errorf(
-					"finalized adoption committed before periodic corroboration failure: %w",
+				return h.postCommitCorroborationFailure(
+					"finalized adoption committed before periodic corroboration failure",
 					corroborateErr,
-				))
+				)
 			}
 		}
 	}
