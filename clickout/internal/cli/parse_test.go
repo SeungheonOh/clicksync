@@ -26,6 +26,7 @@ func TestRequiredCommandsParse(t *testing.T) {
 		{"trace", "--direction", "forward", "--utxo", hash + "#2"},
 		{"trace", "--direction", "reverse", "--tx", hash, "--asset", policy + "."},
 		{"trace", "--direction", "forward", "--address", "addr1...", "--max-depth", "32", "--max-nodes", "100000", "--max-edges", "100000"},
+		{"trace", "--direction", "forward", "--address", "addr1...", "--seed-cursor", "cursor"},
 	}
 	for _, args := range tests {
 		args := args
@@ -69,6 +70,7 @@ func TestHardBoundsAndRequiredAddressState(t *testing.T) {
 		{"trace", "--direction", "forward", "--utxo", hash + "#0", "--max-edges", "100001"},
 		{"address", "addr1...", "--state", "current", "--limit", "10001"},
 		{"address", "addr1..."},
+		{"trace", "--direction", "forward", "--utxo", hash + "#0", "--seed-cursor", "cursor"},
 	} {
 		if _, err := Parse(args); !errors.Is(err, ErrUsage) {
 			t.Fatalf("%v: expected usage error, got %v", args, err)

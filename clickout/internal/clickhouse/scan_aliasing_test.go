@@ -35,7 +35,7 @@ func TestScanOutputDoesNotRetainDriverBuffers(t *testing.T) {
 	row := &aliasingOutputScanner{
 		tx:      make([]byte, 32),
 		block:   make([]byte, 32),
-		address: []byte{1, 2, 3, 4},
+		address: []byte{0x82, 2, 3, 4},
 	}
 	for index := range row.tx {
 		row.tx[index] = 0x11
@@ -55,7 +55,7 @@ func TestScanOutputDoesNotRetainDriverBuffers(t *testing.T) {
 	if output.Ref.TxHash[0] != 0x11 || output.BlockHash[0] != 0x22 {
 		t.Fatalf("fixed hashes retained scanner storage: %#v", output)
 	}
-	if len(output.Address) != 4 || output.Address[0] != 1 || output.Address[3] != 4 {
+	if len(output.Address) != 4 || output.Address[0] != 0x82 || output.Address[3] != 4 {
 		t.Fatalf("address retained scanner storage: %x", []byte(output.Address))
 	}
 }

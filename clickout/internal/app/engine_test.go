@@ -55,6 +55,47 @@ func TestAddressCursorPinsPreviousSnapshot(t *testing.T) {
 	}
 }
 
+func TestTraceAddressSeedCursorPinsSnapshotAndPassesRepositoryKey(t *testing.T) {
+	t.Parallel()
+	raw := []byte{0x61, 0x01}
+	encoded, err := cursor.Encode(cursor.Value{
+		Scope:         chstore.AddressScope(raw, "history"),
+		SnapshotEvent: 17,
+		LastKey:       "physical-address-key",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := &fakeReader{
+		snapshot: model.Snapshot{
+			Event:           17,
+			CompleteHistory: false,
+			TrustMode:       model.TrustPeerObserved,
+		},
+		seeds: repository.TraceSeedResult{
+			Truncated:          true,
+			ContinuationCursor: "next-seed-cursor",
+		},
+	}
+	invocation := traceInvocation(ref(1, 0), limits.DefaultTrace())
+	invocation.Trace.Seed = repository.TraceSeed{}
+	invocation.Trace.Address = "hex:6101"
+	invocation.Trace.SeedCursor = encoded
+	result, err := New(reader).Execute(context.Background(), invocation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := result.(model.Response[model.Trace])
+	if reader.lastAt.Event == nil || *reader.lastAt.Event != 17 ||
+		reader.lastTraceQuery.SeedLastKey != "physical-address-key" {
+		t.Fatalf("seed cursor was not pinned/passed: at=%#v query=%#v", reader.lastAt, reader.lastTraceQuery)
+	}
+	if response.Truncation.ContinuationCursor != "next-seed-cursor" ||
+		!response.Truncation.LosslessResume {
+		t.Fatalf("seed continuation was not actionable: %#v", response.Truncation)
+	}
+}
+
 func TestForwardBFSHandlesConvergenceAndCycle(t *testing.T) {
 	t.Parallel()
 	a := ref(1, 0)
@@ -298,13 +339,14 @@ type addressCall struct {
 }
 
 type fakeReader struct {
-	snapshot      model.Snapshot
-	snapshotCalls int
-	lastAt        model.AtPoint
-	lastAddress   addressCall
-	seeds         repository.TraceSeedResult
-	expandForward func(context.Context, model.Snapshot, []model.UTxORef) ([]model.FlowHyperedge, error)
-	expandReverse func(context.Context, model.Snapshot, []model.UTxORef) ([]model.FlowHyperedge, error)
+	snapshot       model.Snapshot
+	snapshotCalls  int
+	lastAt         model.AtPoint
+	lastAddress    addressCall
+	seeds          repository.TraceSeedResult
+	lastTraceQuery repository.TraceQuery
+	expandForward  func(context.Context, model.Snapshot, []model.UTxORef) ([]model.FlowHyperedge, error)
+	expandReverse  func(context.Context, model.Snapshot, []model.UTxORef) ([]model.FlowHyperedge, error)
 }
 
 func (reader *fakeReader) Snapshot(_ context.Context, at model.AtPoint) (model.Snapshot, error) {
@@ -371,11 +413,12 @@ func (reader *fakeReader) Withdrawals(
 }
 
 func (reader *fakeReader) TraceSeeds(
-	context.Context,
-	model.Snapshot,
-	repository.TraceQuery,
-	uint32,
+	_ context.Context,
+	_ model.Snapshot,
+	query repository.TraceQuery,
+	_ uint32,
 ) (repository.TraceSeedResult, []model.PartialHistoryBoundary, error) {
+	reader.lastTraceQuery = query
 	return reader.seeds, nil, nil
 }
 

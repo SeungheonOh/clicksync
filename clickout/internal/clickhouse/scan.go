@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 
 	"golang.org/x/crypto/blake2b"
 
@@ -148,6 +149,10 @@ func makeOutput(values outputValues) (model.Output, error) {
 		Assets:                assets,
 		DatumKind:             values.datumKind,
 	}
+	derivedKind, derivedHash, err := paymentCredentialFromRawAddress(values.address)
+	if err != nil {
+		return model.Output{}, err
+	}
 	switch values.paymentKind {
 	case "none":
 		if values.paymentHash != nil {
@@ -168,6 +173,12 @@ func makeOutput(values outputValues) (model.Output, error) {
 		return model.Output{}, fmt.Errorf(
 			"unsupported payment credential kind %q",
 			values.paymentKind,
+		)
+	}
+	if values.paymentKind != derivedKind ||
+		!bytes.Equal(output.PaymentCredentialHash, derivedHash) {
+		return model.Output{}, errors.New(
+			"stored payment credential disagrees with raw output address",
 		)
 	}
 	switch values.datumKind {
@@ -201,6 +212,107 @@ func makeOutput(values outputValues) (model.Output, error) {
 		output.ReferenceScriptLanguage = *values.referenceLanguage
 	}
 	return output, nil
+}
+
+// paymentCredentialFromRawAddress performs the minimum Shelley-family
+// decoding needed to prove the denormalized payment credential. Byron
+// addresses are opaque here and intentionally have no payment credential.
+func paymentCredentialFromRawAddress(address []byte) (string, []byte, error) {
+	if len(address) == 0 {
+		return "", nil, errors.New("empty output address")
+	}
+	addressType := address[0] >> 4
+	if addressType == 8 {
+		if len(address) < 2 {
+			return "", nil, errors.New("truncated Byron output address")
+		}
+		return "none", nil, nil
+	}
+	if address[0]&0x0f != 1 {
+		return "", nil, fmt.Errorf(
+			"Shelley-family output address has non-mainnet network id %d",
+			address[0]&0x0f,
+		)
+	}
+	var (
+		kind string
+		want int
+	)
+	switch addressType {
+	case 0, 2:
+		kind, want = "key", 57
+	case 1, 3:
+		kind, want = "script", 57
+	case 4:
+		kind = "key"
+	case 5:
+		kind = "script"
+	case 6:
+		kind, want = "key", 29
+	case 7:
+		kind, want = "script", 29
+	case 14, 15:
+		return "", nil, fmt.Errorf(
+			"reward address type %d is not a transaction output address",
+			addressType,
+		)
+	default:
+		return "", nil, fmt.Errorf("unsupported output address type %d", addressType)
+	}
+	if addressType == 4 || addressType == 5 {
+		if len(address) <= 29 {
+			return "", nil, errors.New("pointer output address is truncated")
+		}
+		if err := validatePointerAddressSuffix(address[29:]); err != nil {
+			return "", nil, err
+		}
+	} else if len(address) != want {
+		return "", nil, fmt.Errorf(
+			"output address type %d has length %d, want %d",
+			addressType,
+			len(address),
+			want,
+		)
+	}
+	return kind, bytes.Clone(address[1:29]), nil
+}
+
+func validatePointerAddressSuffix(suffix []byte) error {
+	offset := 0
+	componentLimits := [...]uint64{math.MaxUint64, math.MaxUint16, math.MaxUint16}
+	for component, limit := range componentLimits {
+		start := offset
+		var accumulated uint64
+		for {
+			if offset >= len(suffix) {
+				return fmt.Errorf("pointer address component %d is truncated", component)
+			}
+			value := suffix[offset]
+			offset++
+			digit := uint64(value & 0x7f)
+			if offset == start+1 && value&0x80 != 0 && digit == 0 {
+				return fmt.Errorf(
+					"pointer address component %d has a non-canonical leading zero",
+					component,
+				)
+			}
+			if accumulated > (limit-digit)>>7 {
+				return fmt.Errorf(
+					"pointer address component %d exceeds ledger bound %d",
+					component,
+					limit,
+				)
+			}
+			accumulated = accumulated<<7 | digit
+			if value&0x80 == 0 {
+				break
+			}
+		}
+	}
+	if offset != len(suffix) {
+		return fmt.Errorf("pointer address has %d trailing bytes", len(suffix)-offset)
+	}
+	return nil
 }
 
 func scanSpend(row scanner) (model.Spend, error) {

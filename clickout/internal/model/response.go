@@ -28,6 +28,7 @@ func (snapshot Snapshot) Valid() bool {
 type Truncation struct {
 	Truncated            bool      `json:"truncated"`
 	Reason               string    `json:"reason,omitempty"`
+	ContinuationCursor   string    `json:"continuation_cursor,omitempty"`
 	ContinuationFrontier []UTxORef `json:"continuation_frontier"`
 	LosslessResume       bool      `json:"lossless_resume"`
 }

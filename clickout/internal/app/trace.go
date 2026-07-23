@@ -7,6 +7,7 @@ import (
 
 	"github.com/clicksync-project/clickout/internal/address"
 	"github.com/clicksync-project/clickout/internal/cli"
+	"github.com/clicksync-project/clickout/internal/cursor"
 	"github.com/clicksync-project/clickout/internal/limits"
 	"github.com/clicksync-project/clickout/internal/metrics"
 	"github.com/clicksync-project/clickout/internal/model"
@@ -18,25 +19,39 @@ func (engine *Engine) trace(
 	collector *metrics.Collector,
 	invocation cli.Invocation,
 ) (any, error) {
-	snapshot, err := engine.reader.Snapshot(ctx, invocation.At)
-	if err != nil {
-		return nil, err
-	}
 	seed := invocation.Trace.Seed
+	at := invocation.At
+	seedLastKey := ""
 	if invocation.Trace.Address != "" {
 		raw, err := address.Decode(invocation.Trace.Address)
 		if err != nil {
 			return nil, err
 		}
 		seed.Address = raw
+		if invocation.Trace.SeedCursor != "" {
+			value, err := cursor.DecodePinned(
+				invocation.Trace.SeedCursor,
+				addressScope(raw, "history"),
+			)
+			if err != nil {
+				return nil, err
+			}
+			at = model.AtPoint{Event: &value.SnapshotEvent}
+			seedLastKey = value.LastKey
+		}
+	}
+	snapshot, err := engine.reader.Snapshot(ctx, at)
+	if err != nil {
+		return nil, err
 	}
 	seedResult, boundaries, err := engine.reader.TraceSeeds(
 		ctx,
 		snapshot,
 		repository.TraceQuery{
-			Direction: invocation.Trace.Direction,
-			Seed:      seed,
-			Asset:     invocation.Trace.Asset,
+			Direction:   invocation.Trace.Direction,
+			Seed:        seed,
+			SeedLastKey: seedLastKey,
+			Asset:       invocation.Trace.Asset,
 		},
 		limits.DefaultAddressPage,
 	)
@@ -56,6 +71,8 @@ func (engine *Engine) trace(
 	if seedResult.Truncated {
 		response.Truncation.Truncated = true
 		response.Truncation.Reason = "address_seed_limit"
+		response.Truncation.ContinuationCursor = seedResult.ContinuationCursor
+		response.Truncation.LosslessResume = seedResult.ContinuationCursor != ""
 	}
 
 	frontier := uniqueSorted(seedResult.UTxOs)
@@ -209,7 +226,9 @@ func (engine *Engine) trace(
 	response.Truncation.ContinuationFrontier = uniqueSorted(
 		response.Truncation.ContinuationFrontier,
 	)
-	response.Truncation.LosslessResume = false
+	if response.Truncation.ContinuationCursor == "" {
+		response.Truncation.LosslessResume = false
+	}
 	response.Data.Visited = uint32(len(visited))
 	response.QueryMetrics = collector.Snapshot()
 	return response, nil

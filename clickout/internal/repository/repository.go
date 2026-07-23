@@ -27,14 +27,16 @@ type TraceSeed struct {
 }
 
 type TraceQuery struct {
-	Direction TraceDirection
-	Seed      TraceSeed
-	Asset     model.AssetSelector
+	Direction   TraceDirection
+	Seed        TraceSeed
+	SeedLastKey string
+	Asset       model.AssetSelector
 }
 
 type TraceSeedResult struct {
-	UTxOs     []model.UTxORef
-	Truncated bool
+	UTxOs              []model.UTxORef
+	Truncated          bool
+	ContinuationCursor string
 }
 
 // Reader is the complete Clickout/Clicksync boundary. Implementations consume

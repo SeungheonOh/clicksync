@@ -509,8 +509,8 @@ func newFixture() fixture {
 		dataHash:     calculateContentHash(redeemerCBOR),
 		metadataHash: calculateContentHash(metadataCBOR),
 		policy:       policy,
-		addressA:     []byte{0x01, 0xff, 0x80, 0x41},
-		addressB:     []byte{0x02, 0xfe, 0x81, 0x42},
+		addressA:     append([]byte{0x71}, policy[:]...),
+		addressB:     append([]byte{0x61}, policy[:]...),
 		datumCBOR:    datumCBOR,
 		redeemerCBOR: redeemerCBOR,
 		metadataCBOR: metadataCBOR,
@@ -644,10 +644,12 @@ func (fixture fixture) insert(t *testing.T, store *Store) {
 		string(fixture.policy[:]), string([]byte{0x00, 0xff}))
 	exec(`INSERT INTO outputs
         (publication_id,block_number,tx_hash,tx_order,output_index,body_ordinal,output_kind,
-         address,lovelace,asset_policy_ids,asset_names,asset_quantities,datum_kind,datum_hash,
+         address,payment_credential_kind,payment_credential_hash,
+         lovelace,asset_policy_ids,asset_names,asset_quantities,datum_kind,datum_hash,
          reference_script_hash,reference_script_language)
-        VALUES (101,1,?,0,1,1,'regular',?,1000000,[],[],[],'none',NULL,NULL,NULL)`,
-		hashArgument(fixture.txA), string(fixture.addressA))
+        VALUES (101,1,?,0,1,1,'regular',?,'script',?,1000000,[],[],[],
+                'none',NULL,NULL,NULL)`,
+		hashArgument(fixture.txA), string(fixture.addressA), string(fixture.policy[:]))
 	exec(`INSERT INTO outputs
         (publication_id,block_number,tx_hash,tx_order,output_index,body_ordinal,output_kind,
          address,payment_credential_kind,payment_credential_hash,
@@ -669,11 +671,12 @@ func (fixture fixture) insert(t *testing.T, store *Store) {
 		hashArgument(fixture.datumHash))
 	exec(`INSERT INTO outputs
         (publication_id,block_number,tx_hash,tx_order,output_index,body_ordinal,output_kind,
-         address,lovelace,asset_policy_ids,asset_names,asset_quantities,datum_kind,datum_hash,
+         address,payment_credential_kind,payment_credential_hash,
+         lovelace,asset_policy_ids,asset_names,asset_quantities,datum_kind,datum_hash,
          reference_script_hash,reference_script_language)
-        VALUES (101,1,?,1,0,0,'collateral_return',?,700000,[],[],[],
+        VALUES (101,1,?,1,0,0,'collateral_return',?,'script',?,700000,[],[],[],
                 'none',NULL,NULL,NULL)`,
-		hashArgument(fixture.txC), string(fixture.addressA))
+		hashArgument(fixture.txC), string(fixture.addressA), string(fixture.policy[:]))
 	exec(`INSERT INTO datum_bodies
         (datum_hash,datum_cbor,byte_length,content_hash,first_publication_id,first_seen_at)
         VALUES (?,?,?, ?,102,now64(6))`,

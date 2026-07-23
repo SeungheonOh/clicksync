@@ -29,12 +29,13 @@ type Invocation struct {
 }
 
 type TraceInvocation struct {
-	Direction repository.TraceDirection
-	Seed      repository.TraceSeed
-	Address   string
-	Asset     model.AssetSelector
-	Limits    limits.Trace
-	Format    string
+	Direction  repository.TraceDirection
+	Seed       repository.TraceSeed
+	Address    string
+	SeedCursor string
+	Asset      model.AssetSelector
+	Limits     limits.Trace
+	Format     string
 }
 
 func Parse(args []string) (Invocation, error) {
@@ -142,6 +143,7 @@ func parseTrace(args []string) (Invocation, error) {
 	utxo := flags.String("utxo", "", "seed UTxO")
 	tx := flags.String("tx", "", "seed transaction")
 	address := flags.String("address", "", "seed address")
+	seedCursor := flags.String("seed-cursor", "", "opaque address-seed continuation cursor")
 	maxDepth := flags.Uint("max-depth", uint(limits.DefaultTraceDepth), "maximum depth")
 	maxNodes := flags.Uint("max-nodes", uint(limits.DefaultTraceNodes), "maximum visited UTxOs")
 	maxEdges := flags.Uint("max-edges", uint(limits.DefaultTraceEdges), "maximum transaction hyperedges")
@@ -199,16 +201,20 @@ func parseTrace(args []string) (Invocation, error) {
 	if selected != 1 {
 		return Invocation{}, usageError("trace requires exactly one of --utxo, --tx, or --address")
 	}
+	if *seedCursor != "" && *address == "" {
+		return Invocation{}, usageError("trace --seed-cursor requires --address")
+	}
 	return Invocation{
 		Command: "trace",
 		At:      model.AtPoint{Tip: true},
 		Trace: TraceInvocation{
-			Direction: repository.TraceDirection(*direction),
-			Seed:      seed,
-			Address:   *address,
-			Asset:     selectedAsset,
-			Limits:    traceLimits,
-			Format:    *format,
+			Direction:  repository.TraceDirection(*direction),
+			Seed:       seed,
+			Address:    *address,
+			SeedCursor: *seedCursor,
+			Asset:      selectedAsset,
+			Limits:     traceLimits,
+			Format:     *format,
 		},
 	}, nil
 }
@@ -245,7 +251,8 @@ clickout metadata TX_HASH
 clickout withdrawals TX_HASH
 clickout trace --direction forward|reverse \
   (--utxo TX_HASH#INDEX|--tx TX_HASH|--address ADDRESS) \
-  [--max-depth N] [--max-nodes N] [--asset ada|POLICY.NAME] --format jsonl
+  [--seed-cursor C] [--max-depth N] [--max-nodes N] \
+  [--asset ada|POLICY.NAME] --format jsonl
 `)
 }
 

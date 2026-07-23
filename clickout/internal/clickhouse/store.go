@@ -22,7 +22,28 @@ var (
 	ErrNotFound       = errors.New("not found at captured snapshot")
 	ErrConflictingRow = errors.New("multiple active rows violate chain uniqueness")
 	ErrInvalidDataset = errors.New("invalid dataset manifest")
+	ErrResourceLimit  = errors.New("ClickHouse query resource limit exceeded")
 )
+
+type ResourceLimitError struct {
+	Phase string
+	Cause error
+}
+
+func (err *ResourceLimitError) Error() string {
+	if err.Cause == nil {
+		return fmt.Sprintf("%s: %v", err.Phase, ErrResourceLimit)
+	}
+	return fmt.Sprintf("%s: %v: %v", err.Phase, ErrResourceLimit, err.Cause)
+}
+
+func (err *ResourceLimitError) Unwrap() error {
+	return err.Cause
+}
+
+func (err *ResourceLimitError) Is(target error) bool {
+	return target == ErrResourceLimit
+}
 
 type Config struct {
 	Addresses    []string
@@ -138,16 +159,93 @@ func (store *Store) Close() error {
 }
 
 func (store *Store) instrument(parent context.Context, name string) (context.Context, func()) {
+	return store.instrumentPhase(parent, name, defaultPhaseLimits())
+}
+
+type phaseLimits struct {
+	MaxRowsToRead  uint64
+	MaxBytesToRead uint64
+	MaxResultRows  uint64
+	MaxResultBytes uint64
+	MaxMemoryUsage uint64
+}
+
+const (
+	mebibyte              = uint64(1024 * 1024)
+	defaultMaxRowsToRead  = uint64(2_000_000)
+	defaultMaxBytesToRead = 512 * mebibyte
+	defaultMaxResultRows  = uint64(100_001)
+	defaultMaxResultBytes = 256 * mebibyte
+	defaultMaxMemoryUsage = 512 * mebibyte
+)
+
+func defaultPhaseLimits() phaseLimits {
+	return phaseLimits{
+		MaxRowsToRead:  defaultMaxRowsToRead,
+		MaxBytesToRead: defaultMaxBytesToRead,
+		MaxResultRows:  defaultMaxResultRows,
+		MaxResultBytes: defaultMaxResultBytes,
+		MaxMemoryUsage: defaultMaxMemoryUsage,
+	}
+}
+
+func candidatePhaseLimits(resultRows uint64) phaseLimits {
+	value := defaultPhaseLimits()
+	value.MaxResultRows = atLeastOne(resultRows)
+	value.MaxResultBytes = 64 * mebibyte
+	return value
+}
+
+func hydrationPhaseLimits(resultRows uint64) phaseLimits {
+	value := defaultPhaseLimits()
+	value.MaxResultRows = atLeastOne(resultRows)
+	return value
+}
+
+func resultPhaseLimits(resultRows uint64) phaseLimits {
+	value := defaultPhaseLimits()
+	value.MaxRowsToRead = 1
+	value.MaxBytesToRead = 1 * mebibyte
+	value.MaxResultRows = atLeastOne(resultRows)
+	value.MaxResultBytes = 1 * mebibyte
+	value.MaxMemoryUsage = 64 * mebibyte
+	return value
+}
+
+func atLeastOne(value uint64) uint64 {
+	if value == 0 {
+		return 1
+	}
+	return value
+}
+
+func settingsForPhase(value phaseLimits, timeout time.Duration) ch.Settings {
+	return ch.Settings{
+		"join_use_nulls":                      1,
+		"max_execution_time":                  uint64(timeout / time.Second),
+		"max_rows_to_read":                    value.MaxRowsToRead,
+		"max_bytes_to_read":                   value.MaxBytesToRead,
+		"read_overflow_mode":                  "throw",
+		"max_result_rows":                     value.MaxResultRows,
+		"max_result_bytes":                    value.MaxResultBytes,
+		"result_overflow_mode":                "throw",
+		"max_memory_usage":                    value.MaxMemoryUsage,
+		"memory_overcommit_ratio_denominator": 0,
+	}
+}
+
+func (store *Store) instrumentPhase(
+	parent context.Context,
+	name string,
+	limits phaseLimits,
+) (context.Context, func()) {
 	started := time.Now()
 	var rows atomic.Uint64
 	var bytes atomic.Uint64
 	var serverElapsed atomic.Int64
 	ctx, cancel := context.WithTimeout(parent, store.queryTimeout)
 	queryCtx := ch.Context(ctx,
-		ch.WithSettings(ch.Settings{
-			"join_use_nulls":     1,
-			"max_execution_time": uint64(store.queryTimeout / time.Second),
-		}),
+		ch.WithSettings(settingsForPhase(limits, store.queryTimeout)),
 		ch.WithProgress(func(progress *ch.Progress) {
 			rows.Add(progress.Rows)
 			bytes.Add(progress.Bytes)
@@ -170,6 +268,28 @@ func (store *Store) instrument(parent context.Context, name string) (context.Con
 			WallElapsed:   time.Since(started),
 		})
 	}
+}
+
+func mapQueryError(phase string, err error) error {
+	if err == nil {
+		return nil
+	}
+	message := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"max_rows_to_read",
+		"max_bytes_to_read",
+		"max_result_rows",
+		"max_result_bytes",
+		"memory limit",
+		"too many rows",
+		"too many bytes",
+		"limit for result exceeded",
+	} {
+		if strings.Contains(message, marker) {
+			return &ResourceLimitError{Phase: phase, Cause: err}
+		}
+	}
+	return err
 }
 
 func (store *Store) Snapshot(ctx context.Context, point model.AtPoint) (model.Snapshot, error) {

@@ -7,9 +7,12 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/clicksync-project/clickout/internal/cursor"
 	"github.com/clicksync-project/clickout/internal/model"
 	"github.com/clicksync-project/clickout/internal/repository"
 )
+
+const maxTraceSeedWindows = 16
 
 func (store *Store) TraceSeeds(
 	ctx context.Context,
@@ -51,23 +54,56 @@ func (store *Store) TraceSeeds(
 		return repository.TraceSeedResult{UTxOs: seeds, Truncated: truncated}, nil, nil
 	}
 	if len(query.Seed.Address) > 0 {
-		page, boundaries, err := store.Address(ctx, snapshot, repository.AddressQuery{
-			Address: query.Seed.Address,
-			State:   "history",
-			Limit:   limit,
-		})
-		if err != nil {
-			return repository.TraceSeedResult{}, nil, err
-		}
-		seeds := make([]model.UTxORef, 0, len(page.Items))
-		for _, item := range page.Items {
-			if outputHasAsset(item.Output, query.Asset) {
+		seeds := make([]model.UTxORef, 0, limit)
+		boundaries := make([]model.PartialHistoryBoundary, 0)
+		lastKey := query.SeedLastKey
+		truncated := false
+		continuation := ""
+		for window := 0; window < maxTraceSeedWindows; window++ {
+			remaining := limit - uint32(len(seeds))
+			if remaining == 0 {
+				break
+			}
+			page, pageBoundaries, err := store.Address(ctx, snapshot, repository.AddressQuery{
+				Address: query.Seed.Address,
+				State:   "history",
+				Limit:   remaining,
+				LastKey: lastKey,
+			})
+			if err != nil {
+				return repository.TraceSeedResult{}, nil, err
+			}
+			boundaries = append(boundaries, pageBoundaries...)
+			for _, item := range page.Items {
+				if !outputHasAsset(item.Output, query.Asset) {
+					continue
+				}
 				seeds = append(seeds, item.Output.Ref)
+			}
+			if page.Cursor == "" {
+				break
+			}
+			continuation = page.Cursor
+			if len(seeds) == int(limit) {
+				truncated = true
+				break
+			}
+			value, err := cursor.DecodePinned(
+				page.Cursor,
+				addressScope(query.Seed.Address, "history"),
+			)
+			if err != nil || value.SnapshotEvent != snapshot.Event {
+				return repository.TraceSeedResult{}, nil, cursor.ErrInvalid
+			}
+			lastKey = value.LastKey
+			if window == maxTraceSeedWindows-1 {
+				truncated = true
 			}
 		}
 		return repository.TraceSeedResult{
-			UTxOs:     seeds,
-			Truncated: page.Cursor != "",
+			UTxOs:              seeds,
+			Truncated:          truncated,
+			ContinuationCursor: continuation,
 		}, boundaries, nil
 	}
 	return repository.TraceSeedResult{}, nil, errors.New("missing trace seed")
