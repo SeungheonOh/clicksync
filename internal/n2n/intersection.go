@@ -19,63 +19,99 @@ type chainSyncClient interface {
 	Sync([]pcommon.Point) error
 }
 
-type reconcileFunc func(pcommon.Point) error
+// ChainPoint is the only intersection-candidate representation. Every
+// non-Origin point carries the decoded/stored block number that the next
+// ChainSync header must extend.
+type ChainPoint struct {
+	Point       pcommon.Point
+	BlockNumber uint64
+	IsByronEBB  bool
+}
+
+func NewChainPoint(point pcommon.Point, blockNumber uint64) ChainPoint {
+	return ChainPoint{
+		Point:       pcommon.NewPoint(point.Slot, append([]byte(nil), point.Hash...)),
+		BlockNumber: blockNumber,
+	}
+}
+
+func NewByronEBBChainPoint(point pcommon.Point, blockNumber uint64) ChainPoint {
+	ret := NewChainPoint(point, blockNumber)
+	ret.IsByronEBB = true
+	return ret
+}
+
+func NewChainPointOrigin() ChainPoint {
+	return ChainPoint{Point: pcommon.NewPointOrigin()}
+}
+
+type reconcileFunc func(ChainPoint) error
 
 func discoverIntersection(
 	client chainSyncClient,
-	candidates []pcommon.Point,
-) (pcommon.Point, error) {
+	candidates []ChainPoint,
+) (ChainPoint, error) {
 	ordered, err := normalizeCandidates(candidates)
 	if err != nil {
-		return pcommon.Point{}, err
+		return ChainPoint{}, err
 	}
 	for _, candidate := range ordered {
-		_, _, err := client.GetAvailableBlockRange([]pcommon.Point{candidate})
+		_, _, err := client.GetAvailableBlockRange([]pcommon.Point{candidate.Point})
 		switch {
 		case err == nil:
 			return candidate, nil
 		case errors.Is(err, chainsync.ErrIntersectNotFound):
 			continue
 		default:
-			return pcommon.Point{}, fmt.Errorf(
+			return ChainPoint{}, fmt.Errorf(
 				"probe ChainSync intersection at slot %d: %w",
-				candidate.Slot,
+				candidate.Point.Slot,
 				err,
 			)
 		}
 	}
-	return pcommon.Point{}, errors.New("Origin ChainSync intersection was not accepted")
+	return ChainPoint{}, errors.New("no supplied ChainSync intersection was accepted")
 }
 
 func reconcileAndSync(
 	client chainSyncClient,
-	candidates []pcommon.Point,
+	candidates []ChainPoint,
 	reconcile reconcileFunc,
-) (pcommon.Point, error) {
+) (ChainPoint, error) {
 	if reconcile == nil {
-		return pcommon.Point{}, errors.New("nil committed-chain reconciler")
+		return ChainPoint{}, errors.New("nil committed-chain reconciler")
 	}
 	chosen, err := discoverIntersection(client, candidates)
 	if err != nil {
-		return pcommon.Point{}, err
+		return ChainPoint{}, err
 	}
 	// Reconciliation must commit any required local rollback before Sync can
 	// deliver and publish a new roll-forward.
 	if err := reconcile(chosen); err != nil {
-		return pcommon.Point{}, fmt.Errorf("reconcile selected intersection: %w", err)
+		return ChainPoint{}, fmt.Errorf("reconcile selected intersection: %w", err)
 	}
-	if err := client.Sync([]pcommon.Point{chosen}); err != nil {
-		return pcommon.Point{}, fmt.Errorf("start ChainSync at selected intersection: %w", err)
+	if err := client.Sync([]pcommon.Point{chosen.Point}); err != nil {
+		return ChainPoint{}, fmt.Errorf("start ChainSync at selected intersection: %w", err)
 	}
 	return chosen, nil
 }
 
-func normalizeCandidates(candidates []pcommon.Point) ([]pcommon.Point, error) {
-	var ret []pcommon.Point
+func normalizeCandidates(candidates []ChainPoint) ([]ChainPoint, error) {
+	var ret []ChainPoint
 	seen := make(map[string]struct{}, len(candidates)+1)
-	origin := pcommon.NewPointOrigin()
-	for _, point := range candidates {
+	for index, candidate := range candidates {
+		point := candidate.Point
 		if isOrigin(point) {
+			if index != len(candidates)-1 {
+				return nil, errors.New("Origin intersection candidate must be last")
+			}
+			if candidate.BlockNumber != 0 {
+				return nil, errors.New("Origin intersection cannot carry a block number")
+			}
+			if candidate.IsByronEBB {
+				return nil, errors.New("Origin intersection cannot be a Byron EBB")
+			}
+			ret = append(ret, NewChainPointOrigin())
 			continue
 		}
 		if len(point.Hash) != 32 {
@@ -86,11 +122,15 @@ func normalizeCandidates(candidates []pcommon.Point) ([]pcommon.Point, error) {
 			continue
 		}
 		seen[key] = struct{}{}
-		ret = append(ret, point)
+		if candidate.IsByronEBB {
+			ret = append(ret, NewByronEBBChainPoint(point, candidate.BlockNumber))
+		} else {
+			ret = append(ret, NewChainPoint(point, candidate.BlockNumber))
+		}
 	}
-	// The caller supplies newest-to-historical candidates. Origin is always
-	// forced to the final position and cannot be omitted.
-	return append(ret, origin), nil
+	// Origin is never widened into the candidate set here. The supervisor
+	// supplies it explicitly only for a complete Origin-start dataset.
+	return ret, nil
 }
 
 func isOrigin(point pcommon.Point) bool {

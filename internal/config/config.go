@@ -1,24 +1,29 @@
 package config
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 )
 
-const (
-	MainnetMagic        = uint32(764824073)
-	DefaultProjectLimit = uint64(100 * 1024 * 1024 * 1024)
-	DefaultActiveLimit  = uint64(70 * 1024 * 1024 * 1024)
-	DefaultWarningLimit = uint64(60 * 1024 * 1024 * 1024)
-)
+const MainnetMagic = uint32(764824073)
 
-var DefaultPeers = []string{
-	"backbone.cardano.iog.io:3001",
-	"backbone.mainnet.cardanofoundation.org:3001",
+const DefaultPeersText = "backbone.cardano.iog.io:3001|iog," +
+	"backbone.mainnet.cardanofoundation.org:3001|cardano-foundation"
+
+type Peer struct {
+	Host     string `json:"host"`
+	Operator string `json:"operator"`
+}
+
+type StartPoint struct {
+	Slot uint64
+	Hash [32]byte
 }
 
 type Config struct {
@@ -29,29 +34,27 @@ type Config struct {
 	ClickHouseDatabase string
 	NetworkName        string
 	NetworkMagic       uint32
-	Peers              []string
+	Peers              []Peer
 	Corroboration      int
 	Start              string
 	StartPoint         string
-	MaxBlocks          uint64
-	StopAtTip          bool
 	QueueCapacity      int
+	HeaderBatchSize    int
 	LockPath           string
 	WriterCoordination string
-	WarningBytes       uint64
-	ActiveLimitBytes   uint64
-	ProjectLimitBytes  uint64
 	DialTimeout        time.Duration
 	ProtocolTimeout    time.Duration
 }
 
 type PeerConfig struct {
+	NetworkName   string
 	NetworkMagic  uint32
-	Peers         []string
+	Peers         []Peer
 	Corroboration int
 }
 
 func PeersFromEnv() (PeerConfig, error) {
+	networkName := env("CARDANO_NETWORK_NAME", "mainnet")
 	magic, err := envUint32("CARDANO_NETWORK_MAGIC", MainnetMagic)
 	if err != nil {
 		return PeerConfig{}, err
@@ -60,27 +63,41 @@ func PeersFromEnv() (PeerConfig, error) {
 	if err != nil {
 		return PeerConfig{}, err
 	}
-	var peers []string
-	for _, peer := range strings.Split(env("CARDANO_PEERS", strings.Join(DefaultPeers, ",")), ",") {
-		if peer = strings.TrimSpace(peer); peer != "" {
+	var peers []Peer
+	for _, value := range strings.Split(env("CARDANO_PEERS", DefaultPeersText), ",") {
+		if value = strings.TrimSpace(value); value != "" {
+			peer, err := parsePeer(value)
+			if err != nil {
+				return PeerConfig{}, err
+			}
 			peers = append(peers, peer)
 		}
 	}
-	if magic == 0 {
-		return PeerConfig{}, errors.New("CARDANO_NETWORK_MAGIC must be non-zero")
+	if networkName != "mainnet" {
+		return PeerConfig{}, fmt.Errorf(
+			"CARDANO_NETWORK_NAME must be mainnet, got %q",
+			networkName,
+		)
+	}
+	if magic != MainnetMagic {
+		return PeerConfig{}, fmt.Errorf(
+			"CARDANO_NETWORK_MAGIC must be mainnet magic %d, got %d",
+			MainnetMagic,
+			magic,
+		)
 	}
 	if corroboration < 2 || corroboration > len(peers) {
 		return PeerConfig{}, fmt.Errorf("CARDANO_CORROBORATION must be in 2..%d", len(peers))
 	}
-	seen := make(map[string]struct{}, len(peers))
-	for _, peer := range peers {
-		key := strings.ToLower(peer)
-		if _, ok := seen[key]; ok {
-			return PeerConfig{}, fmt.Errorf("duplicate peer %q cannot count as independent corroboration", peer)
-		}
-		seen[key] = struct{}{}
+	if err := validateIndependentPeers(peers, corroboration); err != nil {
+		return PeerConfig{}, err
 	}
-	return PeerConfig{NetworkMagic: magic, Peers: peers, Corroboration: corroboration}, nil
+	return PeerConfig{
+		NetworkName:   networkName,
+		NetworkMagic:  magic,
+		Peers:         peers,
+		Corroboration: corroboration,
+	}, nil
 }
 
 func FromEnv() (Config, error) {
@@ -101,22 +118,10 @@ func FromEnv() (Config, error) {
 	if cfg.ClickHousePort, err = envUint16("CLICKHOUSE_NATIVE_PORT", 9000); err != nil {
 		return Config{}, err
 	}
-	if cfg.MaxBlocks, err = envUint64("CLICKSYNC_MAX_BLOCKS", 0); err != nil {
-		return Config{}, err
-	}
-	if cfg.StopAtTip, err = envBool("CLICKSYNC_STOP_AT_TIP", false); err != nil {
-		return Config{}, err
-	}
 	if cfg.QueueCapacity, err = envInt("CLICKSYNC_QUEUE_CAPACITY", 4); err != nil {
 		return Config{}, err
 	}
-	if cfg.WarningBytes, err = envUint64("CLICKSYNC_WARNING_BYTES", DefaultWarningLimit); err != nil {
-		return Config{}, err
-	}
-	if cfg.ActiveLimitBytes, err = envUint64("CLICKSYNC_ACTIVE_DATA_LIMIT_BYTES", DefaultActiveLimit); err != nil {
-		return Config{}, err
-	}
-	if cfg.ProjectLimitBytes, err = envUint64("CLICKSYNC_PROJECT_LIMIT_BYTES", DefaultProjectLimit); err != nil {
+	if cfg.HeaderBatchSize, err = envInt("CLICKSYNC_HEADER_BATCH_SIZE", 32); err != nil {
 		return Config{}, err
 	}
 	peerConfig, err := PeersFromEnv()
@@ -124,6 +129,7 @@ func FromEnv() (Config, error) {
 		return Config{}, err
 	}
 	cfg.NetworkMagic = peerConfig.NetworkMagic
+	cfg.NetworkName = peerConfig.NetworkName
 	cfg.Peers = peerConfig.Peers
 	cfg.Corroboration = peerConfig.Corroboration
 	if err := cfg.Validate(); err != nil {
@@ -144,8 +150,14 @@ func (c Config) Validate() error {
 		return errors.New("CLICKHOUSE_PASSWORD is required")
 	case c.ClickHouseDatabase != "clicksync":
 		return fmt.Errorf("CLICKHOUSE_DATABASE must be clicksync, got %q", c.ClickHouseDatabase)
-	case c.NetworkMagic == 0:
-		return errors.New("CARDANO_NETWORK_MAGIC must be non-zero")
+	case c.NetworkName != "mainnet":
+		return fmt.Errorf("CARDANO_NETWORK_NAME must be mainnet, got %q", c.NetworkName)
+	case c.NetworkMagic != MainnetMagic:
+		return fmt.Errorf(
+			"CARDANO_NETWORK_MAGIC must be mainnet magic %d, got %d",
+			MainnetMagic,
+			c.NetworkMagic,
+		)
 	case len(c.Peers) < 2:
 		return errors.New("at least two independently operated CARDANO_PEERS are required")
 	case c.Corroboration < 2 || c.Corroboration > len(c.Peers):
@@ -154,22 +166,139 @@ func (c Config) Validate() error {
 		return errors.New("CLICKSYNC_START must be origin or intersection")
 	case c.Start == "origin" && c.StartPoint != "":
 		return errors.New("CLICKSYNC_START_POINT cannot be set for Origin sync")
+	case c.Start == "intersection" && c.StartPoint == "":
+		return errors.New("CLICKSYNC_START_POINT is required for intersection sync")
 	case c.QueueCapacity < 1 || c.QueueCapacity > 32:
 		return errors.New("CLICKSYNC_QUEUE_CAPACITY must be in 1..32")
+	case c.HeaderBatchSize < 1 || c.HeaderBatchSize > 32:
+		return errors.New("CLICKSYNC_HEADER_BATCH_SIZE must be in 1..32")
 	case c.WriterCoordination != "" && c.WriterCoordination != "single-host-flock":
 		return errors.New("only single-host-flock writer coordination is supported")
-	case c.WarningBytes >= c.ActiveLimitBytes || c.ActiveLimitBytes >= c.ProjectLimitBytes:
-		return errors.New("storage thresholds must satisfy warning < active limit < project limit")
 	}
-	seen := make(map[string]struct{}, len(c.Peers))
-	for _, peer := range c.Peers {
-		key := strings.ToLower(peer)
-		if _, ok := seen[key]; ok {
-			return fmt.Errorf("duplicate peer %q cannot count as independent corroboration", peer)
+	if err := validateIndependentPeers(c.Peers, c.Corroboration); err != nil {
+		return err
+	}
+	if c.Start == "intersection" {
+		if _, err := ParseStartPoint(c.StartPoint); err != nil {
+			return fmt.Errorf("CLICKSYNC_START_POINT: %w", err)
 		}
-		seen[key] = struct{}{}
 	}
 	return nil
+}
+
+func parsePeer(value string) (Peer, error) {
+	address, operator, ok := strings.Cut(value, "|")
+	if !ok || strings.Contains(operator, "|") {
+		return Peer{}, fmt.Errorf(
+			"CARDANO_PEERS entry %q must be host:port|operator",
+			value,
+		)
+	}
+	address = strings.TrimSpace(address)
+	operator = strings.TrimSpace(operator)
+	host, portText, err := net.SplitHostPort(address)
+	if err != nil || host == "" {
+		return Peer{}, fmt.Errorf(
+			"CARDANO_PEERS entry %q has invalid host:port",
+			value,
+		)
+	}
+	port, err := strconv.ParseUint(portText, 10, 16)
+	if err != nil || port == 0 {
+		return Peer{}, fmt.Errorf(
+			"CARDANO_PEERS entry %q has invalid port",
+			value,
+		)
+	}
+	if !validOperatorLabel(operator) {
+		return Peer{}, fmt.Errorf(
+			"CARDANO_PEERS entry %q has invalid operator label",
+			value,
+		)
+	}
+	return Peer{
+		Host:     net.JoinHostPort(strings.ToLower(host), strconv.FormatUint(port, 10)),
+		Operator: operator,
+	}, nil
+}
+
+func validOperatorLabel(value string) bool {
+	if len(value) < 1 || len(value) > 64 {
+		return false
+	}
+	for index, char := range value {
+		if char >= 'a' && char <= 'z' ||
+			char >= 'A' && char <= 'Z' ||
+			char >= '0' && char <= '9' ||
+			index > 0 && (char == '.' || char == '_' || char == '-') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func validateIndependentPeers(peers []Peer, corroboration int) error {
+	addresses := make(map[string]struct{}, len(peers))
+	operators := make(map[string]struct{}, len(peers))
+	for _, peer := range peers {
+		parsed, err := parsePeer(peer.Host + "|" + peer.Operator)
+		if err != nil {
+			return err
+		}
+		addressKey := strings.ToLower(parsed.Host)
+		if _, ok := addresses[addressKey]; ok {
+			return fmt.Errorf(
+				"duplicate peer address %q cannot count as independent corroboration",
+				peer.Host,
+			)
+		}
+		addresses[addressKey] = struct{}{}
+		operatorKey := strings.ToLower(parsed.Operator)
+		if _, ok := operators[operatorKey]; ok {
+			return fmt.Errorf(
+				"duplicate operator %q cannot count as independent corroboration",
+				peer.Operator,
+			)
+		}
+		operators[operatorKey] = struct{}{}
+	}
+	if len(operators) < corroboration {
+		return fmt.Errorf(
+			"CARDANO_CORROBORATION %d exceeds %d independent operators",
+			corroboration,
+			len(operators),
+		)
+	}
+	return nil
+}
+
+// ParseStartPoint deliberately accepts only SLOT:HASH. The block number must
+// be decoded from an exact, body-hash-validated BlockFetch before the dataset
+// manifest is created; it is never trusted from operator configuration.
+func ParseStartPoint(value string) (StartPoint, error) {
+	parts := strings.Split(strings.TrimSpace(value), ":")
+	if len(parts) != 2 {
+		return StartPoint{}, errors.New("must be SLOT:64_HEX_HASH")
+	}
+	var ret StartPoint
+	slot, err := strconv.ParseUint(parts[0], 10, 64)
+	if err != nil {
+		return StartPoint{}, fmt.Errorf("parse slot: %w", err)
+	}
+	hash, err := hex.DecodeString(parts[1])
+	if err != nil {
+		return StartPoint{}, fmt.Errorf("parse hash: %w", err)
+	}
+	if len(hash) != len(ret.Hash) {
+		return StartPoint{}, fmt.Errorf("hash must be 32 bytes, got %d", len(hash))
+	}
+	ret.Slot = slot
+	copy(ret.Hash[:], hash)
+	if ret.Hash == ([32]byte{}) {
+		return StartPoint{}, errors.New("hash must not be all zero")
+	}
+	return ret, nil
 }
 
 func env(name, fallback string) string {
@@ -215,18 +344,6 @@ func envInt(name string, fallback int) (int, error) {
 	value, err := strconv.Atoi(text)
 	if err != nil {
 		return 0, fmt.Errorf("%s: %w", name, err)
-	}
-	return value, nil
-}
-
-func envBool(name string, fallback bool) (bool, error) {
-	text := strings.TrimSpace(os.Getenv(name))
-	if text == "" {
-		return fallback, nil
-	}
-	value, err := strconv.ParseBool(text)
-	if err != nil {
-		return false, fmt.Errorf("%s: %w", name, err)
 	}
 	return value, nil
 }
