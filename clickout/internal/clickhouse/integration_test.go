@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/clicksync-project/clickout/internal/cursor"
 	"github.com/clicksync-project/clickout/internal/metrics"
 	"github.com/clicksync-project/clickout/internal/model"
 	"github.com/clicksync-project/clickout/internal/repository"
@@ -40,6 +41,7 @@ func TestContractReadsRollbackAndTrace(t *testing.T) {
 	}
 	fixture := newFixture()
 	fixture.insert(t, store)
+	fixture.insertUnpublishedAddressCandidate(t, store)
 
 	snapshot, err := store.Snapshot(ctx, model.AtPoint{Tip: true})
 	if err != nil {
@@ -77,13 +79,34 @@ func TestContractReadsRollbackAndTrace(t *testing.T) {
 	if inlineQueries != 1 {
 		t.Fatalf("two inline outputs used %d datum body queries, want one", inlineQueries)
 	}
-	page, _, err := store.Address(ctx, snapshot, repository.AddressQuery{
+	pageCollector := &metrics.Collector{}
+	pageCtx := metrics.WithCollector(ctx, pageCollector)
+	page, _, err := store.Address(pageCtx, snapshot, repository.AddressQuery{
 		Address: fixture.addressA,
 		State:   "history",
 		Limit:   1,
 	})
-	if err != nil || len(page.Items) != 1 || page.Cursor == "" {
-		t.Fatalf("unexpected address page: %#v, %v", page, err)
+	if err != nil || len(page.Items) != 0 || page.Cursor == "" {
+		t.Fatalf("unpublished physical window was not an empty resumable page: %#v, %v", page, err)
+	}
+	for _, query := range pageCollector.Snapshot() {
+		if query.Name == "address_outputs" || query.Name == "inline_datums_batch" {
+			t.Fatalf("inactive candidate was hydrated by %s", query.Name)
+		}
+	}
+	resume, err := cursor.DecodePinned(page.Cursor, addressScope(fixture.addressA, "history"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, _, err = store.Address(ctx, snapshot, repository.AddressQuery{
+		Address: fixture.addressA,
+		State:   "history",
+		Limit:   1,
+		LastKey: resume.LastKey,
+	})
+	if err != nil || len(page.Items) != 1 || page.Items[0].Output.Ref != fixture.source ||
+		page.Cursor == "" {
+		t.Fatalf("live output after inactive window was not resumable: %#v, %v", page, err)
 	}
 	datum, err := store.Datum(ctx, snapshot, fixture.datumHash)
 	if err != nil || !datum.BodyVerified || len(datum.ActiveObservations) != 2 ||
@@ -129,6 +152,21 @@ func TestContractReadsRollbackAndTrace(t *testing.T) {
 		len(reverse[0].ConsumedInputValues) != 1 ||
 		reverse[0].ConsumedInputValues[0].Ref != fixture.source {
 		t.Fatalf("unexpected reverse edge: %#v, %#v, %v", reverse, boundaries, err)
+	}
+	fanInResult, boundaries, err := store.ExpandReverse(
+		ctx,
+		snapshot,
+		[]model.UTxORef{
+			fixture.destination,
+			{TxHash: fixture.txB, Index: 1},
+		},
+		model.AssetSelector{ADA: true},
+		repository.ExpansionBudget{MaxEdges: 1, MaxNodes: 1000},
+	)
+	if err != nil || len(boundaries) != 0 || fanInResult.Truncated ||
+		len(fanInResult.Hyperedges) != 1 ||
+		fanInResult.Hyperedges[0].Transaction != fixture.txB {
+		t.Fatalf("reverse fan-in did not deduplicate candidate transaction: %#v, %#v, %v", fanInResult, boundaries, err)
 	}
 	invalidTx, _, err := store.Transaction(ctx, snapshot, fixture.txC)
 	if err != nil || invalidTx.Phase2Valid || invalidTx.MintApplied ||
@@ -176,14 +214,43 @@ func TestContractReadsRollbackAndTrace(t *testing.T) {
 		t.Fatalf("datum provenance did not separate body from active observation: %#v, %v", datum, err)
 	}
 
-	fixture.readopt(t, store)
+	fixture.freshReadopt(t, store)
 	snapshot, err = store.Snapshot(ctx, model.AtPoint{Tip: true})
-	if err != nil || snapshot.Event != 6 {
+	if err != nil || snapshot.Event != 6 || snapshot.PublicationWatermark != fixture.pub3 {
 		t.Fatalf("re-adoption failed: %#v, %v", snapshot, err)
 	}
 	sourceState, _, err = store.UTxO(ctx, snapshot, fixture.source)
 	if err != nil || sourceState.IsCurrent {
 		t.Fatalf("re-adoption did not restore spend: %#v, %v", sourceState, err)
+	}
+	atBlock, err := store.Snapshot(ctx, model.AtPoint{BlockHash: &fixture.block2})
+	if err != nil || atBlock.Event != 6 || atBlock.PublicationWatermark != fixture.pub3 {
+		t.Fatalf("complete AtBlock SQL did not select fresh re-adoption: %#v, %v", atBlock, err)
+	}
+	reAdoptPage, _, err := store.Address(ctx, atBlock, repository.AddressQuery{
+		Address: fixture.addressB,
+		State:   "history",
+		Limit:   1,
+	})
+	if err != nil || len(reAdoptPage.Items) != 0 || reAdoptPage.Cursor == "" {
+		t.Fatalf("inactive old publication did not form an empty physical page: %#v, %v", reAdoptPage, err)
+	}
+	reAdoptResume, err := cursor.DecodePinned(
+		reAdoptPage.Cursor,
+		addressScope(fixture.addressB, "history"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reAdoptPage, _, err = store.Address(ctx, atBlock, repository.AddressQuery{
+		Address: fixture.addressB,
+		State:   "history",
+		Limit:   1,
+		LastKey: reAdoptResume.LastKey,
+	})
+	if err != nil || len(reAdoptPage.Items) != 1 ||
+		reAdoptPage.Items[0].Output.Ref != fixture.destination {
+		t.Fatalf("fresh publication was not selected across page boundary: %#v, %v", reAdoptPage, err)
 	}
 	fixture.commitNoOpRollback(t, store)
 	snapshot, err = store.Snapshot(ctx, model.AtPoint{Tip: true})
@@ -196,13 +263,26 @@ func TestContractReadsRollbackAndTrace(t *testing.T) {
 	}
 	pinnedEvent := uint64(7)
 	pinned, err := store.Snapshot(ctx, model.AtPoint{Event: &pinnedEvent})
-	if err != nil || pinned.Event != 7 || pinned.PublicationWatermark != fixture.pub2 {
+	if err != nil || pinned.Event != 7 || pinned.PublicationWatermark != fixture.pub3 {
 		t.Fatalf("depth-zero rollback event was not pinnable: %#v, %v", pinned, err)
 	}
 	fixture.insertPostWatermarkShadow(t, store)
 	sourceState, _, err = store.UTxO(ctx, pinned, fixture.source)
 	if err != nil || sourceState.Output.BlockHash != fixture.block1 {
 		t.Fatalf("post-watermark row leaked into captured snapshot: %#v, %v", sourceState, err)
+	}
+	pinnedPage, _, err := store.Address(ctx, pinned, repository.AddressQuery{
+		Address: fixture.addressA,
+		State:   "history",
+		Limit:   100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range pinnedPage.Items {
+		if item.Output.BlockHeight == 4 {
+			t.Fatalf("post-watermark address candidate leaked: %#v", item)
+		}
 	}
 	fixture.invalidatePostWatermarkShadow(t, store)
 
@@ -235,7 +315,7 @@ func assertPrimaryKeyPlan(t *testing.T, store *Store, snapshot model.Snapshot, r
 		activeArguments(snapshot, hashArgument(ref.TxHash), ref.Index)...,
 	)
 	if !strings.Contains(plan, "PrimaryKey") ||
-		!strings.Contains(plan, "publication_id in 1-element set") {
+		!strings.Contains(plan, "publication_id in") {
 		t.Fatalf("source-spend plan is not candidate-first:\n%s", plan)
 	}
 	t.Logf("source-spend EXPLAIN indexes=1:\n%s", plan)
@@ -464,22 +544,22 @@ func assertInflatedHistoryReadsStayCandidateBounded(
 }
 
 type fixture struct {
-	pub1, pub2     uint64
-	block1, block2 model.Hash32
-	txA, txB, txC  model.Hash32
-	source         model.UTxORef
-	collateral     model.UTxORef
-	destination    model.UTxORef
-	datumHash      model.Hash32
-	dataHash       model.Hash32
-	metadataHash   model.Hash32
-	policy         model.PolicyID
-	addressA       []byte
-	addressB       []byte
-	datumCBOR      []byte
-	redeemerCBOR   []byte
-	metadataCBOR   []byte
-	rollbackID     string
+	pub1, pub2, pub3 uint64
+	block1, block2   model.Hash32
+	txA, txB, txC    model.Hash32
+	source           model.UTxORef
+	collateral       model.UTxORef
+	destination      model.UTxORef
+	datumHash        model.Hash32
+	dataHash         model.Hash32
+	metadataHash     model.Hash32
+	policy           model.PolicyID
+	addressA         []byte
+	addressB         []byte
+	datumCBOR        []byte
+	redeemerCBOR     []byte
+	metadataCBOR     []byte
+	rollbackID       string
 }
 
 func newFixture() fixture {
@@ -503,6 +583,7 @@ func newFixture() fixture {
 	return fixture{
 		pub1:         101,
 		pub2:         102,
+		pub3:         103,
 		block1:       hash(0x11),
 		block2:       hash(0x12),
 		txA:          txA,
@@ -722,6 +803,44 @@ func (fixture fixture) insert(t *testing.T, store *Store) {
 		hashArgument(fixture.txB), string(fixture.metadataCBOR), len(fixture.metadataCBOR), hashArgument(fixture.metadataHash))
 }
 
+func (fixture fixture) insertUnpublishedAddressCandidate(t *testing.T, store *Store) {
+	t.Helper()
+	ctx := context.Background()
+	writer := "22222222-2222-4222-8222-222222222222"
+	block := repeatedHash(0x09)
+	tx := repeatedHash(0x01)
+	missingDatum := repeatedHash(0xaa)
+	if err := store.conn.Exec(ctx, `INSERT INTO blocks
+        (publication_id,block_hash,parent_hash,slot,block_number,era,block_type,
+         transaction_count,input_count,output_count,datum_observation_count,
+         withdrawal_count,redeemer_count,metadata_count,synthetic,source_peer,
+         source_address,source_operator,n2n_version,network_magic,body_hash_verified,
+         transaction_hashes_verified,facts_digest,writer_id,observed_at,inserted_at)
+        VALUES (50,?,NULL,0,0,'conway',0,1,0,1,0,0,0,0,false,'peer',
+                '127.0.0.1','test',15,764824073,true,true,?,toUUID(?),
+                now64(6),now64(6))`,
+		hashArgument(block),
+		hashArgument(block),
+		writer,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.conn.Exec(ctx, `INSERT INTO outputs
+        (publication_id,block_number,tx_hash,tx_order,output_index,body_ordinal,
+         output_kind,address,payment_credential_kind,payment_credential_hash,
+         lovelace,asset_policy_ids,asset_names,asset_quantities,datum_kind,datum_hash,
+         reference_script_hash,reference_script_language)
+        VALUES (50,0,?,0,0,0,'regular',?,'script',?,1,[],[],[],
+                'inline',?,NULL,NULL)`,
+		hashArgument(tx),
+		string(fixture.addressA),
+		string(fixture.policy[:]),
+		hashArgument(missingDatum),
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func (fixture fixture) insertHeaderlessRollback(t *testing.T, store *Store) {
 	t.Helper()
 	if err := store.conn.Exec(context.Background(), `INSERT INTO chain_events
@@ -750,16 +869,74 @@ func (fixture fixture) commitRollback(t *testing.T, store *Store) {
 	}
 }
 
-func (fixture fixture) readopt(t *testing.T, store *Store) {
+func (fixture fixture) freshReadopt(t *testing.T, store *Store) {
 	t.Helper()
-	if err := store.conn.Exec(context.Background(), `INSERT INTO chain_events
+	ctx := context.Background()
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if err := store.conn.Exec(ctx, query, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exec(`INSERT INTO blocks
+        (publication_id,block_hash,parent_hash,slot,block_number,era,block_type,
+         transaction_count,input_count,output_count,datum_observation_count,
+         withdrawal_count,redeemer_count,metadata_count,synthetic,source_peer,
+         source_address,source_operator,n2n_version,network_magic,body_hash_verified,
+         transaction_hashes_verified,facts_digest,writer_id,observed_at,inserted_at)
+        SELECT ?,block_hash,parent_hash,slot,block_number,era,block_type,
+         transaction_count,input_count,output_count,datum_observation_count,
+         withdrawal_count,redeemer_count,metadata_count,synthetic,source_peer,
+         source_address,source_operator,n2n_version,network_magic,body_hash_verified,
+         transaction_hashes_verified,facts_digest,writer_id,observed_at,now64(6)
+        FROM blocks WHERE publication_id = ?`,
+		fixture.pub3, fixture.pub2)
+	exec(`INSERT INTO transactions
+        (publication_id,block_number,tx_hash,tx_order,parent_tx_hash,subtransaction_index,
+         era,phase2_valid,flow_kind,declared_fee_lovelace,effective_fee_lovelace,
+         mint_is_applied,mint_policy_ids,mint_asset_names,mint_quantities,
+         regular_input_count,collateral_input_count,reference_input_count,
+         produced_output_count,withdrawal_count,redeemer_count,metadata_present,
+         datum_observation_count)
+        SELECT ?,block_number,tx_hash,tx_order,parent_tx_hash,subtransaction_index,
+         era,phase2_valid,flow_kind,declared_fee_lovelace,effective_fee_lovelace,
+         mint_is_applied,mint_policy_ids,mint_asset_names,mint_quantities,
+         regular_input_count,collateral_input_count,reference_input_count,
+         produced_output_count,withdrawal_count,redeemer_count,metadata_present,
+         datum_observation_count
+        FROM transactions WHERE publication_id = ?`,
+		fixture.pub3, fixture.pub2)
+	exec(`INSERT INTO inputs
+        (publication_id,block_number,tx_hash,tx_order,source_tx_hash,
+         source_output_index,body_ordinal,role,is_consumed,source_is_resolved)
+        SELECT ?,block_number,tx_hash,tx_order,source_tx_hash,
+         source_output_index,body_ordinal,role,is_consumed,source_is_resolved
+        FROM inputs WHERE publication_id = ?`,
+		fixture.pub3, fixture.pub2)
+	exec(`INSERT INTO outputs
+        (publication_id,block_number,tx_hash,tx_order,output_index,body_ordinal,
+         output_kind,address,payment_credential_kind,payment_credential_hash,
+         lovelace,asset_policy_ids,asset_names,asset_quantities,datum_kind,datum_hash,
+         reference_script_hash,reference_script_language)
+        SELECT ?,block_number,tx_hash,tx_order,output_index,body_ordinal,
+         output_kind,address,payment_credential_kind,payment_credential_hash,
+         lovelace,asset_policy_ids,asset_names,asset_quantities,datum_kind,datum_hash,
+         reference_script_hash,reference_script_language
+        FROM outputs WHERE publication_id = ?`,
+		fixture.pub3, fixture.pub2)
+	exec(`INSERT INTO withdrawals
+        (publication_id,block_number,tx_hash,tx_order,body_ordinal,reward_account,
+         lovelace,is_applied,credential_kind,credential_hash)
+        SELECT ?,block_number,tx_hash,tx_order,body_ordinal,reward_account,
+         lovelace,is_applied,credential_kind,credential_hash
+        FROM withdrawals WHERE publication_id = ?`,
+		fixture.pub3, fixture.pub2)
+	exec(`INSERT INTO chain_events
         (event_seq,publication_id,event_kind,active,rollback_id,block_hash,slot,
          block_number,is_byron_ebb,writer_id,recorded_at)
-	        VALUES (6,102,'adoption',true,NULL,?,2,2,false,
+        VALUES (6,?,'adoption',true,NULL,?,2,2,false,
                 toUUID('22222222-2222-4222-8222-222222222222'),now64(6))`,
-		hashArgument(fixture.block2)); err != nil {
-		t.Fatal(err)
-	}
+		fixture.pub3, hashArgument(fixture.block2))
 }
 
 func (fixture fixture) commitNoOpRollback(t *testing.T, store *Store) {
