@@ -52,6 +52,15 @@ type RangeUnavailable struct {
 	Err   error
 }
 
+// ProtocolChannelClosed means gOuroboros ended its asynchronous error stream
+// without a more specific validation or handler failure. It is a typed
+// transport termination, not peer-data evidence.
+type ProtocolChannelClosed struct{}
+
+func (*ProtocolChannelClosed) Error() string {
+	return "peer protocol error channel closed"
+}
+
 func (e *RangeUnavailable) Error() string {
 	if e == nil {
 		return "BlockFetch range unavailable"

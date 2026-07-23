@@ -189,10 +189,28 @@ func RunPeer(
 		return err
 	case err, ok := <-asyncErr:
 		if !ok {
-			return errors.New("peer protocol error channel closed")
+			return protocolChannelClosure(runCtx, cancel, workerErr)
 		}
 		return classifyPeerProtocolError(err, current.currentFetchPoint())
 	}
+}
+
+func protocolChannelClosure(
+	runCtx context.Context,
+	cancel context.CancelCauseFunc,
+	workerErr <-chan error,
+) error {
+	closed := &ProtocolChannelClosed{}
+	cancel(closed)
+	err := <-workerErr
+	if err == nil ||
+		errors.Is(err, closed) ||
+		errors.Is(err, context.Canceled) {
+		return closed
+	}
+	// A handler/store failure or typed validation failure which raced channel
+	// closure is more specific and must remain terminal.
+	return err
 }
 
 func classifyPeerProtocolError(err error, point pcommon.Point) error {

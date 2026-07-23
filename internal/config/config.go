@@ -53,6 +53,49 @@ type PeerConfig struct {
 	Corroboration int
 }
 
+type WriterSettings struct {
+	LockPath           string
+	WriterCoordination string
+}
+
+// DatabaseFromEnv loads only native ClickHouse settings. Read-only status
+// commands must not depend on Cardano peer or start-point configuration.
+func DatabaseFromEnv() (Config, error) {
+	cfg := Config{
+		ClickHouseHost:     env("CLICKHOUSE_HOST", "127.0.0.1"),
+		ClickHouseUser:     env("CLICKHOUSE_USER", "clicksync"),
+		ClickHousePassword: os.Getenv("CLICKHOUSE_PASSWORD"),
+		ClickHouseDatabase: env("CLICKHOUSE_DATABASE", "clicksync"),
+	}
+	var err error
+	if cfg.ClickHousePort, err = envUint16("CLICKHOUSE_NATIVE_PORT", 9000); err != nil {
+		return Config{}, err
+	}
+	switch {
+	case cfg.ClickHouseHost == "":
+		return Config{}, errors.New("CLICKHOUSE_HOST is required")
+	case cfg.ClickHousePort == 0:
+		return Config{}, errors.New("CLICKHOUSE_NATIVE_PORT must be non-zero")
+	case cfg.ClickHouseUser == "":
+		return Config{}, errors.New("CLICKHOUSE_USER is required")
+	case cfg.ClickHousePassword == "":
+		return Config{}, errors.New("CLICKHOUSE_PASSWORD is required")
+	case cfg.ClickHouseDatabase != "clicksync":
+		return Config{}, fmt.Errorf(
+			"CLICKHOUSE_DATABASE must be clicksync, got %q",
+			cfg.ClickHouseDatabase,
+		)
+	}
+	return cfg, nil
+}
+
+func WriterSettingsFromEnv() WriterSettings {
+	return WriterSettings{
+		LockPath:           env("CLICKSYNC_LOCK_PATH", "./clicksync-state/writer.lock"),
+		WriterCoordination: env("CLICKSYNC_WRITER_COORDINATION", ""),
+	}
+}
+
 func PeersFromEnv() (PeerConfig, error) {
 	networkName := env("CARDANO_NETWORK_NAME", "mainnet")
 	magic, err := envUint32("CARDANO_NETWORK_MAGIC", MainnetMagic)
@@ -101,23 +144,18 @@ func PeersFromEnv() (PeerConfig, error) {
 }
 
 func FromEnv() (Config, error) {
-	cfg := Config{
-		ClickHouseHost:     env("CLICKHOUSE_HOST", "127.0.0.1"),
-		ClickHouseUser:     env("CLICKHOUSE_USER", "clicksync"),
-		ClickHousePassword: os.Getenv("CLICKHOUSE_PASSWORD"),
-		ClickHouseDatabase: env("CLICKHOUSE_DATABASE", "clicksync"),
-		NetworkName:        env("CARDANO_NETWORK_NAME", "mainnet"),
-		Start:              env("CLICKSYNC_START", "intersection"),
-		StartPoint:         strings.TrimSpace(os.Getenv("CLICKSYNC_START_POINT")),
-		LockPath:           env("CLICKSYNC_LOCK_PATH", "./clicksync-state/writer.lock"),
-		WriterCoordination: env("CLICKSYNC_WRITER_COORDINATION", ""),
-		DialTimeout:        10 * time.Second,
-		ProtocolTimeout:    90 * time.Second,
-	}
-	var err error
-	if cfg.ClickHousePort, err = envUint16("CLICKHOUSE_NATIVE_PORT", 9000); err != nil {
+	cfg, err := DatabaseFromEnv()
+	if err != nil {
 		return Config{}, err
 	}
+	writer := WriterSettingsFromEnv()
+	cfg.NetworkName = env("CARDANO_NETWORK_NAME", "mainnet")
+	cfg.Start = env("CLICKSYNC_START", "intersection")
+	cfg.StartPoint = strings.TrimSpace(os.Getenv("CLICKSYNC_START_POINT"))
+	cfg.LockPath = writer.LockPath
+	cfg.WriterCoordination = writer.WriterCoordination
+	cfg.DialTimeout = 10 * time.Second
+	cfg.ProtocolTimeout = 90 * time.Second
 	if cfg.QueueCapacity, err = envInt("CLICKSYNC_QUEUE_CAPACITY", 4); err != nil {
 		return Config{}, err
 	}

@@ -132,3 +132,56 @@ func TestOnlyNativeBinaryNormalizerModelRemains(t *testing.T) {
 		}
 	}
 }
+
+func TestExecutableRuntimeHasNoArtificialSyncOrStorageCeiling(t *testing.T) {
+	_, file, _, _ := runtime.Caller(0)
+	root := filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+	executable := []string{
+		".env.example",
+		"Dockerfile",
+		"compose.yaml",
+		"cmd/clicksync/main.go",
+		"internal/config/config.go",
+		"internal/ingest/runtime.go",
+		"internal/syncer/supervisor.go",
+	}
+	forbidden := []string{
+		"max_blocks",
+		"stop_at_tip",
+		"100gb",
+		"100 gb",
+		"100gib",
+		"storage quota",
+		"disk quota",
+		"free_space",
+		"free-space",
+		"disk walker",
+		"maxreconnectfailures",
+		"max_reconnect",
+		"stop after blocks",
+		"block limit",
+		"tip limit",
+		"runtime limit",
+	}
+	for _, rel := range executable {
+		data, err := os.ReadFile(filepath.Join(root, rel))
+		if err != nil {
+			t.Fatal(err)
+		}
+		lower := strings.ToLower(string(data))
+		for _, marker := range forbidden {
+			if strings.Contains(lower, marker) {
+				t.Fatalf("%s contains artificial runtime ceiling %q", rel, marker)
+			}
+		}
+	}
+	mainSource, err := os.ReadFile(filepath.Join(root, "cmd", "clicksync", "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, removedCommand := range []string{`"storage"`, `"lease"`} {
+		if strings.Contains(string(mainSource), removedCommand) {
+			t.Fatalf("root CLI retains removed command %s", removedCommand)
+		}
+	}
+}

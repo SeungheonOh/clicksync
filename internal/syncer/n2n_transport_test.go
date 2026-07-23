@@ -215,6 +215,34 @@ func TestDirectTransportPreservesTerminalHandlerFailure(t *testing.T) {
 	}
 }
 
+func TestDirectTransportClassifiesProtocolChannelClosureAsRetryable(t *testing.T) {
+	transport := testDirectTransport()
+	transport.runPeer = func(
+		context.Context,
+		string,
+		n2n.DialConfig,
+		[]n2n.ChainPoint,
+		n2n.Handler,
+		*slog.Logger,
+	) error {
+		return &n2n.ProtocolChannelClosed{}
+	}
+	err := transport.Follow(
+		context.Background(),
+		testPeer("relay.example:3001", "operator"),
+		[]n2n.ChainPoint{testChainPoint(10, 10, 0x10)},
+		&n2nNoopHandler{},
+	)
+	var transportErr *TransportError
+	if !errors.As(err, &transportErr) {
+		t.Fatalf("error = %T %v, want retryable transport", err, err)
+	}
+	var closed *n2n.ProtocolChannelClosed
+	if !errors.As(err, &closed) {
+		t.Fatalf("retryable error lost typed closure: %v", err)
+	}
+}
+
 type n2nNoopHandler struct {
 	terminal error
 }

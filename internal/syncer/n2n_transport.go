@@ -98,6 +98,10 @@ func classifyDirectError(err error) error {
 	if errors.As(err, &peerData) || errors.As(err, &rangeUnavailable) {
 		return err
 	}
+	var protocolClosed *n2n.ProtocolChannelClosed
+	if errors.As(err, &protocolClosed) {
+		return RetryableTransportError(err)
+	}
 	if isRetryableNetworkError(err) {
 		return RetryableTransportError(err)
 	}

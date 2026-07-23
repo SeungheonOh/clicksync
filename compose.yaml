@@ -36,6 +36,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        CLICKSYNC_BUILD_ID: ${CLICKSYNC_BUILD_ID:?set CLICKSYNC_BUILD_ID to the frozen source commit/hash}
     image: clicksync:local
     container_name: clicksync
     deploy:

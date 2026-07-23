@@ -44,11 +44,12 @@ type CommitOutcome struct {
 	// even if a later manifest-cache or observation update failed.
 	Committed bool
 	// CommittedBlocks counts the ordered roll-forward prefix made visible by
-	// adoption events. It may be greater than one for a physical microbatch.
+	// adoption events. It may be greater than one for a physical microbatch,
+	// including a retained prefix finalized while handling RollBackward.
 	CommittedBlocks uint64
-	// LastCommittedPoint/Tip identify the tail of a prefix committed by
-	// EndAttempt. RollForward outcomes may omit them because the callback block
-	// and tip are the tail.
+	// LastCommittedPoint/Tip are required whenever CommittedBlocks is non-zero
+	// from RollForward, RollBackward, or EndAttempt. They identify the exact
+	// typed tail and its associated peer tip.
 	LastCommittedPoint *n2n.ChainPoint
 	LastCommittedTip   *chainsync.Tip
 }
@@ -110,6 +111,18 @@ type ProbeResult struct {
 	Address    string
 }
 
+type CorroborationUnavailableError struct {
+	Err error
+}
+
+func (err *CorroborationUnavailableError) Error() string {
+	return fmt.Sprintf("checkpoint corroboration unavailable: %v", err.Err)
+}
+
+func (err *CorroborationUnavailableError) Unwrap() error {
+	return err.Err
+}
+
 type Observation struct {
 	Kind                  string
 	Peer                  n2n.Peer
@@ -130,7 +143,6 @@ type Config struct {
 	AllowOrigin           bool
 	InitialBackoff        time.Duration
 	MaxBackoff            time.Duration
-	MaxReconnectFailures  int
 	RollbackConfirmations int
 	CheckpointEveryBlocks uint64
 	FinalizeTimeout       time.Duration
@@ -220,9 +232,6 @@ func validateConfig(config Config) error {
 	if config.InitialBackoff <= 0 || config.MaxBackoff < config.InitialBackoff {
 		return errors.New("backoff must satisfy 0 < initial <= max")
 	}
-	if config.MaxReconnectFailures < 1 {
-		return errors.New("max reconnect failures must be positive")
-	}
 	if config.CheckpointEveryBlocks == 0 {
 		return errors.New("checkpoint observation interval must be positive")
 	}
@@ -236,11 +245,10 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	var (
 		nextPrimary     int
 		lastPrimaryHost string
-		failures        int
 		currentBackoff  = s.config.InitialBackoff
 		committedBlocks uint64
 		quarantined     = make(map[string]struct{})
-		rangeFailures   = make(map[string]struct{})
+		rangeFailures   = make(rangeRetryState)
 	)
 	for {
 		if err := ctx.Err(); err != nil {
@@ -252,7 +260,15 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		}
 		checkpoint, agreeing, err := s.corroborate(ctx, candidates, quarantined)
 		if err != nil {
-			return err
+			var unavailable *CorroborationUnavailableError
+			if !errors.As(err, &unavailable) {
+				return err
+			}
+			if waitErr := s.wait(ctx, currentBackoff); waitErr != nil {
+				return waitErr
+			}
+			currentBackoff = nextBackoff(currentBackoff, s.config.MaxBackoff)
+			continue
 		}
 		primaryEvidence := agreeing[nextPrimary%len(agreeing)]
 		primary := primaryEvidence.Peer
@@ -298,6 +314,9 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
+		if attempt.committed {
+			rangeFailures.clear(primary.Operator)
+		}
 		var peerData *n2n.PeerDataViolation
 		if errors.As(err, &peerData) {
 			if observeErr := s.observeFollowFailure(
@@ -314,21 +333,18 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			if err := s.requireRemainingOperators(quarantined); err != nil {
 				return fmt.Errorf("%w: %v", err, peerData)
 			}
-			failures = 0
 			currentBackoff = s.config.InitialBackoff
 			continue
 		}
 		var rangeUnavailable *n2n.RangeUnavailable
 		if errors.As(err, &rangeUnavailable) {
 			key := unavailableRangeKey(primary, rangeUnavailable)
-			_, repeated := rangeFailures[key]
+			repeated := rangeFailures.repeated(primary.Operator, key)
 			result := "unavailable"
 			reason := "range unavailable; reconnect and re-intersect once"
 			if repeated {
 				result = "quarantined"
 				reason = "exact source/range was unavailable after one reconnect"
-			} else {
-				rangeFailures[key] = struct{}{}
 			}
 			if observeErr := s.observeFollowFailure(
 				ctx,
@@ -346,7 +362,6 @@ func (s *Supervisor) Run(ctx context.Context) error {
 					return fmt.Errorf("%w: %v", err, rangeUnavailable)
 				}
 			}
-			failures = 0
 			currentBackoff = s.config.InitialBackoff
 			continue
 		}
@@ -355,17 +370,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			return fmt.Errorf("unclassified N2N follow failure is terminal: %w", err)
 		}
 		if attempt.committed {
-			failures = 0
 			currentBackoff = s.config.InitialBackoff
-		} else {
-			failures++
-		}
-		if failures >= s.config.MaxReconnectFailures {
-			return fmt.Errorf(
-				"N2N reconnect failure limit %d reached: %w",
-				s.config.MaxReconnectFailures,
-				err,
-			)
 		}
 		if waitErr := s.wait(ctx, currentBackoff); waitErr != nil {
 			return waitErr
@@ -475,7 +480,9 @@ func (s *Supervisor) corroborate(
 		}
 		return checkpoint, agreeing, nil
 	}
-	return n2n.ChainPoint{}, nil, errors.New("no checkpoint corroborated by independent peers")
+	return n2n.ChainPoint{}, nil, &CorroborationUnavailableError{
+		Err: errors.New("no checkpoint corroborated by independent peers"),
+	}
 }
 
 func (s *Supervisor) observeFollowFailure(
@@ -536,6 +543,18 @@ func unavailableRangeKey(peer n2n.Peer, value *n2n.RangeUnavailable) string {
 		value.End.Slot,
 		value.End.Hash,
 	)
+}
+
+type rangeRetryState map[string]string
+
+func (state rangeRetryState) repeated(operator, key string) bool {
+	previous, found := state[operator]
+	state[operator] = key
+	return found && previous == key
+}
+
+func (state rangeRetryState) clear(operator string) {
+	delete(state, operator)
 }
 
 type attemptHandler struct {
@@ -638,8 +657,10 @@ func (h *attemptHandler) RollForward(
 			"roll-forward committed flag and committed-block count disagree",
 		))
 	}
-	if outcome.CommittedBlocks > 0 && !outcome.Accepted {
-		return h.terminal(errors.New("roll-forward committed blocks without accepting the callback block"))
+	if outcome.CommittedBlocks > 0 && !outcome.Accepted && err == nil {
+		return h.terminal(errors.New(
+			"roll-forward committed a prefix without accepting the callback block or returning a terminal error",
+		))
 	}
 	if outcome.CommittedBlocks > 0 {
 		if tailErr := validateCommittedTail(outcome); tailErr != nil {
@@ -647,6 +668,15 @@ func (h *attemptHandler) RollForward(
 		}
 		if orderErr := validateTailAtOrBeforeBlock(*outcome.LastCommittedPoint, block); orderErr != nil {
 			return h.terminal(fmt.Errorf("roll-forward committed tail: %w", orderErr))
+		}
+		if !outcome.Accepted &&
+			pointsEqual(outcome.LastCommittedPoint.Point, pcommon.NewPoint(
+				block.SlotNumber(),
+				block.Hash().Bytes(),
+			)) {
+			return h.terminal(errors.New(
+				"unaccepted callback block was reported as the committed prefix tail",
+			))
 		}
 	}
 	if outcome.Committed {
@@ -657,16 +687,6 @@ func (h *attemptHandler) RollForward(
 		if err := h.addCommittedBlocks(outcome.CommittedBlocks); err != nil {
 			return h.terminal(err)
 		}
-	}
-	if err != nil {
-		return h.terminal(fmt.Errorf(
-			"roll-forward handler failed (committed=%t): %w",
-			outcome.Committed,
-			err,
-		))
-	}
-	if !outcome.Accepted {
-		return h.terminal(errors.New("roll-forward handler returned without accepting the block"))
 	}
 	if outcome.CommittedBlocks > 0 &&
 		previousCommitted/h.supervisor.config.CheckpointEveryBlocks !=
@@ -683,6 +703,17 @@ func (h *attemptHandler) RollForward(
 				err,
 			))
 		}
+	}
+	if err != nil {
+		return h.terminal(fmt.Errorf(
+			"roll-forward handler failed (committed=%t, accepted=%t): %w",
+			outcome.Committed,
+			outcome.Accepted,
+			err,
+		))
+	}
+	if !outcome.Accepted {
+		return h.terminal(errors.New("roll-forward handler returned without accepting the block"))
 	}
 	return nil
 }
@@ -703,9 +734,6 @@ func (h *attemptHandler) RollBackward(
 	}
 	confirmations := 1
 	for _, candidatePeer := range h.supervisor.config.Peers {
-		if candidatePeer.Operator == h.evidence.Primary.Peer.Operator {
-			continue
-		}
 		if _, duplicate := confirmedOperators[candidatePeer.Operator]; duplicate {
 			continue
 		}
@@ -751,6 +779,35 @@ func (h *attemptHandler) RollBackward(
 			})
 			if outcome.Committed {
 				h.committed = true
+			}
+			if outcome.CommittedBlocks > 0 {
+				if tailErr := validateCommittedTail(outcome); tailErr != nil {
+					return h.terminal(fmt.Errorf("rollback committed prefix tail: %w", tailErr))
+				}
+				if !chainPointsEqual(*outcome.LastCommittedPoint, point) {
+					return h.terminal(errors.New(
+						"rollback retained-prefix tail differs from the exact rollback target",
+					))
+				}
+				previousCommitted := *h.committedBlocks
+				if addErr := h.addCommittedBlocks(outcome.CommittedBlocks); addErr != nil {
+					return h.terminal(addErr)
+				}
+				if previousCommitted/h.supervisor.config.CheckpointEveryBlocks !=
+					*h.committedBlocks/h.supervisor.config.CheckpointEveryBlocks {
+					if corroborateErr := h.confirmPublishedCheckpoint(
+						ctx,
+						outcome.LastCommittedPoint.Point,
+						outcome.LastCommittedPoint.BlockNumber,
+						outcome.LastCommittedPoint.IsByronEBB,
+						*outcome.LastCommittedTip,
+					); corroborateErr != nil {
+						return h.terminal(fmt.Errorf(
+							"rollback prefix adoption committed before periodic corroboration failure: %w",
+							corroborateErr,
+						))
+					}
+				}
 			}
 			if err != nil {
 				return h.terminal(fmt.Errorf(
@@ -1068,13 +1125,31 @@ func orderedCandidates(
 				len(point.Hash),
 			)
 		}
-		if len(ret) > 0 && point.Slot >= previousSlot {
-			return nil, errors.New("intersection candidates must be strictly newest-to-oldest")
-		}
-		if len(ret) > 0 && candidate.BlockNumber > previousBlockNumber {
-			return nil, errors.New(
-				"intersection candidate block numbers must be non-increasing newest-to-oldest",
-			)
+		if len(ret) > 0 {
+			previous := ret[len(ret)-1]
+			switch {
+			case point.Slot > previousSlot:
+				return nil, errors.New(
+					"intersection candidates must be newest-to-oldest by slot",
+				)
+			case point.Slot == previousSlot:
+				if previous.IsByronEBB ||
+					!candidate.IsByronEBB ||
+					previous.BlockNumber != candidate.BlockNumber+1 {
+					return nil, errors.New(
+						"equal-slot candidates must be a newer regular successor followed by its older Byron EBB predecessor",
+					)
+				}
+			case candidate.BlockNumber > previousBlockNumber:
+				return nil, errors.New(
+					"intersection candidate block numbers cannot increase newest-to-oldest",
+				)
+			case candidate.BlockNumber == previousBlockNumber &&
+				(!previous.IsByronEBB || candidate.IsByronEBB):
+				return nil, errors.New(
+					"equal-height candidates must be a Byron EBB followed newest-to-oldest by its regular predecessor",
+				)
+			}
 		}
 		if slices.ContainsFunc(ret, func(existing n2n.ChainPoint) bool {
 			return pointsEqual(existing.Point, point)

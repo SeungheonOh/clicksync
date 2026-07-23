@@ -114,3 +114,44 @@ func TestBlankIntersectionNeverFallsBackToOrigin(t *testing.T) {
 		t.Fatalf("blank intersection error = %v", err)
 	}
 }
+
+func TestDatabaseConfigIgnoresUnrelatedCardanoSettings(t *testing.T) {
+	t.Setenv("CLICKHOUSE_PASSWORD", "secret")
+	t.Setenv("CARDANO_NETWORK_NAME", "not-mainnet")
+	t.Setenv("CARDANO_PEERS", "malformed")
+	t.Setenv("CLICKSYNC_START", "invalid")
+	cfg, err := DatabaseFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ClickHouseDatabase != "clicksync" ||
+		cfg.ClickHousePassword != "secret" ||
+		len(cfg.Peers) != 0 ||
+		cfg.Start != "" {
+		t.Fatalf("scoped database config = %#v", cfg)
+	}
+}
+
+func TestWriterSettingsDoNotReadCardanoConfiguration(t *testing.T) {
+	t.Setenv("CARDANO_PEERS", "malformed")
+	t.Setenv("CLICKSYNC_LOCK_PATH", "/tmp/clicksync-test.lock")
+	t.Setenv("CLICKSYNC_WRITER_COORDINATION", "single-host-flock")
+	settings := WriterSettingsFromEnv()
+	if settings.LockPath != "/tmp/clicksync-test.lock" ||
+		settings.WriterCoordination != "single-host-flock" {
+		t.Fatalf("writer settings = %#v", settings)
+	}
+}
+
+func TestFullSyncConfigStillRejectsInvalidCardanoSettings(t *testing.T) {
+	t.Setenv("CLICKHOUSE_PASSWORD", "secret")
+	t.Setenv("CARDANO_NETWORK_NAME", "not-mainnet")
+	t.Setenv(
+		"CARDANO_PEERS",
+		"one.example:3001|one,two.example:3001|two",
+	)
+	t.Setenv("CLICKSYNC_START_POINT", "1:"+strings.Repeat("ab", 32))
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("full sync config accepted non-mainnet network")
+	}
+}

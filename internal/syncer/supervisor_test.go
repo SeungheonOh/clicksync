@@ -108,12 +108,18 @@ func TestSupervisorCorroboratesOlderStableCheckpointBeforeFollow(t *testing.T) {
 
 func TestPartialDatasetRejectedBoundaryNeverFallsBackToOrigin(t *testing.T) {
 	boundary := testPoint(10, 0x10)
+	ctx, cancel := context.WithCancel(context.Background())
+	probes := 0
 	transport := &fakeTransport{
 		probe: func(
 			_ context.Context,
 			_ n2n.Peer,
 			_ pcommon.Point,
 		) (ProbeResult, error) {
+			probes++
+			if probes == 4 {
+				cancel()
+			}
 			return ProbeResult{Accepted: false}, nil
 		},
 	}
@@ -125,8 +131,9 @@ func TestPartialDatasetRejectedBoundaryNeverFallsBackToOrigin(t *testing.T) {
 		&fakeObserver{},
 		transport,
 	)
-	err := supervisor.Run(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "no checkpoint corroborated") {
+	supervisor.wait = waitContext
+	err := supervisor.Run(ctx)
+	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v", err)
 	}
 	if len(transport.follows) != 0 {
@@ -139,6 +146,144 @@ func TestPartialDatasetRejectedBoundaryNeverFallsBackToOrigin(t *testing.T) {
 		if !pointsEqual(probe.point, boundary) {
 			t.Fatalf("unexpected probe point: %#v", probe.point)
 		}
+	}
+}
+
+func TestSupervisorRetriesUnavailableCorroborationThenRecovers(t *testing.T) {
+	checkpoint := testChainPoint(10, 10, 0x10)
+	config := baseConfig()
+	config.InitialBackoff = time.Second
+	config.MaxBackoff = 2 * time.Second
+	ctx, cancel := context.WithCancel(context.Background())
+	round := 0
+	transport := &fakeTransport{
+		probe: func(
+			_ context.Context,
+			peer n2n.Peer,
+			_ pcommon.Point,
+		) (ProbeResult, error) {
+			if peer.Operator == "operator-a" {
+				round++
+			}
+			if round <= 3 {
+				return ProbeResult{}, RetryableTransportError(errors.New("dial unavailable"))
+			}
+			return ProbeResult{
+				Accepted:   true,
+				Tip:        chainsync.Tip{Point: testPoint(12, 0x12), BlockNumber: 12},
+				N2NVersion: 15,
+				Address:    "192.0.2.10:3001",
+			}, nil
+		},
+		follow: func(
+			ctx context.Context,
+			peer n2n.Peer,
+			points []n2n.ChainPoint,
+			handler n2n.Handler,
+		) error {
+			peer = prepareFollowPeer(
+				peer,
+				chainsync.Tip{Point: testPoint(12, 0x12), BlockNumber: 12},
+			)
+			if err := handler.Reconcile(ctx, points[0], peer); err != nil {
+				return err
+			}
+			cancel()
+			return ctx.Err()
+		},
+	}
+	candidates := &fakeCandidates{points: []n2n.ChainPoint{checkpoint}}
+	supervisor := newTestSupervisor(
+		t,
+		config,
+		candidates,
+		&fakeHandler{},
+		&fakeObserver{},
+		transport,
+	)
+	var waits []time.Duration
+	supervisor.wait = func(_ context.Context, duration time.Duration) error {
+		waits = append(waits, duration)
+		return nil
+	}
+	if err := supervisor.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v", err)
+	}
+	if !slices.Equal(waits, []time.Duration{time.Second, 2 * time.Second, 2 * time.Second}) {
+		t.Fatalf("backoffs = %#v", waits)
+	}
+	if candidates.calls != 4 || len(transport.follows) != 1 {
+		t.Fatalf("candidate loads=%d follows=%d", candidates.calls, len(transport.follows))
+	}
+}
+
+func TestPartialByronBoundaryFallsBackFromSameSlotSuccessorToEBB(t *testing.T) {
+	ebb := n2n.NewByronEBBChainPoint(testPoint(21_600, 0xe0), 20_000)
+	successor := testChainPoint(21_600, 20_001, 0xe1)
+	ctx, cancel := context.WithCancel(context.Background())
+	handler := &fakeHandler{
+		reconcile: func(
+			_ context.Context,
+			point n2n.ChainPoint,
+			_ SourceEvidence,
+		) (CommitOutcome, error) {
+			if !chainPointsEqual(point, ebb) {
+				t.Fatalf("reconciled point = %#v, want EBB %#v", point, ebb)
+			}
+			return CommitOutcome{}, nil
+		},
+	}
+	transport := &fakeTransport{
+		probe: func(
+			_ context.Context,
+			peer n2n.Peer,
+			point pcommon.Point,
+		) (ProbeResult, error) {
+			return ProbeResult{
+				Accepted:   pointsEqual(point, ebb.Point),
+				Tip:        chainsync.Tip{Point: testPoint(22_000, 0xf0), BlockNumber: 20_100},
+				N2NVersion: 15,
+				Address:    "192.0.2." + peer.Operator[len(peer.Operator)-1:] + ":3001",
+			}, nil
+		},
+		follow: func(
+			ctx context.Context,
+			peer n2n.Peer,
+			points []n2n.ChainPoint,
+			target n2n.Handler,
+		) error {
+			if len(points) != 1 || !chainPointsEqual(points[0], ebb) {
+				t.Fatalf("Follow points = %#v, want exact EBB singleton", points)
+			}
+			peer = prepareFollowPeer(
+				peer,
+				chainsync.Tip{Point: testPoint(22_000, 0xf0), BlockNumber: 20_100},
+			)
+			if err := target.Reconcile(ctx, ebb, peer); err != nil {
+				return err
+			}
+			cancel()
+			return ctx.Err()
+		},
+	}
+	supervisor := newTestSupervisor(
+		t,
+		baseConfig(),
+		&fakeCandidates{points: []n2n.ChainPoint{successor, ebb}},
+		handler,
+		&fakeObserver{},
+		transport,
+	)
+	if err := supervisor.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("shutdown error = %v", err)
+	}
+	for _, probe := range transport.probes {
+		if pointIsOrigin(probe.point) {
+			t.Fatal("partial Byron fallback widened to Origin")
+		}
+	}
+	if len(transport.follows) != 1 {
+		t.Fatalf("Follow calls = %d, want 1", len(transport.follows))
 	}
 }
 
@@ -202,9 +347,8 @@ func TestCompleteOriginDatasetMayFallbackToOrigin(t *testing.T) {
 	}
 }
 
-func TestSupervisorRotatesPeersWithBoundedExponentialBackoff(t *testing.T) {
+func TestSupervisorRetriesTransportIndefinitelyThenRecovers(t *testing.T) {
 	config := baseConfig()
-	config.MaxReconnectFailures = 3
 	config.InitialBackoff = time.Second
 	config.MaxBackoff = 2 * time.Second
 	candidates := &fakeCandidates{points: []n2n.ChainPoint{
@@ -212,6 +356,7 @@ func TestSupervisorRotatesPeersWithBoundedExponentialBackoff(t *testing.T) {
 	}}
 	observer := &fakeObserver{}
 	transport := &fakeTransport{}
+	ctx, cancel := context.WithCancel(context.Background())
 	probeRound := 0
 	transport.probe = func(_ context.Context, peer n2n.Peer, point pcommon.Point) (ProbeResult, error) {
 		if peer.Operator == "operator-a" {
@@ -236,6 +381,10 @@ func TestSupervisorRotatesPeersWithBoundedExponentialBackoff(t *testing.T) {
 		if err := handler.Reconcile(ctx, points[0], peer); err != nil {
 			return err
 		}
+		if len(transport.follows) == 4 {
+			cancel()
+			return ctx.Err()
+		}
 		return RetryableTransportError(errors.New("connection dropped"))
 	}
 	supervisor := newTestSupervisor(
@@ -251,28 +400,78 @@ func TestSupervisorRotatesPeersWithBoundedExponentialBackoff(t *testing.T) {
 		waits = append(waits, duration)
 		return nil
 	}
-	err := supervisor.Run(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "failure limit 3") {
+	err := supervisor.Run(ctx)
+	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v", err)
 	}
-	if got := peerHosts(transport.follows); !slices.Equal(got, []string{"relay-a:3001", "relay-b:3001", "relay-a:3001"}) {
+	if got := peerHosts(transport.follows); !slices.Equal(got, []string{"relay-a:3001", "relay-b:3001", "relay-a:3001", "relay-b:3001"}) {
 		t.Fatalf("follow rotation = %#v", got)
 	}
-	if got := peerAddresses(transport.follows); !slices.Equal(got, []string{"192.0.2.1", "192.0.2.2", "192.0.2.3"}) {
+	if got := peerAddresses(transport.follows); !slices.Equal(got, []string{"192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.4"}) {
 		t.Fatalf("freshly resolved addresses = %#v", got)
 	}
-	if !slices.Equal(waits, []time.Duration{time.Second, 2 * time.Second}) {
+	if !slices.Equal(waits, []time.Duration{time.Second, 2 * time.Second, 2 * time.Second}) {
 		t.Fatalf("backoffs = %#v", waits)
 	}
-	if candidates.calls != 3 {
-		t.Fatalf("candidate reloads = %d, want 3", candidates.calls)
+	if candidates.calls != 4 {
+		t.Fatalf("candidate reloads = %d, want 4", candidates.calls)
 	}
 	sourceSelections := observationsOfKind(observer.observations, "source_change")
-	if len(sourceSelections) != 3 ||
+	if len(sourceSelections) != 4 ||
 		sourceSelections[0].Reason != "initial selection" ||
 		sourceSelections[1].Reason != "peer rotation" ||
-		sourceSelections[2].Reason != "peer rotation" {
+		sourceSelections[2].Reason != "peer rotation" ||
+		sourceSelections[3].Reason != "peer rotation" {
 		t.Fatalf("source selections = %#v", sourceSelections)
+	}
+}
+
+func TestSupervisorContextCancellationInterruptsReconnectBackoff(t *testing.T) {
+	config := baseConfig()
+	config.InitialBackoff = time.Hour
+	config.MaxBackoff = time.Hour
+	transport := acceptingTransport()
+	transport.follow = func(
+		ctx context.Context,
+		peer n2n.Peer,
+		points []n2n.ChainPoint,
+		handler n2n.Handler,
+	) error {
+		peer = prepareFollowPeer(
+			peer,
+			chainsync.Tip{Point: testPoint(12, 0x12), BlockNumber: 12},
+		)
+		if err := handler.Reconcile(ctx, points[0], peer); err != nil {
+			return err
+		}
+		return RetryableTransportError(errors.New("connection dropped"))
+	}
+	supervisor := newTestSupervisor(
+		t,
+		config,
+		&fakeCandidates{points: []n2n.ChainPoint{testChainPoint(10, 10, 0x10)}},
+		&fakeHandler{},
+		&fakeObserver{},
+		transport,
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	waitStarted := make(chan struct{})
+	supervisor.wait = func(ctx context.Context, duration time.Duration) error {
+		if duration != time.Hour {
+			t.Fatalf("backoff = %s, want one hour", duration)
+		}
+		close(waitStarted)
+		return waitContext(ctx, duration)
+	}
+	go func() {
+		<-waitStarted
+		cancel()
+	}()
+	if err := supervisor.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v", err)
+	}
+	if len(transport.follows) != 1 {
+		t.Fatalf("follow calls = %d, want 1", len(transport.follows))
 	}
 }
 
@@ -452,6 +651,32 @@ func TestRepeatedExactRangeUnavailableQuarantinesSource(t *testing.T) {
 	}
 }
 
+func TestRangeRetryStateIsBoundedPerOperatorAndClearsOnProgress(t *testing.T) {
+	state := make(rangeRetryState)
+	for index := 0; index < 10_000; index++ {
+		key := fmt.Sprintf("range-%d", index)
+		if state.repeated("operator-a", key) {
+			t.Fatalf("new range %q was classified as repeated", key)
+		}
+	}
+	if len(state) != 1 {
+		t.Fatalf("range retry entries = %d, want one per operator", len(state))
+	}
+	if !state.repeated("operator-a", "range-9999") {
+		t.Fatal("exact current range retry was not recognized")
+	}
+	if state.repeated("operator-b", "range-1") {
+		t.Fatal("first range for independent operator was repeated")
+	}
+	if len(state) != 2 {
+		t.Fatalf("range retry entries = %d, want two operators", len(state))
+	}
+	state.clear("operator-a")
+	if state.repeated("operator-a", "range-9999") {
+		t.Fatal("successful progress did not clear exact retry state")
+	}
+}
+
 func TestCommittedPostActionFailureIsTerminalAndNeverRotates(t *testing.T) {
 	before := testPoint(10, 0x10)
 	block := testBlock(11, 11, 0x11)
@@ -594,6 +819,73 @@ func TestRollbackRequiresAndCarriesIndependentConfirmation(t *testing.T) {
 		evidence.Confirmations[0].Peer.Operator != "operator-a" ||
 		evidence.Confirmations[1].Peer.Operator != "operator-b" {
 		t.Fatalf("typed rollback evidence = %#v, calls=%d", evidence, delegateCalls)
+	}
+}
+
+func TestRollbackRejectsCommittedPrefixTailDifferentFromTarget(t *testing.T) {
+	primary := actualPeer(
+		testPeer("relay-a:3001", "operator-a"),
+		"198.51.100.1:3001",
+		15,
+	)
+	target := testChainPoint(8, 8, 0x08)
+	wrongTail := testChainPoint(9, 9, 0x09)
+	branchTip := chainsync.Tip{Point: testPoint(12, 0x12), BlockNumber: 12}
+	delegate := &fakeHandler{
+		rollBackward: func(
+			_ context.Context,
+			_ n2n.ChainPoint,
+			_ chainsync.Tip,
+			_ RollbackEvidence,
+		) (CommitOutcome, error) {
+			tip := chainsync.Tip{
+				Point:       clonePoint(wrongTail.Point),
+				BlockNumber: wrongTail.BlockNumber,
+			}
+			return CommitOutcome{
+				Committed:          true,
+				CommittedBlocks:    1,
+				LastCommittedPoint: &wrongTail,
+				LastCommittedTip:   &tip,
+			}, nil
+		},
+	}
+	transport := &fakeTransport{
+		probe: func(
+			_ context.Context,
+			_ n2n.Peer,
+			_ pcommon.Point,
+		) (ProbeResult, error) {
+			return ProbeResult{
+				Accepted:   true,
+				Tip:        branchTip,
+				N2NVersion: 15,
+				Address:    "198.51.100.2:3001",
+			}, nil
+		},
+	}
+	supervisor := newTestSupervisor(
+		t,
+		baseConfig(),
+		&fakeCandidates{},
+		delegate,
+		&fakeObserver{},
+		transport,
+	)
+	attempt := &attemptHandler{
+		supervisor: supervisor,
+		evidence: SourceEvidence{
+			Primary: PeerEvidence{Peer: primary, Tip: branchTip, N2NVersion: 15},
+		},
+		delegate:        delegate,
+		committedBlocks: new(uint64),
+	}
+	err := attempt.RollBackward(context.Background(), target, branchTip, primary)
+	if err == nil || !strings.Contains(err.Error(), "differs from the exact rollback target") {
+		t.Fatalf("error = %v", err)
+	}
+	if *attempt.committedBlocks != 0 {
+		t.Fatalf("corrupt prefix changed committed counter to %d", *attempt.committedBlocks)
 	}
 }
 
@@ -850,11 +1142,9 @@ func TestUncommittedHandlerFailureIsTerminal(t *testing.T) {
 	}
 	transport := acceptingTransport()
 	transport.follow = oneBlockFollow(testBlock(11, 11, 0x11))
-	config := baseConfig()
-	config.MaxReconnectFailures = 1
 	supervisor := newTestSupervisor(
 		t,
-		config,
+		baseConfig(),
 		&fakeCandidates{points: []n2n.ChainPoint{testChainPoint(10, 10, 0x10)}},
 		handler,
 		&fakeObserver{},
@@ -1163,13 +1453,47 @@ func TestCandidateOrderAndIndependentOperatorValidation(t *testing.T) {
 	}
 	equalHeight, err := orderedCandidates(
 		[]n2n.ChainPoint{
-			testChainPoint(11, 10, 0x11),
+			n2n.NewByronEBBChainPoint(testPoint(11, 0x11), 10),
 			testChainPoint(10, 10, 0x10),
 		},
 		false,
 	)
 	if err != nil || len(equalHeight) != 2 {
 		t.Fatalf("valid equal-height Byron restart candidates: %#v, %v", equalHeight, err)
+	}
+	equalSlot, err := orderedCandidates(
+		[]n2n.ChainPoint{
+			testChainPoint(11, 11, 0x12),
+			n2n.NewByronEBBChainPoint(testPoint(11, 0x11), 10),
+		},
+		false,
+	)
+	if err != nil || len(equalSlot) != 2 {
+		t.Fatalf("valid equal-slot Byron restart candidates: %#v, %v", equalSlot, err)
+	}
+	for name, points := range map[string][]n2n.ChainPoint{
+		"equal height regular pair": {
+			testChainPoint(11, 10, 0x11),
+			testChainPoint(10, 10, 0x10),
+		},
+		"equal height wrong EBB side": {
+			testChainPoint(11, 10, 0x11),
+			n2n.NewByronEBBChainPoint(testPoint(10, 0x10), 10),
+		},
+		"equal slot regular pair": {
+			testChainPoint(11, 11, 0x12),
+			testChainPoint(11, 10, 0x11),
+		},
+		"equal slot wrong height": {
+			testChainPoint(11, 12, 0x12),
+			n2n.NewByronEBBChainPoint(testPoint(11, 0x11), 10),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := orderedCandidates(points, false); err == nil {
+				t.Fatal("accepted corrupt Byron candidate shape")
+			}
+		})
 	}
 	if _, err := orderedCandidates(
 		[]n2n.ChainPoint{
@@ -1328,7 +1652,6 @@ func baseConfig() Config {
 		Corroboration:         2,
 		InitialBackoff:        time.Millisecond,
 		MaxBackoff:            4 * time.Millisecond,
-		MaxReconnectFailures:  3,
 		RollbackConfirmations: 2,
 		CheckpointEveryBlocks: 100,
 		FinalizeTimeout:       time.Second,
