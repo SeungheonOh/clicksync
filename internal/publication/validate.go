@@ -173,18 +173,28 @@ func validateTransaction(
 		Hash  model.Hash32
 		Index uint32
 	}
-	inputKeys := make(map[inputKey]struct{}, len(transaction.Inputs))
+	type roleInputKey struct {
+		inputKey
+		Role string
+	}
+	inputKeys := make(map[roleInputKey]struct{}, len(transaction.Inputs))
+	regularInputRefs := make(map[inputKey]struct{}, len(transaction.Inputs))
 	roleOrdinals := make(map[string]map[uint32]struct{})
 	roleCounts := make(map[string]uint32)
 	for _, input := range transaction.Inputs {
 		if input.TransactionHash != transaction.Hash || input.TransactionOrder != transaction.Order {
 			return errors.New("input transaction linkage mismatch")
 		}
+		key := inputKey{
+			Hash:  input.SourceHash,
+			Index: input.SourceIndex,
+		}
 		switch input.Role {
 		case "regular":
 			if input.Consumed != transaction.Phase2Valid {
 				return errors.New("regular input consumption disagrees with phase-2 validity")
 			}
+			regularInputRefs[key] = struct{}{}
 		case "collateral":
 			if input.Consumed == transaction.Phase2Valid {
 				return errors.New("collateral input consumption disagrees with phase-2 validity")
@@ -196,14 +206,11 @@ func validateTransaction(
 		default:
 			return fmt.Errorf("unknown input role %q", input.Role)
 		}
-		key := inputKey{
-			Hash:  input.SourceHash,
-			Index: input.SourceIndex,
-		}
-		if _, duplicate := inputKeys[key]; duplicate {
+		roleKey := roleInputKey{inputKey: key, Role: input.Role}
+		if _, duplicate := inputKeys[roleKey]; duplicate {
 			return errors.New("duplicate input reference/body ordinal")
 		}
-		inputKeys[key] = struct{}{}
+		inputKeys[roleKey] = struct{}{}
 		ordinals := roleOrdinals[input.Role]
 		if ordinals == nil {
 			ordinals = make(map[uint32]struct{})
@@ -261,6 +268,24 @@ func validateTransaction(
 		}
 		if len(output.Address) == 0 {
 			return errors.New("produced output has an empty address")
+		}
+		switch output.PaymentCredentialKind {
+		case "none":
+			if output.PaymentCredentialHash != nil {
+				return errors.New("payment-credential-none output has a credential hash")
+			}
+		case "key", "script":
+			if output.PaymentCredentialHash == nil {
+				return fmt.Errorf(
+					"payment credential kind %q has no hash",
+					output.PaymentCredentialKind,
+				)
+			}
+		default:
+			return fmt.Errorf(
+				"unknown payment credential kind %q",
+				output.PaymentCredentialKind,
+			)
 		}
 		if err := validateAssets(output.Assets); err != nil {
 			return err
@@ -354,6 +379,15 @@ func validateTransaction(
 		if err := validateRedeemerTarget(redeemer); err != nil {
 			return err
 		}
+		if redeemer.Purpose == "spend" {
+			target := inputKey{
+				Hash:  *redeemer.TargetTxHash,
+				Index: *redeemer.TargetOutputIndex,
+			}
+			if _, ok := regularInputRefs[target]; !ok {
+				return errors.New("spend redeemer target is not a regular transaction input")
+			}
+		}
 		key := redeemerKey{purpose: redeemer.Purpose, index: redeemer.Index}
 		if _, duplicate := redeemerKeys[key]; duplicate {
 			return errors.New("duplicate redeemer purpose/index")
@@ -436,23 +470,75 @@ func compareAsset(
 func validateRedeemerTarget(redeemer model.Redeemer) error {
 	switch redeemer.Purpose {
 	case "spend":
+		if redeemer.RawPurposeTag != 0 {
+			return errors.New("spend redeemer raw purpose tag is not 0")
+		}
 		if redeemer.TargetTxHash == nil || redeemer.TargetOutputIndex == nil {
 			return errors.New("spend redeemer target is unresolved")
 		}
 	case "mint":
+		if redeemer.RawPurposeTag != 1 {
+			return errors.New("mint redeemer raw purpose tag is not 1")
+		}
 		if redeemer.TargetPolicyID == nil {
 			return errors.New("mint redeemer target is unresolved")
 		}
 	case "reward":
+		if redeemer.RawPurposeTag != 3 {
+			return errors.New("reward redeemer raw purpose tag is not 3")
+		}
 		if len(redeemer.TargetRewardAccount) == 0 {
 			return errors.New("reward redeemer target is unresolved")
 		}
-	case "certificate", "vote", "proposal":
+	case "certificate":
+		if redeemer.RawPurposeTag != 2 {
+			return errors.New("certificate redeemer raw purpose tag is not 2")
+		}
 		if redeemer.TargetBodyOrdinal == nil {
-			return fmt.Errorf("%s redeemer target is unresolved", redeemer.Purpose)
+			return errors.New("certificate redeemer target is unresolved")
+		}
+		if err := validateCompactTargetIdentity(redeemer, 18); err != nil {
+			return fmt.Errorf("certificate redeemer target identity: %w", err)
+		}
+	case "vote":
+		if redeemer.RawPurposeTag != 4 {
+			return errors.New("vote redeemer raw purpose tag is not 4")
+		}
+		if redeemer.TargetBodyOrdinal == nil {
+			return errors.New("vote redeemer target is unresolved")
+		}
+		if len(redeemer.TargetIdentity) != 29 || redeemer.TargetIdentity[0] > 4 {
+			return errors.New("vote redeemer target identity is malformed")
+		}
+	case "proposal":
+		if redeemer.RawPurposeTag != 5 {
+			return errors.New("proposal redeemer raw purpose tag is not 5")
+		}
+		if redeemer.TargetBodyOrdinal == nil {
+			return errors.New("proposal redeemer target is unresolved")
+		}
+		if err := validateCompactTargetIdentity(redeemer, 6); err != nil {
+			return fmt.Errorf("proposal redeemer target identity: %w", err)
 		}
 	default:
 		return fmt.Errorf("unsupported redeemer purpose %q", redeemer.Purpose)
+	}
+	return nil
+}
+
+func validateCompactTargetIdentity(redeemer model.Redeemer, maximumConstructor byte) error {
+	if len(redeemer.TargetIdentity) != 34 {
+		return fmt.Errorf("length is %d, want 34", len(redeemer.TargetIdentity))
+	}
+	if redeemer.TargetIdentity[0] != redeemer.RawPurposeTag {
+		return errors.New("purpose tag disagrees with redeemer")
+	}
+	if redeemer.TargetIdentity[1] > maximumConstructor {
+		return fmt.Errorf(
+			"constructor is %d, maximum %d",
+			redeemer.TargetIdentity[1],
+			maximumConstructor,
+		)
 	}
 	return nil
 }

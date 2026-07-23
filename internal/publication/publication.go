@@ -26,6 +26,12 @@ type OutputRef struct {
 	Index uint32
 }
 
+type ResolvedOutput struct {
+	Lovelace              uint64
+	PaymentCredentialKind string
+	PaymentCredentialHash *model.Hash28
+}
+
 type Point struct {
 	Origin      bool
 	Slot        uint64
@@ -159,7 +165,7 @@ type Backend interface {
 	CommittedSnapshot(context.Context) (uint64, error)
 	CommittedTip(context.Context, uint64) (Point, error)
 	GenesisState(context.Context) (bool, bool, error)
-	ResolveActiveOutputs(context.Context, uint64, []OutputRef) (map[OutputRef]struct{}, error)
+	ResolveActiveOutputs(context.Context, uint64, []OutputRef) (map[OutputRef]ResolvedOutput, error)
 	ExistingDatumBodies(context.Context, []model.Hash32) (map[model.Hash32][]byte, error)
 
 	InsertPeerObservations(context.Context, []model.PeerObservation) error
@@ -716,8 +722,9 @@ func (coordinator *Coordinator) resolveBatchInputs(
 		return nil, fmt.Errorf("resolve prior active outputs: %w", err)
 	}
 	type stagedOutput struct {
-		block int
-		order uint32
+		block  int
+		order  uint32
+		output ResolvedOutput
 	}
 	produced := make(map[OutputRef]stagedOutput)
 	consumed := make(map[OutputRef]struct{})
@@ -728,6 +735,8 @@ func (coordinator *Coordinator) resolveBatchInputs(
 		for transactionIndex := range block.Transactions {
 			transaction := &block.Transactions[transactionIndex]
 			transaction.Inputs = append([]model.Input(nil), transaction.Inputs...)
+			transaction.Redeemers = append([]model.Redeemer(nil), transaction.Redeemers...)
+			resolved := make(map[OutputRef]ResolvedOutput, len(transaction.Inputs))
 			for inputIndex := range transaction.Inputs {
 				input := &transaction.Inputs[inputIndex]
 				ref := OutputRef{Hash: input.SourceHash, Index: input.SourceIndex}
@@ -737,23 +746,159 @@ func (coordinator *Coordinator) resolveBatchInputs(
 					}
 					consumed[ref] = struct{}{}
 				}
-				_, prior := active[ref]
+				priorOutput, prior := active[ref]
 				staged, sameBatch := produced[ref]
-				input.SourceResolved = prior || (sameBatch &&
+				stagedBefore := sameBatch &&
 					(staged.block < blockIndex ||
-						(staged.block == blockIndex && staged.order < transaction.Order)))
+						(staged.block == blockIndex && staged.order < transaction.Order))
+				if prior && stagedBefore {
+					return nil, fmt.Errorf(
+						"output %x#%d exists in both the active snapshot and staged prefix",
+						ref.Hash,
+						ref.Index,
+					)
+				}
+				input.SourceResolved = prior || stagedBefore
+				if prior {
+					resolved[ref] = priorOutput
+				} else if stagedBefore {
+					resolved[ref] = staged.output
+				}
+			}
+			if err := resolveTransactionFacts(transaction, resolved); err != nil {
+				return nil, fmt.Errorf(
+					"resolve block %d transaction %d facts: %w",
+					blockIndex,
+					transactionIndex,
+					err,
+				)
 			}
 			for _, output := range transaction.Outputs {
 				ref := OutputRef{Hash: output.TransactionHash, Index: output.Index}
 				if _, duplicate := produced[ref]; duplicate {
 					return nil, fmt.Errorf("duplicate batch output %x#%d", ref.Hash, ref.Index)
 				}
-				produced[ref] = stagedOutput{block: blockIndex, order: transaction.Order}
+				produced[ref] = stagedOutput{
+					block: blockIndex,
+					order: transaction.Order,
+					output: ResolvedOutput{
+						Lovelace:              output.Lovelace,
+						PaymentCredentialKind: output.PaymentCredentialKind,
+						PaymentCredentialHash: cloneHash28(output.PaymentCredentialHash),
+					},
+				}
 			}
 		}
 		ret[blockIndex] = block
 	}
 	return ret, nil
+}
+
+func resolveTransactionFacts(
+	transaction *model.Transaction,
+	resolved map[OutputRef]ResolvedOutput,
+) error {
+	if transaction.FlowKind == "collateral" {
+		var (
+			collateralTotal uint64
+			collateralCount int
+			allResolved     = true
+		)
+		for _, input := range transaction.Inputs {
+			if input.Role != "collateral" {
+				continue
+			}
+			collateralCount++
+			source, ok := resolved[OutputRef{Hash: input.SourceHash, Index: input.SourceIndex}]
+			if !ok {
+				allResolved = false
+				continue
+			}
+			if math.MaxUint64-collateralTotal < source.Lovelace {
+				return errors.New("resolved collateral lovelace sum overflows UInt64")
+			}
+			collateralTotal += source.Lovelace
+		}
+		if collateralCount > 0 && allResolved {
+			var collateralReturn uint64
+			var collateralReturnSeen bool
+			for _, output := range transaction.Outputs {
+				if output.Kind != "collateral_return" {
+					continue
+				}
+				if collateralReturnSeen {
+					return errors.New("multiple collateral-return outputs")
+				}
+				collateralReturnSeen = true
+				collateralReturn = output.Lovelace
+			}
+			if collateralReturn > collateralTotal {
+				return fmt.Errorf(
+					"collateral return %d exceeds resolved collateral inputs %d",
+					collateralReturn,
+					collateralTotal,
+				)
+			}
+			derived := collateralTotal - collateralReturn
+			if derived == 0 {
+				return errors.New("resolved effective collateral fee is zero")
+			}
+			if transaction.EffectiveFee != nil && *transaction.EffectiveFee != derived {
+				return fmt.Errorf(
+					"declared total collateral %d differs from resolved effective fee %d",
+					*transaction.EffectiveFee,
+					derived,
+				)
+			}
+			transaction.EffectiveFee = &derived
+		}
+	}
+	for index := range transaction.Redeemers {
+		redeemer := &transaction.Redeemers[index]
+		if redeemer.Purpose != "spend" {
+			continue
+		}
+		if redeemer.TargetTxHash == nil || redeemer.TargetOutputIndex == nil {
+			return errors.New("spend redeemer target is unresolved")
+		}
+		ref := OutputRef{Hash: *redeemer.TargetTxHash, Index: *redeemer.TargetOutputIndex}
+		source, ok := resolved[ref]
+		if !ok {
+			redeemer.ResolvedScriptHash = nil
+			continue
+		}
+		switch source.PaymentCredentialKind {
+		case "script":
+			if source.PaymentCredentialHash == nil {
+				return fmt.Errorf("resolved script output %x#%d lacks credential hash", ref.Hash, ref.Index)
+			}
+			if redeemer.ResolvedScriptHash != nil &&
+				*redeemer.ResolvedScriptHash != *source.PaymentCredentialHash {
+				return fmt.Errorf("spend redeemer script hash disagrees with output %x#%d", ref.Hash, ref.Index)
+			}
+			redeemer.ResolvedScriptHash = cloneHash28(source.PaymentCredentialHash)
+		case "key", "none":
+			if redeemer.ResolvedScriptHash != nil {
+				return fmt.Errorf("non-script output %x#%d has a spend script hash", ref.Hash, ref.Index)
+			}
+		default:
+			return fmt.Errorf(
+				"resolved output %x#%d has unknown payment credential kind %q",
+				ref.Hash,
+				ref.Index,
+				source.PaymentCredentialKind,
+			)
+		}
+	}
+	return nil
+}
+
+func cloneHash28(value *model.Hash28) *model.Hash28 {
+	if value == nil {
+		return nil
+	}
+	ret := *value
+	return &ret
 }
 
 func (coordinator *Coordinator) precheckBatchDatumBodies(

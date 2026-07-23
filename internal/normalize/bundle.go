@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"slices"
 
+	"github.com/blinklabs-io/gouroboros/cbor"
 	"github.com/blinklabs-io/gouroboros/ledger"
 	lcommon "github.com/blinklabs-io/gouroboros/ledger/common"
 
@@ -120,7 +121,7 @@ func transactionBundle(
 		if valid {
 			effective := declared
 			ret.EffectiveFee = &effective
-		} else if tx.TotalCollateral() != nil {
+		} else if tx.TotalCollateral() != nil && tx.TotalCollateral().Sign() > 0 {
 			effective, err := uint64Value(tx.TotalCollateral(), "total collateral")
 			if err != nil {
 				return model.Transaction{}, err
@@ -218,6 +219,11 @@ func appendInputs(
 	if len(inputs) > math.MaxUint32 {
 		return fmt.Errorf("%s input count exceeds UInt32", role)
 	}
+	type inputRef struct {
+		hash  model.Hash32
+		index uint32
+	}
+	seen := make(map[inputRef]struct{}, len(inputs))
 	for ordinal, input := range inputs {
 		if input == nil {
 			return fmt.Errorf("%s input %d is nil", role, ordinal)
@@ -226,6 +232,16 @@ func appendInputs(
 		if err != nil {
 			return err
 		}
+		ref := inputRef{hash: sourceHash, index: input.Index()}
+		if _, duplicate := seen[ref]; duplicate {
+			return fmt.Errorf(
+				"duplicate %s input reference %x#%d",
+				role,
+				sourceHash,
+				input.Index(),
+			)
+		}
+		seen[ref] = struct{}{}
 		tx.Inputs = append(tx.Inputs, model.Input{
 			TransactionHash:  tx.Hash,
 			TransactionOrder: tx.Order,
@@ -235,6 +251,111 @@ func appendInputs(
 			Role:             role,
 			Consumed:         consumed,
 		})
+	}
+	return nil
+}
+
+func paymentCredentialFromAddress(
+	address []byte,
+) (string, *model.Hash28, error) {
+	if len(address) == 0 {
+		return "", nil, errors.New("empty address")
+	}
+	if _, err := lcommon.NewAddressFromBytes(address); err != nil {
+		return "", nil, fmt.Errorf("decode address: %w", err)
+	}
+	addressType := address[0] >> 4
+	if addressType != lcommon.AddressTypeByron &&
+		address[0]&lcommon.AddressHeaderNetworkMask != lcommon.AddressNetworkMainnet {
+		return "", nil, fmt.Errorf(
+			"Shelley-family output address network ID %d is not pinned mainnet",
+			address[0]&lcommon.AddressHeaderNetworkMask,
+		)
+	}
+	switch addressType {
+	case lcommon.AddressTypeByron:
+		return "none", nil, nil
+	case lcommon.AddressTypeNoneKey,
+		lcommon.AddressTypeNoneScript:
+		return "", nil, fmt.Errorf(
+			"reward-account address type %d is not a transaction output address",
+			addressType,
+		)
+	case lcommon.AddressTypeKeyKey,
+		lcommon.AddressTypeKeyScript,
+		lcommon.AddressTypeScriptKey,
+		lcommon.AddressTypeScriptScript:
+		if len(address) != 1+2*lcommon.AddressHashSize {
+			return "", nil, fmt.Errorf(
+				"base address type %d has length %d, want %d",
+				addressType,
+				len(address),
+				1+2*lcommon.AddressHashSize,
+			)
+		}
+	case lcommon.AddressTypeKeyNone,
+		lcommon.AddressTypeScriptNone:
+		if len(address) != 1+lcommon.AddressHashSize {
+			return "", nil, fmt.Errorf(
+				"enterprise address type %d has length %d, want %d",
+				addressType,
+				len(address),
+				1+lcommon.AddressHashSize,
+			)
+		}
+	case lcommon.AddressTypeKeyPointer,
+		lcommon.AddressTypeScriptPointer:
+		if err := validatePointerAddressSuffix(address[1+lcommon.AddressHashSize:]); err != nil {
+			return "", nil, err
+		}
+	default:
+		return "", nil, fmt.Errorf("unknown address type %d", addressType)
+	}
+	hash, err := hash28(
+		address[1:1+lcommon.AddressHashSize],
+		"payment credential",
+	)
+	if err != nil {
+		return "", nil, err
+	}
+	kind := "key"
+	switch addressType {
+	case lcommon.AddressTypeScriptKey,
+		lcommon.AddressTypeScriptScript,
+		lcommon.AddressTypeScriptPointer,
+		lcommon.AddressTypeScriptNone:
+		kind = "script"
+	}
+	return kind, &hash, nil
+}
+
+func validatePointerAddressSuffix(suffix []byte) error {
+	offset := 0
+	limits := [...]uint64{math.MaxUint32, math.MaxUint16, math.MaxUint16}
+	for component, limit := range limits {
+		var accumulated uint64
+		for {
+			if offset >= len(suffix) {
+				return fmt.Errorf("pointer address component %d is truncated", component)
+			}
+			value := suffix[offset]
+			offset++
+			digit := uint64(value & 0x7f)
+			if accumulated > (limit-digit)>>7 {
+				return fmt.Errorf(
+					"pointer address component %d exceeds ledger bound %d",
+					component,
+					limit,
+				)
+			}
+			accumulated = accumulated<<7 | digit
+			if value&0x80 == 0 {
+				break
+			}
+		}
+	}
+	if offset != len(suffix) {
+		return fmt.Errorf("pointer address has %d trailing bytes", len(suffix)-offset)
 	}
 	return nil
 }
@@ -266,16 +387,22 @@ func outputBundle(
 	if err != nil {
 		return model.Output{}, nil, err
 	}
+	paymentKind, paymentHash, err := paymentCredentialFromAddress(address)
+	if err != nil {
+		return model.Output{}, nil, fmt.Errorf("payment credential: %w", err)
+	}
 	ret := model.Output{
-		TransactionHash:  txHash,
-		TransactionOrder: txOrder,
-		Index:            index,
-		BodyOrdinal:      ordinal,
-		Kind:             kind,
-		Address:          bytes.Clone(address),
-		Lovelace:         lovelace,
-		Assets:           assets,
-		DatumKind:        "none",
+		TransactionHash:       txHash,
+		TransactionOrder:      txOrder,
+		Index:                 index,
+		BodyOrdinal:           ordinal,
+		Kind:                  kind,
+		Address:               bytes.Clone(address),
+		PaymentCredentialKind: paymentKind,
+		PaymentCredentialHash: paymentHash,
+		Lovelace:              lovelace,
+		Assets:                assets,
+		DatumKind:             "none",
 	}
 	var observations []model.DatumObservation
 	if script := output.ScriptRef(); script != nil {
@@ -404,9 +531,11 @@ func withdrawalBundle(
 	order uint32,
 ) ([]model.Withdrawal, error) {
 	type item struct {
-		address []byte
-		value   *big.Int
-		parsed  *lcommon.Address
+		address        []byte
+		value          *big.Int
+		network        uint
+		credentialKind string
+		credentialHash model.Hash28
 	}
 	var items []item
 	for address, value := range tx.Withdrawals() {
@@ -417,20 +546,27 @@ func withdrawalBundle(
 		if err != nil {
 			return nil, fmt.Errorf("withdrawal reward account: %w", err)
 		}
-		items = append(items, item{address: raw, value: value, parsed: address})
-	}
-	slices.SortFunc(items, func(a, b item) int { return bytes.Compare(a.address, b.address) })
-	ret := make([]model.Withdrawal, 0, len(items))
-	for ordinal, value := range items {
-		amount, err := uint64Value(value.value, "withdrawal lovelace")
-		if err != nil {
-			return nil, err
+		if address.Type() != lcommon.AddressTypeNoneKey &&
+			address.Type() != lcommon.AddressTypeNoneScript {
+			return nil, fmt.Errorf(
+				"withdrawal address type %d is not a reward account",
+				address.Type(),
+			)
 		}
-		credential, ok := value.parsed.StakeCredential()
+		if address.NetworkId() != lcommon.AddressNetworkMainnet {
+			return nil, fmt.Errorf(
+				"withdrawal reward account network ID %d is not pinned mainnet",
+				address.NetworkId(),
+			)
+		}
+		credential, ok := address.StakeCredential()
 		if !ok {
 			return nil, errors.New("withdrawal reward account has no stake credential")
 		}
-		credentialHash, err := hash28(credential.Credential.Bytes(), "withdrawal credential")
+		credentialHash, err := hash28(
+			credential.Credential.Bytes(),
+			"withdrawal credential",
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -442,6 +578,53 @@ func withdrawalBundle(
 		default:
 			return nil, fmt.Errorf("unknown withdrawal credential type %d", credential.CredType)
 		}
+		items = append(items, item{
+			address:        raw,
+			value:          value,
+			network:        address.NetworkId(),
+			credentialKind: kind,
+			credentialHash: credentialHash,
+		})
+	}
+	// Reward redeemer pointers use Map AccountAddress order, not reward-account
+	// wire bytes. AccountAddress derives Ord by Network then Credential, whose
+	// constructor order is ScriptHashObj before KeyHashObj, then hash bytes.
+	// https://cardano-ledger.cardano.intersectmbo.org/cardano-ledger-core/Cardano-Ledger-Core.html
+	// https://cardano-ledger.cardano.intersectmbo.org/cardano-ledger-alonzo/src/Cardano.Ledger.Alonzo.TxBody.html
+	slices.SortFunc(items, func(a, b item) int {
+		switch {
+		case a.network < b.network:
+			return -1
+		case a.network > b.network:
+			return 1
+		}
+		rank := func(kind string) int {
+			if kind == "script" {
+				return 0
+			}
+			return 1
+		}
+		if rankA, rankB := rank(a.credentialKind), rank(b.credentialKind); rankA != rankB {
+			return rankA - rankB
+		}
+		return bytes.Compare(a.credentialHash[:], b.credentialHash[:])
+	})
+	for index := 1; index < len(items); index++ {
+		if items[index].network == items[index-1].network &&
+			items[index].credentialKind == items[index-1].credentialKind &&
+			items[index].credentialHash == items[index-1].credentialHash {
+			return nil, fmt.Errorf(
+				"duplicate withdrawal reward account %x",
+				items[index].address,
+			)
+		}
+	}
+	ret := make([]model.Withdrawal, 0, len(items))
+	for ordinal, value := range items {
+		amount, err := uint64Value(value.value, "withdrawal lovelace")
+		if err != nil {
+			return nil, err
+		}
 		ret = append(ret, model.Withdrawal{
 			TransactionHash:  txHash,
 			TransactionOrder: order,
@@ -449,8 +632,8 @@ func withdrawalBundle(
 			RewardAccount:    bytes.Clone(value.address),
 			Lovelace:         amount,
 			Applied:          tx.IsValid(),
-			CredentialKind:   kind,
-			CredentialHash:   credentialHash,
+			CredentialKind:   value.credentialKind,
+			CredentialHash:   value.credentialHash,
 		})
 	}
 	return ret, nil
@@ -512,17 +695,16 @@ func resolveRedeemer(tx lcommon.Transaction, key lcommon.RedeemerKey, row *model
 	switch key.Tag {
 	case lcommon.RedeemerTagSpend:
 		row.Purpose = "spend"
-		if int(key.Index) >= len(tx.Inputs()) {
-			return fmt.Errorf("spend redeemer index %d is unresolved", key.Index)
-		}
-		input := tx.Inputs()[key.Index]
-		hash, err := hash32(input.Id().Bytes(), "spend redeemer target")
+		inputs, err := canonicalSpendInputs(tx.Inputs())
 		if err != nil {
 			return err
 		}
-		index := input.Index()
-		row.TargetTxHash = &hash
-		row.TargetOutputIndex = &index
+		if int(key.Index) >= len(inputs) {
+			return fmt.Errorf("spend redeemer index %d is unresolved", key.Index)
+		}
+		target := inputs[key.Index]
+		row.TargetTxHash = &target.hash
+		row.TargetOutputIndex = &target.index
 	case lcommon.RedeemerTagMint:
 		row.Purpose = "mint"
 		if tx.AssetMint() == nil {
@@ -546,9 +728,34 @@ func resolveRedeemer(tx lcommon.Transaction, key lcommon.RedeemerKey, row *model
 		if int(key.Index) >= len(tx.Certificates()) {
 			return fmt.Errorf("certificate redeemer index %d is unresolved", key.Index)
 		}
+		certificate := tx.Certificates()[key.Index]
+		certificateConstructor, err := canonicalLedgerConstructor(
+			certificate,
+			uint8(lcommon.CertificateTypeUpdateDrep),
+		)
+		if err != nil {
+			return fmt.Errorf("certificate constructor: %w", err)
+		}
+		if certificateConstructor != certificate.Type() {
+			return fmt.Errorf(
+				"certificate constructor %d disagrees with decoded type %d",
+				certificateConstructor,
+				certificate.Type(),
+			)
+		}
+		identity, err := compactLedgerTargetIdentity(
+			uint8(lcommon.RedeemerTagCert),
+			certificateConstructor,
+			uint8(lcommon.CertificateTypeUpdateDrep),
+			certificate,
+		)
+		if err != nil {
+			return fmt.Errorf("certificate redeemer target identity: %w", err)
+		}
 		index := key.Index
 		row.TargetBodyOrdinal = &index
-		if hash, ok := certificateScriptHash(tx.Certificates()[key.Index]); ok {
+		row.TargetIdentity = identity
+		if hash, ok := certificateScriptHash(certificate); ok {
 			row.ResolvedScriptHash = &hash
 		}
 	case lcommon.RedeemerTagReward:
@@ -588,9 +795,27 @@ func resolveRedeemer(tx lcommon.Transaction, key lcommon.RedeemerKey, row *model
 		if int(key.Index) >= len(tx.ProposalProcedures()) {
 			return fmt.Errorf("proposal redeemer index %d is unresolved", key.Index)
 		}
+		proposal := tx.ProposalProcedures()[key.Index]
+		actionConstructor, err := canonicalLedgerConstructor(
+			proposal.GovAction(),
+			uint8(lcommon.GovActionTypeInfo),
+		)
+		if err != nil {
+			return fmt.Errorf("proposal governance action constructor: %w", err)
+		}
+		identity, err := compactLedgerTargetIdentity(
+			uint8(lcommon.RedeemerTagProposing),
+			actionConstructor,
+			uint8(lcommon.GovActionTypeInfo),
+			proposal,
+		)
+		if err != nil {
+			return fmt.Errorf("proposal redeemer target identity: %w", err)
+		}
 		index := key.Index
 		row.TargetBodyOrdinal = &index
-		if action := tx.ProposalProcedures()[key.Index].GovAction(); action != nil {
+		row.TargetIdentity = identity
+		if action := proposal.GovAction(); action != nil {
 			if withPolicy, ok := action.(lcommon.GovActionWithPolicy); ok {
 				if raw := withPolicy.GetPolicyHash(); len(raw) > 0 {
 					hash, err := hash28(raw, "proposal policy script hash")
@@ -607,6 +832,109 @@ func resolveRedeemer(tx lcommon.Transaction, key lcommon.RedeemerKey, row *model
 	return nil
 }
 
+func compactLedgerTargetIdentity(
+	purpose uint8,
+	constructor uint,
+	maxConstructor uint8,
+	value any,
+) ([]byte, error) {
+	canonical, err := cbor.Encode(value)
+	if err != nil {
+		return nil, fmt.Errorf("encode canonical ledger CBOR: %w", err)
+	}
+	if len(canonical) == 0 || len(canonical) > maxContextCBORSize {
+		return nil, fmt.Errorf(
+			"canonical ledger CBOR length %d outside 1..%d",
+			len(canonical),
+			maxContextCBORSize,
+		)
+	}
+	if constructor > uint(maxConstructor) {
+		return nil, fmt.Errorf(
+			"canonical constructor %d outside 0..%d",
+			constructor,
+			maxConstructor,
+		)
+	}
+	digest := lcommon.Blake2b256Hash(canonical)
+	// Compact identity: [redeemer-purpose tag, target constructor, digest].
+	ret := make([]byte, 2+len(digest))
+	ret[0] = purpose
+	ret[1] = uint8(constructor)
+	copy(ret[2:], digest.Bytes())
+	return ret, nil
+}
+
+func canonicalLedgerConstructor(value any, maximum uint8) (uint, error) {
+	canonical, err := cbor.Encode(value)
+	if err != nil {
+		return 0, fmt.Errorf("encode canonical ledger CBOR: %w", err)
+	}
+	if len(canonical) == 0 || len(canonical) > maxContextCBORSize {
+		return 0, fmt.Errorf(
+			"canonical ledger CBOR length %d outside 1..%d",
+			len(canonical),
+			maxContextCBORSize,
+		)
+	}
+	constructor, err := cbor.DecodeIdFromList(canonical)
+	if err != nil {
+		return 0, fmt.Errorf("decode canonical constructor: %w", err)
+	}
+	if constructor < 0 || constructor > int(maximum) {
+		return 0, fmt.Errorf(
+			"canonical constructor %d outside 0..%d",
+			constructor,
+			maximum,
+		)
+	}
+	return uint(constructor), nil
+}
+
+type canonicalSpendInput struct {
+	hash  model.Hash32
+	index uint32
+}
+
+func canonicalSpendInputs(
+	inputs []lcommon.TransactionInput,
+) ([]canonicalSpendInput, error) {
+	ret := make([]canonicalSpendInput, 0, len(inputs))
+	for bodyOrdinal, input := range inputs {
+		if input == nil {
+			return nil, fmt.Errorf("regular input %d is nil", bodyOrdinal)
+		}
+		hash, err := hash32(input.Id().Bytes(), "spend redeemer input transaction hash")
+		if err != nil {
+			return nil, err
+		}
+		ret = append(ret, canonicalSpendInput{hash: hash, index: input.Index()})
+	}
+	slices.SortFunc(ret, func(left, right canonicalSpendInput) int {
+		if compared := bytes.Compare(left.hash[:], right.hash[:]); compared != 0 {
+			return compared
+		}
+		switch {
+		case left.index < right.index:
+			return -1
+		case left.index > right.index:
+			return 1
+		default:
+			return 0
+		}
+	})
+	for index := 1; index < len(ret); index++ {
+		if ret[index] == ret[index-1] {
+			return nil, fmt.Errorf(
+				"duplicate regular input reference %x#%d",
+				ret[index].hash,
+				ret[index].index,
+			)
+		}
+	}
+	return ret, nil
+}
+
 func sortedVoters(votes lcommon.VotingProcedures) ([]*lcommon.Voter, error) {
 	var voters []*lcommon.Voter
 	for voter := range votes {
@@ -615,7 +943,14 @@ func sortedVoters(votes lcommon.VotingProcedures) ([]*lcommon.Voter, error) {
 		}
 		voters = append(voters, voter)
 	}
-	tag := func(voter *lcommon.Voter) (int, error) {
+	// The redeemer index is Map.elemAt over the ledger Voter Ord instance.
+	// Voter constructor order is Committee, DRep, StakePool. Inside the first
+	// two constructors Credential declares ScriptHashObj before KeyHashObj.
+	// This is intentionally not the CDDL numeric tag order.
+	// Official generated APIs:
+	// https://cardano-api.cardano.intersectmbo.org/cardano-api/Cardano-Api-Ledger.html
+	// https://cardano-ledger.cardano.intersectmbo.org/cardano-ledger-api/Cardano-Ledger-Api-Governance.html
+	ledgerOrdinal := func(voter *lcommon.Voter) (int, error) {
 		switch voter.Type {
 		case lcommon.VoterTypeConstitutionalCommitteeHotScriptHash:
 			return 0, nil
@@ -631,10 +966,15 @@ func sortedVoters(votes lcommon.VotingProcedures) ([]*lcommon.Voter, error) {
 			return 0, fmt.Errorf("unknown voter type %d", voter.Type)
 		}
 	}
+	for _, voter := range voters {
+		if _, err := ledgerOrdinal(voter); err != nil {
+			return nil, err
+		}
+	}
 	var sortErr error
 	slices.SortFunc(voters, func(a, b *lcommon.Voter) int {
-		aTag, aErr := tag(a)
-		bTag, bErr := tag(b)
+		aTag, aErr := ledgerOrdinal(a)
+		bTag, bErr := ledgerOrdinal(b)
 		if aErr != nil {
 			sortErr = aErr
 		}
@@ -723,6 +1063,8 @@ func scriptLanguage(script lcommon.Script) (string, error) {
 func certificateScriptHash(certificate lcommon.Certificate) (model.Hash28, bool) {
 	var credential *lcommon.Credential
 	switch value := certificate.(type) {
+	case *lcommon.StakeRegistrationCertificate:
+		credential = &value.StakeCredential
 	case *lcommon.StakeDeregistrationCertificate:
 		credential = &value.StakeCredential
 	case *lcommon.RegistrationCertificate:

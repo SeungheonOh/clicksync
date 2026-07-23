@@ -58,6 +58,8 @@ type Output struct {
 	BodyOrdinal             uint32
 	Kind                    string
 	Address                 []byte
+	PaymentCredentialKind   string
+	PaymentCredentialHash   *Hash28
 	Lovelace                uint64
 	Assets                  []Asset
 	DatumKind               string

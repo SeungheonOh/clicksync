@@ -101,6 +101,8 @@ func TestNativePublicationBinaryRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	policy := hash28Fill(0x55)
+	paymentKey := hash28Fill(0x56)
 	firstTx := hash32Fill(0x21)
 	firstBlock := model.Block{
 		Hash:                   hash32Fill(0x20),
@@ -122,14 +124,27 @@ func TestNativePublicationBinaryRoundTrip(t *testing.T) {
 			EffectiveFee: uint64Pointer(2),
 			MintApplied:  true,
 			Outputs: []model.Output{{
-				TransactionHash:  firstTx,
-				TransactionOrder: 0,
-				Index:            0,
-				BodyOrdinal:      0,
-				Kind:             "regular",
-				Address:          []byte{0x01, 0x00, 0xff},
-				Lovelace:         42,
-				DatumKind:        "none",
+				TransactionHash:       firstTx,
+				TransactionOrder:      0,
+				Index:                 0,
+				BodyOrdinal:           0,
+				Kind:                  "regular",
+				Address:               append([]byte{0x71}, bytesOf28(policy)...),
+				PaymentCredentialKind: "script",
+				PaymentCredentialHash: &policy,
+				Lovelace:              42,
+				DatumKind:             "none",
+			}, {
+				TransactionHash:       firstTx,
+				TransactionOrder:      0,
+				Index:                 1,
+				BodyOrdinal:           1,
+				Kind:                  "regular",
+				Address:               append([]byte{0x61}, bytesOf28(paymentKey)...),
+				PaymentCredentialKind: "key",
+				PaymentCredentialHash: &paymentKey,
+				Lovelace:              100,
+				DatumKind:             "none",
 			}},
 		}},
 	}
@@ -137,8 +152,8 @@ func TestNativePublicationBinaryRoundTrip(t *testing.T) {
 	datumHash := model.Hash32(blake2b.Sum256(datumCBOR))
 	secondTx := hash32Fill(0x31)
 	thirdTx := hash32Fill(0x32)
+	fourthTx := hash32Fill(0x33)
 	unknownTx := hash32Fill(0x77)
-	policy := hash28Fill(0x55)
 	redeemerData := []byte{0x80}
 	redeemerHash := model.Hash32(blake2b.Sum256(redeemerData))
 	metadataCBOR := []byte{0xa1, 0x01, 0x41, 0xff}
@@ -177,13 +192,15 @@ func TestNativePublicationBinaryRoundTrip(t *testing.T) {
 					inputFixture(secondTx, 0, unknownTx, 9, 1),
 				},
 				Outputs: []model.Output{{
-					TransactionHash:  secondTx,
-					TransactionOrder: 0,
-					Index:            0,
-					BodyOrdinal:      0,
-					Kind:             "regular",
-					Address:          []byte{0x02, 0x00, 0xfe},
-					Lovelace:         21,
+					TransactionHash:       secondTx,
+					TransactionOrder:      0,
+					Index:                 0,
+					BodyOrdinal:           0,
+					Kind:                  "regular",
+					Address:               append([]byte{0x61}, bytesOf28(paymentKey)...),
+					PaymentCredentialKind: "key",
+					PaymentCredentialHash: &paymentKey,
+					Lovelace:              21,
 					Assets: []model.Asset{{
 						PolicyID: policy,
 						Name:     []byte{0x00, 0xff},
@@ -244,6 +261,37 @@ func TestNativePublicationBinaryRoundTrip(t *testing.T) {
 				Inputs: []model.Input{
 					inputFixture(thirdTx, 1, secondTx, 0, 0),
 				},
+			},
+			{
+				Hash:         fourthTx,
+				Order:        2,
+				Era:          "conway",
+				Phase2Valid:  false,
+				FlowKind:     "collateral",
+				DeclaredFee:  uint64Pointer(99),
+				EffectiveFee: nil,
+				MintApplied:  false,
+				Inputs: []model.Input{{
+					TransactionHash:  fourthTx,
+					TransactionOrder: 2,
+					SourceHash:       firstTx,
+					SourceIndex:      1,
+					BodyOrdinal:      0,
+					Role:             "collateral",
+					Consumed:         true,
+				}},
+				Outputs: []model.Output{{
+					TransactionHash:       fourthTx,
+					TransactionOrder:      2,
+					Index:                 0,
+					BodyOrdinal:           0,
+					Kind:                  "collateral_return",
+					Address:               append([]byte{0x61}, bytesOf28(paymentKey)...),
+					PaymentCredentialKind: "key",
+					PaymentCredentialHash: &paymentKey,
+					Lovelace:              40,
+					DatumKind:             "none",
+				}},
 			},
 		},
 	}
@@ -360,8 +408,12 @@ ORDER BY tx_order, body_ordinal`)
 		resolved = append(resolved, value)
 	}
 	rows.Close()
-	if len(resolved) != 3 || !resolved[0] || resolved[1] || !resolved[2] {
-		t.Fatalf("source resolution = %v, want [true false true]", resolved)
+	if len(resolved) != 4 ||
+		!resolved[0] ||
+		resolved[1] ||
+		!resolved[2] ||
+		!resolved[3] {
+		t.Fatalf("source resolution = %v, want [true false true true]", resolved)
 	}
 	var address, datum, redeemer, metadata []byte
 	if err := db.conn.QueryRow(ctx, `
@@ -377,11 +429,31 @@ CROSS JOIN clicksync.transaction_metadata AS m
 WHERE o.block_number = 11`).Scan(&address, &datum, &redeemer, &metadata); err != nil {
 		t.Fatal(err)
 	}
-	if string(address) != string([]byte{0x02, 0x00, 0xfe}) ||
+	if string(address) != string(append([]byte{0x61}, bytesOf28(paymentKey)...)) ||
 		string(datum) != string(datumCBOR) ||
 		string(redeemer) != string([]byte{0x80}) ||
 		string(metadata) != string([]byte{0xa1, 0x01, 0x41, 0xff}) {
 		t.Fatalf("binary round-trip mismatch: %x %x %x %x", address, datum, redeemer, metadata)
+	}
+	var resolvedScriptHash []byte
+	if err := db.conn.QueryRow(ctx, `
+SELECT assumeNotNull(resolved_script_hash)
+FROM clicksync.redeemers
+WHERE block_number = 11 AND purpose = 'spend'`).Scan(&resolvedScriptHash); err != nil {
+		t.Fatal(err)
+	}
+	if string(resolvedScriptHash) != string(policy[:]) {
+		t.Fatalf("resolved spend script hash = %x, want %x", resolvedScriptHash, policy)
+	}
+	var effectiveCollateralFee *uint64
+	if err := db.conn.QueryRow(ctx, `
+SELECT effective_fee_lovelace
+FROM clicksync.transactions
+WHERE tx_hash = ?`, string(fourthTx[:])).Scan(&effectiveCollateralFee); err != nil {
+		t.Fatal(err)
+	}
+	if effectiveCollateralFee == nil || *effectiveCollateralFee != 60 {
+		t.Fatalf("derived effective collateral fee = %v, want 60", effectiveCollateralFee)
 	}
 
 	firstPoint := publication.Point{

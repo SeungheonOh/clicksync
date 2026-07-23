@@ -110,6 +110,422 @@ func TestInvalidBundleRetainsContextButOnlyCollateralFlow(t *testing.T) {
 	}
 }
 
+func TestInvalidZeroTotalCollateralRemainsUnknownDuringNormalization(t *testing.T) {
+	collateral := ledger.NewShelleyTransactionInput(strings.Repeat("22", 32), 2)
+	tx := testConwayTransaction(t, false, txOptions{
+		collateral: []ledger.ShelleyTransactionInput{collateral},
+		fee:        99,
+	})
+	got, err := transactionBundle(tx, 0, "Conway", bundleDatumCollector{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.EffectiveFee != nil {
+		t.Fatalf("zero/absent total collateral normalized as known fee %d", *got.EffectiveFee)
+	}
+}
+
+func TestSpendRedeemerUsesLedgerOrderedInputSetAndPreservesBodyOrdinal(t *testing.T) {
+	wireFirst := ledger.NewShelleyTransactionInput(strings.Repeat("22", 32), 9)
+	ledgerFirst := ledger.NewShelleyTransactionInput(strings.Repeat("11", 32), 7)
+	datum := testDatum(t, []byte{0x01})
+	tx := testConwayTransaction(t, true, txOptions{
+		inputs:  []ledger.ShelleyTransactionInput{wireFirst, ledgerFirst},
+		outputs: []ledger.BabbageTransactionOutput{testOutput(nil, 1)},
+		fee:     1,
+		redeemers: conway.ConwayRedeemers{Redeemers: map[lcommon.RedeemerKey]lcommon.RedeemerValue{
+			{Tag: lcommon.RedeemerTagSpend, Index: 0}: {
+				Data: datum, ExUnits: lcommon.ExUnits{Memory: 1, Steps: 1},
+			},
+		}},
+	})
+	got, err := transactionBundle(tx, 0, "Conway", bundleDatumCollector{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Inputs) != 2 ||
+		got.Inputs[0].BodyOrdinal != 0 ||
+		got.Inputs[0].SourceHash[0] != 0x22 ||
+		got.Inputs[1].BodyOrdinal != 1 ||
+		got.Inputs[1].SourceHash[0] != 0x11 {
+		t.Fatalf("wire input order/body ordinals changed: %#v", got.Inputs)
+	}
+	if len(got.Redeemers) != 1 ||
+		got.Redeemers[0].TargetTxHash == nil ||
+		got.Redeemers[0].TargetTxHash[0] != 0x11 ||
+		got.Redeemers[0].TargetOutputIndex == nil ||
+		*got.Redeemers[0].TargetOutputIndex != 7 {
+		t.Fatalf("spend redeemer did not target ledger-ordered input: %#v", got.Redeemers)
+	}
+}
+
+func TestSpendRedeemerRejectsDuplicateInputReference(t *testing.T) {
+	input := ledger.NewShelleyTransactionInput(strings.Repeat("11", 32), 7)
+	datum := testDatum(t, []byte{0x01})
+	tx := testConwayTransaction(t, true, txOptions{
+		inputs:  []ledger.ShelleyTransactionInput{input, input},
+		outputs: []ledger.BabbageTransactionOutput{testOutput(nil, 1)},
+		fee:     1,
+		redeemers: conway.ConwayRedeemers{Redeemers: map[lcommon.RedeemerKey]lcommon.RedeemerValue{
+			{Tag: lcommon.RedeemerTagSpend, Index: 0}: {
+				Data: datum, ExUnits: lcommon.ExUnits{Memory: 1, Steps: 1},
+			},
+		}},
+	})
+	if _, err := transactionBundle(tx, 0, "Conway", bundleDatumCollector{}); err == nil ||
+		!strings.Contains(err.Error(), "duplicate regular input reference") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestVoterRedeemerOrderMatchesLedgerAndCDDLOracle(t *testing.T) {
+	if lcommon.VoterTypeConstitutionalCommitteeHotKeyHash != 0 ||
+		lcommon.VoterTypeConstitutionalCommitteeHotScriptHash != 1 ||
+		lcommon.VoterTypeDRepKeyHash != 2 ||
+		lcommon.VoterTypeDRepScriptHash != 3 ||
+		lcommon.VoterTypeStakingPoolKeyHash != 4 {
+		t.Fatal("gouroboros voter tags differ from the Conway CDDL 0..4 oracle")
+	}
+	voter := func(voterType uint8, fill byte) *lcommon.Voter {
+		ret := &lcommon.Voter{Type: voterType}
+		for index := range ret.Hash {
+			ret.Hash[index] = fill
+		}
+		return ret
+	}
+	committeeScriptHigh := voter(lcommon.VoterTypeConstitutionalCommitteeHotScriptHash, 0x22)
+	committeeScriptLow := voter(lcommon.VoterTypeConstitutionalCommitteeHotScriptHash, 0x11)
+	committeeKey := voter(lcommon.VoterTypeConstitutionalCommitteeHotKeyHash, 0x01)
+	drepScript := voter(lcommon.VoterTypeDRepScriptHash, 0x01)
+	drepKey := voter(lcommon.VoterTypeDRepKeyHash, 0x01)
+	pool := voter(lcommon.VoterTypeStakingPoolKeyHash, 0x01)
+	votes := lcommon.VotingProcedures{
+		pool:                {},
+		drepKey:             {},
+		committeeKey:        {},
+		committeeScriptHigh: {},
+		drepScript:          {},
+		committeeScriptLow:  {},
+	}
+	got, err := sortedVoters(votes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []*lcommon.Voter{
+		committeeScriptLow,
+		committeeScriptHigh,
+		committeeKey,
+		drepScript,
+		drepKey,
+		pool,
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("voter %d = type %d hash %x, want type %d hash %x",
+				index, got[index].Type, got[index].Hash, want[index].Type, want[index].Hash)
+		}
+	}
+	unknown := voter(5, 0)
+	if _, err := sortedVoters(lcommon.VotingProcedures{unknown: {}}); err == nil ||
+		!strings.Contains(err.Error(), "unknown voter type") {
+		t.Fatalf("unknown voter error = %v", err)
+	}
+}
+
+func TestCompactCertificateAndProposalTargetIdentityIsDeterministic(t *testing.T) {
+	credential := func(fill byte) lcommon.Credential {
+		return lcommon.Credential{
+			CredType:   lcommon.CredentialTypeScriptHash,
+			Credential: lcommon.NewBlake2b224(bytesOf(fill, 28)),
+		}
+	}
+	certificate := func(fill byte) *lcommon.StakeRegistrationCertificate {
+		return &lcommon.StakeRegistrationCertificate{
+			CertType:        uint(lcommon.CertificateTypeStakeRegistration),
+			StakeCredential: credential(fill),
+		}
+	}
+	first, err := compactLedgerTargetIdentity(
+		uint8(lcommon.RedeemerTagCert),
+		uint(lcommon.CertificateTypeStakeRegistration),
+		uint8(lcommon.CertificateTypeUpdateDrep),
+		certificate(0x11),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	same, err := compactLedgerTargetIdentity(
+		uint8(lcommon.RedeemerTagCert),
+		uint(lcommon.CertificateTypeStakeRegistration),
+		uint8(lcommon.CertificateTypeUpdateDrep),
+		certificate(0x11),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	different, err := compactLedgerTargetIdentity(
+		uint8(lcommon.RedeemerTagCert),
+		uint(lcommon.CertificateTypeStakeRegistration),
+		uint8(lcommon.CertificateTypeUpdateDrep),
+		certificate(0x12),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 34 ||
+		first[0] != uint8(lcommon.RedeemerTagCert) ||
+		first[1] != uint8(lcommon.CertificateTypeStakeRegistration) {
+		t.Fatalf("certificate identity header = %x", first)
+	}
+	if !bytes.Equal(first, same) || bytes.Equal(first, different) {
+		t.Fatalf("certificate identities same=%x different=%x", same, different)
+	}
+	cached := certificate(0x11)
+	cached.SetCbor([]byte{0x81, 0x00})
+	canonical, err := cbor.Encode(cached)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(canonical, cached.Cbor()) {
+		t.Fatal("canonical certificate encoding reused cached original CBOR")
+	}
+	cachedIdentity, err := compactLedgerTargetIdentity(
+		uint8(lcommon.RedeemerTagCert),
+		uint(lcommon.CertificateTypeStakeRegistration),
+		uint8(lcommon.CertificateTypeUpdateDrep),
+		cached,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonicalDigest := lcommon.Blake2b256Hash(canonical)
+	if !bytes.Equal(cachedIdentity[2:], canonicalDigest.Bytes()) {
+		t.Fatalf(
+			"identity digest = %x, canonical digest = %x",
+			cachedIdentity[2:],
+			canonicalDigest.Bytes(),
+		)
+	}
+
+	proposal := func(deposit uint64) conway.ConwayProposalProcedure {
+		action := &lcommon.InfoGovAction{Type: uint(lcommon.GovActionTypeInfo)}
+		return conway.ConwayProposalProcedure{
+			PPDeposit:       deposit,
+			PPRewardAccount: *testRewardAccount(t, false, 0x21),
+			PPGovAction: conway.ConwayGovAction{
+				Type:   uint(lcommon.GovActionTypeInfo),
+				Action: action,
+			},
+		}
+	}
+	proposalFirst, err := compactLedgerTargetIdentity(
+		uint8(lcommon.RedeemerTagProposing),
+		uint(lcommon.GovActionTypeInfo),
+		uint8(lcommon.GovActionTypeInfo),
+		proposal(1),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proposalSame, err := compactLedgerTargetIdentity(
+		uint8(lcommon.RedeemerTagProposing),
+		uint(lcommon.GovActionTypeInfo),
+		uint8(lcommon.GovActionTypeInfo),
+		proposal(1),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proposalDifferent, err := compactLedgerTargetIdentity(
+		uint8(lcommon.RedeemerTagProposing),
+		uint(lcommon.GovActionTypeInfo),
+		uint8(lcommon.GovActionTypeInfo),
+		proposal(2),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(proposalFirst) != 34 ||
+		proposalFirst[0] != uint8(lcommon.RedeemerTagProposing) ||
+		proposalFirst[1] != uint8(lcommon.GovActionTypeInfo) {
+		t.Fatalf("proposal identity header = %x", proposalFirst)
+	}
+	if !bytes.Equal(proposalFirst, proposalSame) ||
+		bytes.Equal(proposalFirst, proposalDifferent) {
+		t.Fatalf(
+			"proposal identities same=%x different=%x",
+			proposalSame,
+			proposalDifferent,
+		)
+	}
+}
+
+func TestCompactTargetIdentityFailsClosedWithoutBoundedCanonicalCBOR(t *testing.T) {
+	if _, err := compactLedgerTargetIdentity(2, 0, 18, make(chan int)); err == nil ||
+		!strings.Contains(err.Error(), "encode canonical") {
+		t.Fatalf("unavailable CBOR error = %v", err)
+	}
+	oversized := []any{uint64(0), bytesOf(0x55, maxContextCBORSize)}
+	if _, err := compactLedgerTargetIdentity(2, 0, 18, oversized); err == nil ||
+		!strings.Contains(err.Error(), "outside") {
+		t.Fatalf("oversized CBOR error = %v", err)
+	}
+	if _, err := compactLedgerTargetIdentity(2, 19, 18, []any{uint64(19)}); err == nil ||
+		!strings.Contains(err.Error(), "outside") {
+		t.Fatalf("unknown constructor error = %v", err)
+	}
+}
+
+func TestCertificateAndProposalRedeemersPersistCompactTargetIdentity(t *testing.T) {
+	scriptCredential := lcommon.Credential{
+		CredType:   lcommon.CredentialTypeScriptHash,
+		Credential: lcommon.NewBlake2b224(bytesOf(0x41, 28)),
+	}
+	certificate := &lcommon.StakeRegistrationCertificate{
+		CertType:        uint(lcommon.CertificateTypeStakeRegistration),
+		StakeCredential: scriptCredential,
+	}
+	action := &lcommon.InfoGovAction{Type: uint(lcommon.GovActionTypeInfo)}
+	proposal := conway.ConwayProposalProcedure{
+		PPDeposit:       1,
+		PPRewardAccount: *testRewardAccount(t, false, 0x42),
+		PPGovAction: conway.ConwayGovAction{
+			Type:   uint(lcommon.GovActionTypeInfo),
+			Action: action,
+		},
+	}
+	datum := testDatum(t, []byte{0x01})
+	tx := testConwayTransaction(t, true, txOptions{
+		outputs: []ledger.BabbageTransactionOutput{testOutput(nil, 1)},
+		fee:     1,
+		certificates: []lcommon.CertificateWrapper{{
+			Type:        uint(lcommon.CertificateTypeStakeRegistration),
+			Certificate: certificate,
+		}},
+		proposals: []conway.ConwayProposalProcedure{proposal},
+		redeemers: conway.ConwayRedeemers{Redeemers: map[lcommon.RedeemerKey]lcommon.RedeemerValue{
+			{Tag: lcommon.RedeemerTagCert, Index: 0}: {
+				Data: datum, ExUnits: lcommon.ExUnits{Memory: 1, Steps: 1},
+			},
+			{Tag: lcommon.RedeemerTagProposing, Index: 0}: {
+				Data: datum, ExUnits: lcommon.ExUnits{Memory: 1, Steps: 1},
+			},
+		}},
+	})
+	got, err := transactionBundle(tx, 0, "Conway", bundleDatumCollector{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Redeemers) != 2 {
+		t.Fatalf("redeemers = %#v", got.Redeemers)
+	}
+	certificateRedeemer := got.Redeemers[0]
+	proposalRedeemer := got.Redeemers[1]
+	if certificateRedeemer.Purpose != "certificate" ||
+		len(certificateRedeemer.TargetIdentity) != 34 ||
+		certificateRedeemer.TargetIdentity[1] !=
+			uint8(lcommon.CertificateTypeStakeRegistration) ||
+		certificateRedeemer.ResolvedScriptHash == nil {
+		t.Fatalf("certificate redeemer = %#v", certificateRedeemer)
+	}
+	if proposalRedeemer.Purpose != "proposal" ||
+		len(proposalRedeemer.TargetIdentity) != 34 ||
+		proposalRedeemer.TargetIdentity[1] != uint8(lcommon.GovActionTypeInfo) ||
+		proposalRedeemer.ResolvedScriptHash != nil {
+		t.Fatalf("proposal redeemer = %#v", proposalRedeemer)
+	}
+}
+
+func TestPaymentCredentialExtractionIsStrict(t *testing.T) {
+	address := func(header byte, payment byte, suffix []byte) []byte {
+		ret := append([]byte{header}, bytesOf(payment, 28)...)
+		return append(ret, suffix...)
+	}
+	baseStake := bytesOf(0x77, 28)
+	tests := []struct {
+		name string
+		raw  []byte
+		kind string
+		hash byte
+	}{
+		{"base key", address(0x01, 0x11, baseStake), "key", 0x11},
+		{"base script", address(0x11, 0x22, baseStake), "script", 0x22},
+		{"pointer key", address(0x41, 0x33, []byte{0, 0, 0}), "key", 0x33},
+		{"pointer script", address(0x51, 0x44, []byte{0, 0, 0}), "script", 0x44},
+		{"enterprise key", address(0x61, 0x55, nil), "key", 0x55},
+		{"enterprise script", address(0x71, 0x66, nil), "script", 0x66},
+	}
+	byron, err := lcommon.NewByronAddressFromParts(
+		lcommon.ByronAddressTypePubkey,
+		bytesOf(0x88, 28),
+		lcommon.ByronAddressAttributes{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byronRaw, err := byron.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests = append(tests, struct {
+		name string
+		raw  []byte
+		kind string
+		hash byte
+	}{"Byron unsupported", byronRaw, "none", 0})
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			kind, hash, err := paymentCredentialFromAddress(test.raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if kind != test.kind {
+				t.Fatalf("kind = %q, want %q", kind, test.kind)
+			}
+			if test.kind == "none" {
+				if hash != nil {
+					t.Fatalf("unsupported address returned hash %x", *hash)
+				}
+			} else if hash == nil || hash[0] != test.hash {
+				t.Fatalf("hash = %v, want fill %x", hash, test.hash)
+			}
+		})
+	}
+	malformed := [][]byte{
+		address(0x60, 0x11, nil),
+		address(0x70, 0x11, nil),
+		address(0x61, 0x11, []byte{0}),
+		address(0x41, 0x11, []byte{0, 0}),
+		address(0x41, 0x11, []byte{0, 0, 0, 0}),
+		{0x91},
+		address(0xe1, 0x77, nil),
+		address(0xf1, 0x77, nil),
+	}
+	for _, raw := range malformed {
+		if _, _, err := paymentCredentialFromAddress(raw); err == nil {
+			t.Fatalf("malformed address accepted: %x", raw)
+		}
+	}
+}
+
+func TestWithdrawalRejectsNonMainnetRewardAccount(t *testing.T) {
+	testnet, err := lcommon.NewAddressFromBytes(
+		append([]byte{0xe0}, bytesOf(0x11, 28)...),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := testConwayTransaction(t, true, txOptions{
+		outputs:     []ledger.BabbageTransactionOutput{testOutput(nil, 1)},
+		fee:         1,
+		withdrawals: map[*lcommon.Address]uint64{&testnet: 1},
+	})
+	if _, err := transactionBundle(tx, 0, "Conway", bundleDatumCollector{}); err == nil ||
+		!strings.Contains(err.Error(), "not pinned mainnet") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestWithdrawalRedeemerAndMetadataAreExactAndResolved(t *testing.T) {
 	input := ledger.NewShelleyTransactionInput(strings.Repeat("11", 32), 7)
 	reward := testRewardAccount(t, true, 0x44)
@@ -166,6 +582,48 @@ func TestWithdrawalRedeemerAndMetadataAreExactAndResolved(t *testing.T) {
 	}
 }
 
+func TestRewardRedeemerUsesLedgerAccountAddressOrder(t *testing.T) {
+	keyReward := testRewardAccount(t, false, 0x11)
+	scriptReward := testRewardAccount(t, true, 0x22)
+	if bytes.Compare(
+		mustAddressBytes(t, keyReward),
+		mustAddressBytes(t, scriptReward),
+	) >= 0 {
+		t.Fatal("oracle requires raw key reward bytes to sort before script bytes")
+	}
+	datum := testDatum(t, []byte{0x01})
+	tx := testConwayTransaction(t, true, txOptions{
+		outputs: []ledger.BabbageTransactionOutput{testOutput(nil, 1)},
+		fee:     1,
+		withdrawals: map[*lcommon.Address]uint64{
+			keyReward:    1,
+			scriptReward: 2,
+		},
+		redeemers: conway.ConwayRedeemers{Redeemers: map[lcommon.RedeemerKey]lcommon.RedeemerValue{
+			{Tag: lcommon.RedeemerTagReward, Index: 0}: {
+				Data: datum, ExUnits: lcommon.ExUnits{Memory: 1, Steps: 1},
+			},
+		}},
+	})
+	got, err := transactionBundle(tx, 0, "Conway", bundleDatumCollector{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Withdrawals) != 2 ||
+		got.Withdrawals[0].CredentialKind != "script" ||
+		got.Withdrawals[0].BodyOrdinal != 0 ||
+		got.Withdrawals[1].CredentialKind != "key" ||
+		got.Withdrawals[1].BodyOrdinal != 1 {
+		t.Fatalf("ledger withdrawal ordering = %#v", got.Withdrawals)
+	}
+	if len(got.Redeemers) != 1 ||
+		!bytes.Equal(got.Redeemers[0].TargetRewardAccount, mustAddressBytes(t, scriptReward)) ||
+		got.Redeemers[0].ResolvedScriptHash == nil ||
+		*got.Redeemers[0].ResolvedScriptHash != got.Withdrawals[0].CredentialHash {
+		t.Fatalf("reward redeemer target = %#v", got.Redeemers)
+	}
+}
+
 func TestDijkstraNestedTransactionFailsBeforeNormalization(t *testing.T) {
 	tx := &ledger.DijkstraTransaction{
 		Body: ledger.DijkstraTransactionBody{
@@ -198,21 +656,25 @@ type txOptions struct {
 	mint             *lcommon.MultiAsset[lcommon.MultiAssetTypeMint]
 	witnessDatums    []lcommon.Datum
 	withdrawals      map[*lcommon.Address]uint64
+	certificates     []lcommon.CertificateWrapper
+	proposals        []conway.ConwayProposalProcedure
 	redeemers        conway.ConwayRedeemers
 }
 
 func testConwayTransaction(t *testing.T, valid bool, options txOptions) *ledger.ConwayTransaction {
 	t.Helper()
 	template := ledger.ConwayTransactionBody{
-		TxInputs:           conway.NewConwayTransactionInputSet(options.inputs),
-		TxOutputs:          options.outputs,
-		TxFee:              options.fee,
-		TxMint:             options.mint,
-		TxCollateral:       cbor.NewSetType(options.collateral, true),
-		TxCollateralReturn: options.collateralReturn,
-		TxTotalCollateral:  options.totalCollateral,
-		TxReferenceInputs:  cbor.NewSetType(options.reference, true),
-		TxWithdrawals:      options.withdrawals,
+		TxInputs:             conway.NewConwayTransactionInputSet(options.inputs),
+		TxOutputs:            options.outputs,
+		TxFee:                options.fee,
+		TxMint:               options.mint,
+		TxCollateral:         cbor.NewSetType(options.collateral, true),
+		TxCollateralReturn:   options.collateralReturn,
+		TxTotalCollateral:    options.totalCollateral,
+		TxReferenceInputs:    cbor.NewSetType(options.reference, true),
+		TxWithdrawals:        options.withdrawals,
+		TxCertificates:       options.certificates,
+		TxProposalProcedures: options.proposals,
 	}
 	raw, err := cbor.Encode(&template)
 	if err != nil {

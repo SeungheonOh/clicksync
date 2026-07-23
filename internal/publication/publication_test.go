@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -42,7 +43,7 @@ func (lock *fakeLock) AssertHeld() error {
 type fakeBackend struct {
 	calls               []string
 	snapshot            uint64
-	resolved            map[OutputRef]struct{}
+	resolved            map[OutputRef]ResolvedOutput
 	datums              map[model.Hash32][]byte
 	adoptions           int
 	rollbackHeaders     int
@@ -80,7 +81,7 @@ func (backend *fakeBackend) ResolveActiveOutputs(
 	_ context.Context,
 	_ uint64,
 	_ []OutputRef,
-) (map[OutputRef]struct{}, error) {
+) (map[OutputRef]ResolvedOutput, error) {
 	backend.call("resolve")
 	return backend.resolved, nil
 }
@@ -477,11 +478,12 @@ func TestSyntheticGenesisRequiresPinnedOfficialSource(t *testing.T) {
 			Phase2Valid: true,
 			FlowKind:    "genesis",
 			Outputs: []model.Output{{
-				TransactionHash: txHash,
-				Kind:            "genesis",
-				Address:         []byte{0x82, 0x01},
-				Lovelace:        1,
-				DatumKind:       "none",
+				TransactionHash:       txHash,
+				Kind:                  "genesis",
+				Address:               []byte{0x82, 0x01},
+				PaymentCredentialKind: "none",
+				Lovelace:              1,
+				DatumKind:             "none",
 			}},
 		}},
 	}
@@ -929,13 +931,14 @@ func complexValidBlock() model.Block {
 			Consumed:         true,
 		}},
 		Outputs: []model.Output{{
-			TransactionHash:  txHash,
-			TransactionOrder: 0,
-			Kind:             "regular",
-			Address:          []byte{1},
-			Assets:           []model.Asset{{PolicyID: policy, Name: []byte{1}, Quantity: 1}},
-			DatumKind:        "inline",
-			DatumHash:        &datumHash,
+			TransactionHash:       txHash,
+			TransactionOrder:      0,
+			Kind:                  "regular",
+			Address:               []byte{1},
+			PaymentCredentialKind: "none",
+			Assets:                []model.Asset{{PolicyID: policy, Name: []byte{1}, Quantity: 1}},
+			DatumKind:             "inline",
+			DatumHash:             &datumHash,
 		}},
 		DatumObservations: []model.DatumObservation{{
 			Hash:             datumHash,
@@ -1002,14 +1005,15 @@ func twoBlockBatch() []BatchItem {
 		EffectiveFee: &firstFee,
 		MintApplied:  true,
 		Outputs: []model.Output{{
-			TransactionHash:  firstTx,
-			TransactionOrder: 0,
-			Index:            0,
-			BodyOrdinal:      0,
-			Kind:             "regular",
-			Address:          []byte{1},
-			Lovelace:         10,
-			DatumKind:        "none",
+			TransactionHash:       firstTx,
+			TransactionOrder:      0,
+			Index:                 0,
+			BodyOrdinal:           0,
+			Kind:                  "regular",
+			Address:               []byte{1},
+			PaymentCredentialKind: "none",
+			Lovelace:              10,
+			DatumKind:             "none",
 		}},
 	}}
 	second := validBlock()
@@ -1043,3 +1047,150 @@ func twoBlockBatch() []BatchItem {
 		{Block: second, Source: validSource()},
 	}
 }
+
+func TestCollateralEffectiveFeeResolutionSemantics(t *testing.T) {
+	sourceHash := filled32(0x91)
+	ref := OutputRef{Hash: sourceHash, Index: 3}
+	base := func(declared *uint64) model.Transaction {
+		txHash := filled32(0x92)
+		return model.Transaction{
+			Hash:         txHash,
+			Phase2Valid:  false,
+			FlowKind:     "collateral",
+			DeclaredFee:  pointer64(99),
+			EffectiveFee: declared,
+			Inputs: []model.Input{{
+				TransactionHash: txHash,
+				SourceHash:      sourceHash,
+				SourceIndex:     3,
+				Role:            "collateral",
+				Consumed:        true,
+			}},
+			Outputs: []model.Output{{
+				TransactionHash:       txHash,
+				Kind:                  "collateral_return",
+				PaymentCredentialKind: "none",
+				Lovelace:              40,
+				DatumKind:             "none",
+			}},
+		}
+	}
+	t.Run("positive declared remains authoritative while unresolved", func(t *testing.T) {
+		declared := uint64(60)
+		tx := base(&declared)
+		if err := resolveTransactionFacts(&tx, nil); err != nil {
+			t.Fatal(err)
+		}
+		if tx.EffectiveFee == nil || *tx.EffectiveFee != 60 {
+			t.Fatalf("effective fee = %v", tx.EffectiveFee)
+		}
+	})
+	t.Run("zero or absent remains unknown while unresolved", func(t *testing.T) {
+		tx := base(nil)
+		if err := resolveTransactionFacts(&tx, nil); err != nil {
+			t.Fatal(err)
+		}
+		if tx.EffectiveFee != nil {
+			t.Fatalf("effective fee = %d, want unknown", *tx.EffectiveFee)
+		}
+	})
+	t.Run("positive declared is cross-checked when resolved", func(t *testing.T) {
+		declared := uint64(60)
+		tx := base(&declared)
+		if err := resolveTransactionFacts(&tx, map[OutputRef]ResolvedOutput{
+			ref: {Lovelace: 100, PaymentCredentialKind: "none"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if tx.EffectiveFee == nil || *tx.EffectiveFee != 60 {
+			t.Fatalf("effective fee = %v", tx.EffectiveFee)
+		}
+	})
+	t.Run("positive declared mismatch fails closed", func(t *testing.T) {
+		declared := uint64(61)
+		tx := base(&declared)
+		err := resolveTransactionFacts(&tx, map[OutputRef]ResolvedOutput{
+			ref: {Lovelace: 100, PaymentCredentialKind: "none"},
+		})
+		if err == nil || !strings.Contains(err.Error(), "differs from resolved") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+	t.Run("zero or absent is derived when resolved", func(t *testing.T) {
+		tx := base(nil)
+		if err := resolveTransactionFacts(&tx, map[OutputRef]ResolvedOutput{
+			ref: {Lovelace: 100, PaymentCredentialKind: "none"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if tx.EffectiveFee == nil || *tx.EffectiveFee != 60 {
+			t.Fatalf("effective fee = %v", tx.EffectiveFee)
+		}
+	})
+	t.Run("zero-valued first duplicate collateral return fails closed", func(t *testing.T) {
+		tx := base(nil)
+		tx.Outputs[0].Lovelace = 0
+		tx.Outputs = append(tx.Outputs, model.Output{
+			Kind:                  "collateral_return",
+			PaymentCredentialKind: "none",
+			Lovelace:              40,
+		})
+		err := resolveTransactionFacts(&tx, map[OutputRef]ResolvedOutput{
+			ref: {Lovelace: 100, PaymentCredentialKind: "none"},
+		})
+		if err == nil || !strings.Contains(err.Error(), "multiple collateral-return") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+}
+
+func TestSpendRedeemerResolvesPaymentScriptCredential(t *testing.T) {
+	sourceHash := filled32(0xa1)
+	targetIndex := uint32(2)
+	scriptHash := filled28(0xa2)
+	tx := model.Transaction{Redeemers: []model.Redeemer{{
+		Purpose:           "spend",
+		TargetTxHash:      &sourceHash,
+		TargetOutputIndex: &targetIndex,
+	}}}
+	ref := OutputRef{Hash: sourceHash, Index: targetIndex}
+	if err := resolveTransactionFacts(&tx, map[OutputRef]ResolvedOutput{
+		ref: {
+			Lovelace:              1,
+			PaymentCredentialKind: "script",
+			PaymentCredentialHash: &scriptHash,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if tx.Redeemers[0].ResolvedScriptHash == nil ||
+		*tx.Redeemers[0].ResolvedScriptHash != scriptHash {
+		t.Fatalf("resolved script hash = %v", tx.Redeemers[0].ResolvedScriptHash)
+	}
+	tx.Redeemers[0].ResolvedScriptHash = nil
+	if err := resolveTransactionFacts(&tx, map[OutputRef]ResolvedOutput{
+		ref: {
+			Lovelace:              1,
+			PaymentCredentialKind: "key",
+			PaymentCredentialHash: &scriptHash,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if tx.Redeemers[0].ResolvedScriptHash != nil {
+		t.Fatal("key payment credential produced a script hash")
+	}
+	wrong := filled28(0xa3)
+	tx.Redeemers[0].ResolvedScriptHash = &wrong
+	if err := resolveTransactionFacts(&tx, map[OutputRef]ResolvedOutput{
+		ref: {
+			Lovelace:              1,
+			PaymentCredentialKind: "script",
+			PaymentCredentialHash: &scriptHash,
+		},
+	}); err == nil || !strings.Contains(err.Error(), "disagrees") {
+		t.Fatalf("mismatched pre-resolution error = %v", err)
+	}
+}
+
+func pointer64(value uint64) *uint64 { return &value }

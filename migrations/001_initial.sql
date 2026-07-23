@@ -219,6 +219,8 @@ CREATE TABLE IF NOT EXISTS clicksync.outputs
     output_kind Enum8('regular' = 1, 'collateral_return' = 2, 'genesis' = 3),
     address String CODEC(ZSTD(3)),
     address_hash UInt64 MATERIALIZED sipHash64(address),
+    payment_credential_kind Enum8('none' = 0, 'key' = 1, 'script' = 2),
+    payment_credential_hash Nullable(FixedString(28)),
     lovelace UInt64,
     asset_policy_ids Array(FixedString(28)),
     asset_names Array(String) CODEC(ZSTD(3)),
@@ -237,6 +239,10 @@ CREATE TABLE IF NOT EXISTS clicksync.outputs
         length(asset_policy_ids) = length(asset_names)
         AND length(asset_policy_ids) = length(asset_quantities),
     CONSTRAINT outputs_asset_nonzero CHECK arrayAll(quantity -> quantity != 0, asset_quantities),
+    CONSTRAINT outputs_payment_credential CHECK
+        (payment_credential_kind = 'none' AND isNull(payment_credential_hash))
+        OR
+        (payment_credential_kind IN ('key', 'script') AND isNotNull(payment_credential_hash)),
     CONSTRAINT outputs_datum CHECK
         (datum_kind = 'none' AND isNull(datum_hash))
         OR

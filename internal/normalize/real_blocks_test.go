@@ -95,6 +95,11 @@ func TestRealBlocksDecodeAndNormalize(t *testing.T) {
 	var observedTransactions int
 	var observedInputs int
 	var observedOutputs int
+	credentialOutputs := map[uint]int{
+		ledger.BlockTypeAlonzo:  0,
+		ledger.BlockTypeBabbage: 0,
+		ledger.BlockTypeConway:  0,
+	}
 	for _, fixture := range realBlockFixtures {
 		t.Run(fixture.name, func(t *testing.T) {
 			raw := readFixture(t, fixture)
@@ -140,6 +145,32 @@ func TestRealBlocksDecodeAndNormalize(t *testing.T) {
 			for _, tx := range facts.Transactions {
 				observedInputs += len(tx.Inputs)
 				observedOutputs += len(tx.Outputs)
+				for _, output := range tx.Outputs {
+					switch output.PaymentCredentialKind {
+					case "none":
+						if output.PaymentCredentialHash != nil {
+							t.Fatal("payment-credential-none output retained a hash")
+						}
+					case "key", "script":
+						if output.PaymentCredentialHash == nil {
+							t.Fatalf(
+								"%s output %x#%d lacks payment credential hash",
+								fixture.name,
+								output.TransactionHash,
+								output.Index,
+							)
+						}
+						credentialOutputs[fixture.blockType]++
+					default:
+						t.Fatalf(
+							"%s output %x#%d has unknown payment credential kind %q",
+							fixture.name,
+							output.TransactionHash,
+							output.Index,
+							output.PaymentCredentialKind,
+						)
+					}
+				}
 			}
 			assertAllowedCBORIntegrity(t, raw, facts)
 		})
@@ -151,6 +182,11 @@ func TestRealBlocksDecodeAndNormalize(t *testing.T) {
 			observedInputs,
 			observedOutputs,
 		)
+	}
+	for blockType, count := range credentialOutputs {
+		if count == 0 {
+			t.Errorf("body-hash-verified era fixture type %d lacks payment credential coverage", blockType)
+		}
 	}
 }
 

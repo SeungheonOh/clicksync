@@ -34,8 +34,8 @@ func (d *DB) ResolveActiveOutputs(
 	ctx context.Context,
 	snapshot uint64,
 	refs []publication.OutputRef,
-) (map[publication.OutputRef]struct{}, error) {
-	ret := make(map[publication.OutputRef]struct{})
+) (map[publication.OutputRef]publication.ResolvedOutput, error) {
+	ret := make(map[publication.OutputRef]publication.ResolvedOutput)
 	if len(refs) == 0 {
 		return ret, nil
 	}
@@ -46,7 +46,14 @@ func (d *DB) ResolveActiveOutputs(
 		indexes = append(indexes, ref.Index)
 	}
 	query := `
-SELECT o.tx_hash, o.output_index, groupUniqArray(o.publication_id)
+SELECT
+    o.tx_hash,
+    o.output_index,
+    o.publication_id,
+    o.lovelace,
+    toString(o.payment_credential_kind),
+    isNull(o.payment_credential_hash),
+    assumeNotNull(o.payment_credential_hash)
 FROM clicksync.outputs AS o
 WHERE (o.tx_hash, o.output_index) IN
 (
@@ -55,20 +62,31 @@ WHERE (o.tx_hash, o.output_index) IN
     (
         SELECT arrayJoin(arrayZip(?, ?)) AS ref
     )
-)
-GROUP BY o.tx_hash, o.output_index`
+)`
 	rows, err := d.conn.Query(ctx, query, hashes, indexes)
 	if err != nil {
 		return nil, fmt.Errorf("query active source outputs: %w", err)
 	}
 	defer rows.Close()
-	publicationRefs := make(map[uint64][]publication.OutputRef)
+	publicationOutputs := make(map[uint64]map[publication.OutputRef]publication.ResolvedOutput)
 	var candidateIDs []uint64
 	for rows.Next() {
 		var hash []byte
 		var index uint32
-		var publicationIDs []uint64
-		if err := rows.Scan(&hash, &index, &publicationIDs); err != nil {
+		var publicationID uint64
+		var lovelace uint64
+		var credentialKind string
+		var credentialHashNull bool
+		var credentialHashBytes []byte
+		if err := rows.Scan(
+			&hash,
+			&index,
+			&publicationID,
+			&lovelace,
+			&credentialKind,
+			&credentialHashNull,
+			&credentialHashBytes,
+		); err != nil {
 			return nil, fmt.Errorf("scan active source output: %w", err)
 		}
 		converted, err := hash32(hash)
@@ -76,12 +94,50 @@ GROUP BY o.tx_hash, o.output_index`
 			return nil, err
 		}
 		ref := publication.OutputRef{Hash: converted, Index: index}
-		for _, publicationID := range publicationIDs {
-			if _, first := publicationRefs[publicationID]; !first {
-				candidateIDs = append(candidateIDs, publicationID)
-			}
-			publicationRefs[publicationID] = append(publicationRefs[publicationID], ref)
+		resolved := publication.ResolvedOutput{
+			Lovelace:              lovelace,
+			PaymentCredentialKind: credentialKind,
 		}
+		if credentialHashNull {
+			if credentialKind != "none" {
+				return nil, fmt.Errorf(
+					"active output %x#%d has %q credential without hash",
+					ref.Hash,
+					ref.Index,
+					credentialKind,
+				)
+			}
+		} else {
+			credentialHash, err := hash28(credentialHashBytes)
+			if err != nil {
+				return nil, err
+			}
+			if credentialKind != "key" && credentialKind != "script" {
+				return nil, fmt.Errorf(
+					"active output %x#%d has hash for credential kind %q",
+					ref.Hash,
+					ref.Index,
+					credentialKind,
+				)
+			}
+			resolved.PaymentCredentialHash = &credentialHash
+		}
+		outputs := publicationOutputs[publicationID]
+		if outputs == nil {
+			candidateIDs = append(candidateIDs, publicationID)
+			outputs = make(map[publication.OutputRef]publication.ResolvedOutput)
+			publicationOutputs[publicationID] = outputs
+		}
+		if previous, duplicate := outputs[ref]; duplicate &&
+			!sameResolvedOutput(previous, resolved) {
+			return nil, fmt.Errorf(
+				"publication %d has conflicting output facts for %x#%d",
+				publicationID,
+				ref.Hash,
+				ref.Index,
+			)
+		}
+		outputs[ref] = resolved
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate active source outputs: %w", err)
@@ -97,8 +153,16 @@ GROUP BY o.tx_hash, o.output_index`
 		return nil, err
 	}
 	for _, publicationID := range activeIDs {
-		for _, ref := range publicationRefs[publicationID] {
-			ret[ref] = struct{}{}
+		for ref, resolved := range publicationOutputs[publicationID] {
+			if previous, duplicate := ret[ref]; duplicate &&
+				!sameResolvedOutput(previous, resolved) {
+				return nil, fmt.Errorf(
+					"active publications conflict for output %x#%d",
+					ref.Hash,
+					ref.Index,
+				)
+			}
+			ret[ref] = resolved
 		}
 	}
 	spent, err := d.activeConsumedOutputRefs(ctx, snapshot, refs)
@@ -109,6 +173,17 @@ GROUP BY o.tx_hash, o.output_index`
 		delete(ret, ref)
 	}
 	return ret, nil
+}
+
+func sameResolvedOutput(left, right publication.ResolvedOutput) bool {
+	if left.Lovelace != right.Lovelace ||
+		left.PaymentCredentialKind != right.PaymentCredentialKind {
+		return false
+	}
+	if left.PaymentCredentialHash == nil || right.PaymentCredentialHash == nil {
+		return left.PaymentCredentialHash == nil && right.PaymentCredentialHash == nil
+	}
+	return *left.PaymentCredentialHash == *right.PaymentCredentialHash
 }
 
 func (d *DB) activeConsumedOutputRefs(
@@ -480,9 +555,9 @@ func (d *DB) InsertOutputBatch(
 	const query = `INSERT INTO clicksync.outputs
 (
     publication_id, block_number, tx_hash, tx_order, output_index, body_ordinal,
-    output_kind, address, lovelace, asset_policy_ids, asset_names,
-    asset_quantities, datum_kind, datum_hash, reference_script_hash,
-    reference_script_language
+    output_kind, address, payment_credential_kind, payment_credential_hash,
+    lovelace, asset_policy_ids, asset_names, asset_quantities, datum_kind,
+    datum_hash, reference_script_hash, reference_script_language
 )`
 	batch, err := d.conn.PrepareBatch(ctx, query)
 	if err != nil {
@@ -508,6 +583,8 @@ func (d *DB) InsertOutputBatch(
 					output.BodyOrdinal,
 					output.Kind,
 					append([]byte(nil), output.Address...),
+					output.PaymentCredentialKind,
+					nullableHash28(output.PaymentCredentialHash),
 					output.Lovelace,
 					policies,
 					names,
@@ -1652,6 +1729,19 @@ func hash32(value []byte) (model.Hash32, error) {
 	var hash model.Hash32
 	if len(value) != len(hash) {
 		return hash, fmt.Errorf("ClickHouse returned hash with length %d, want %d", len(value), len(hash))
+	}
+	copy(hash[:], value)
+	return hash, nil
+}
+
+func hash28(value []byte) (model.Hash28, error) {
+	var hash model.Hash28
+	if len(value) != len(hash) {
+		return hash, fmt.Errorf(
+			"ClickHouse returned hash with length %d, want %d",
+			len(value),
+			len(hash),
+		)
 	}
 	copy(hash[:], value)
 	return hash, nil

@@ -267,9 +267,10 @@ func publicationContentContracts(attempt publication.Attempt) ([]contentContract
 			table: "outputs",
 			columns: []string{
 				"publication_id", "block_number", "tx_hash", "tx_order", "output_index",
-				"body_ordinal", "output_kind", "address", "lovelace", "asset_policy_ids",
-				"asset_names", "asset_quantities", "datum_kind", "datum_hash",
-				"reference_script_hash", "reference_script_language",
+				"body_ordinal", "output_kind", "address", "payment_credential_kind",
+				"payment_credential_hash", "lovelace", "asset_policy_ids", "asset_names",
+				"asset_quantities", "datum_kind", "datum_hash", "reference_script_hash",
+				"reference_script_language",
 			},
 		},
 		{
@@ -370,8 +371,9 @@ func publicationContentContracts(attempt publication.Attempt) ([]contentContract
 			contracts[3].rows = append(contracts[3].rows, []any{
 				attempt.PublicationID, attempt.Block.Number, bytesOf32(output.TransactionHash),
 				output.TransactionOrder, output.Index, output.BodyOrdinal, output.Kind,
-				append([]byte(nil), output.Address...), output.Lovelace, outputPolicies,
-				outputNames, outputQuantities, output.DatumKind,
+				append([]byte(nil), output.Address...), output.PaymentCredentialKind,
+				nullableHash28(output.PaymentCredentialHash), output.Lovelace,
+				outputPolicies, outputNames, outputQuantities, output.DatumKind,
 				nullableHash32(output.DatumHash), nullableHash28(output.ReferenceScriptHash),
 				output.ReferenceScriptLanguage,
 			})

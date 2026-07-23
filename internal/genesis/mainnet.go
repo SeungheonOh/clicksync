@@ -166,11 +166,12 @@ func ParseMainnet(byronJSON, shelleyJSON []byte) (Bundle, error) {
 			Phase2Valid: true,
 			FlowKind:    "genesis",
 			Outputs: []model.Output{{
-				TransactionHash: txHash,
-				Kind:            "genesis",
-				Address:         address,
-				Lovelace:        output.OutputAmount,
-				DatumKind:       "none",
+				TransactionHash:       txHash,
+				Kind:                  "genesis",
+				Address:               address,
+				PaymentCredentialKind: "none",
+				Lovelace:              output.OutputAmount,
+				DatumKind:             "none",
 			}},
 		})
 	}
