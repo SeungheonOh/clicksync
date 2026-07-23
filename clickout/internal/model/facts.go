@@ -37,6 +37,7 @@ type SignedAssetQuantity struct {
 type Output struct {
 	Ref                     UTxORef       `json:"ref"`
 	ProducingTx             Hash32        `json:"producing_tx"`
+	BodyOrdinal             uint32        `json:"body_ordinal"`
 	BlockHash               Hash32        `json:"block_hash"`
 	BlockHeight             uint64        `json:"block_height"`
 	Kind                    OutputKind    `json:"kind"`

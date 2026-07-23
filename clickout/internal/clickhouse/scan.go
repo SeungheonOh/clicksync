@@ -26,6 +26,7 @@ func calculateContentHash(data []byte) model.Hash32 {
 type outputValues struct {
 	txHash              []byte
 	outputIndex         uint32
+	bodyOrdinal         uint32
 	blockHash           []byte
 	blockNumber         uint64
 	kind                string
@@ -47,6 +48,7 @@ func scanOutput(row scanner) (model.Output, error) {
 	if err := row.Scan(
 		&values.txHash,
 		&values.outputIndex,
+		&values.bodyOrdinal,
 		&values.blockHash,
 		&values.blockNumber,
 		&values.kind,
@@ -73,6 +75,7 @@ func scanAddressOutput(row scanner) (model.Output, uint64, error) {
 	if err := row.Scan(
 		&values.txHash,
 		&values.outputIndex,
+		&values.bodyOrdinal,
 		&values.blockHash,
 		&values.blockNumber,
 		&values.kind,
@@ -140,6 +143,7 @@ func makeOutput(values outputValues) (model.Output, error) {
 			Index:  values.outputIndex,
 		},
 		ProducingTx:           hash,
+		BodyOrdinal:           values.bodyOrdinal,
 		BlockHash:             block,
 		BlockHeight:           values.blockNumber,
 		Kind:                  model.OutputKind(values.kind),
@@ -373,6 +377,149 @@ func scanSpend(row scanner) (model.Spend, error) {
 		IsConsumed:           consumed,
 		SourceResolved:       sourceResolved,
 	}, nil
+}
+
+type spendOrdering uint8
+
+const (
+	spendByTransaction spendOrdering = iota
+	spendByBlockThenTransaction
+)
+
+func validateSpendRows(spends []model.Spend, ordering spendOrdering) error {
+	ordinals := make(map[string]struct{}, len(spends))
+	for index, spend := range spends {
+		identity := fmt.Sprintf(
+			"%s/%s/%d",
+			spend.ConsumingTx.String(),
+			spend.Role,
+			spend.BodyOrdinal,
+		)
+		if _, duplicate := ordinals[identity]; duplicate {
+			return fmt.Errorf("%w: duplicate input role/body ordinal", ErrConflictingRow)
+		}
+		ordinals[identity] = struct{}{}
+		if index > 0 && compareSpends(spends[index-1], spend, ordering) >= 0 {
+			return fmt.Errorf("%w: input rows are not in deterministic role order", ErrConflictingRow)
+		}
+	}
+	return nil
+}
+
+func validateCompleteSpendRows(spends []model.Spend) error {
+	if err := validateSpendRows(spends, spendByTransaction); err != nil {
+		return err
+	}
+	next := make(map[string]uint32)
+	for _, spend := range spends {
+		key := spend.ConsumingTx.String() + "/" + string(spend.Role)
+		if spend.BodyOrdinal != next[key] {
+			return fmt.Errorf(
+				"%w: non-consecutive %s input body ordinal",
+				ErrConflictingRow,
+				spend.Role,
+			)
+		}
+		next[key]++
+	}
+	return nil
+}
+
+func compareSpends(left, right model.Spend, ordering spendOrdering) int {
+	if ordering == spendByBlockThenTransaction {
+		switch {
+		case left.ConsumingBlockHeight < right.ConsumingBlockHeight:
+			return -1
+		case left.ConsumingBlockHeight > right.ConsumingBlockHeight:
+			return 1
+		}
+	}
+	if compared := bytes.Compare(left.ConsumingTx[:], right.ConsumingTx[:]); compared != 0 {
+		return compared
+	}
+	leftRole := inputRoleRank(left.Role)
+	rightRole := inputRoleRank(right.Role)
+	switch {
+	case leftRole < rightRole:
+		return -1
+	case leftRole > rightRole:
+		return 1
+	case left.BodyOrdinal < right.BodyOrdinal:
+		return -1
+	case left.BodyOrdinal > right.BodyOrdinal:
+		return 1
+	}
+	if compared := bytes.Compare(left.Source.TxHash[:], right.Source.TxHash[:]); compared != 0 {
+		return compared
+	}
+	switch {
+	case left.Source.Index < right.Source.Index:
+		return -1
+	case left.Source.Index > right.Source.Index:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func inputRoleRank(role model.InputRole) uint8 {
+	switch role {
+	case model.InputRegular:
+		return 0
+	case model.InputCollateral:
+		return 1
+	case model.InputReference:
+		return 2
+	default:
+		return 3
+	}
+}
+
+func validateOutputRows(outputs []model.Output) error {
+	ordinals := make(map[string]struct{}, len(outputs))
+	refs := make(map[string]struct{}, len(outputs))
+	for index, output := range outputs {
+		ref := output.Ref.String()
+		if _, duplicate := refs[ref]; duplicate {
+			return fmt.Errorf("%w: duplicate output reference", ErrConflictingRow)
+		}
+		refs[ref] = struct{}{}
+		ordinal := fmt.Sprintf("%s/%d", output.ProducingTx, output.BodyOrdinal)
+		if _, duplicate := ordinals[ordinal]; duplicate {
+			return fmt.Errorf("%w: duplicate output body ordinal", ErrConflictingRow)
+		}
+		ordinals[ordinal] = struct{}{}
+		if index == 0 {
+			continue
+		}
+		previous := outputs[index-1]
+		if compared := bytes.Compare(previous.ProducingTx[:], output.ProducingTx[:]); compared > 0 ||
+			(compared == 0 &&
+				(previous.BodyOrdinal > output.BodyOrdinal ||
+					(previous.BodyOrdinal == output.BodyOrdinal &&
+						previous.Ref.Index >= output.Ref.Index))) {
+			return fmt.Errorf("%w: output rows are not in deterministic ordinal order", ErrConflictingRow)
+		}
+	}
+	return nil
+}
+
+func validateCompleteOutputRows(outputs []model.Output) error {
+	if err := validateOutputRows(outputs); err != nil {
+		return err
+	}
+	next := make(map[string]uint32)
+	for _, output := range outputs {
+		key := output.ProducingTx.String()
+		if output.BodyOrdinal != next[key] {
+			return fmt.Errorf(
+				"%w: non-consecutive output body ordinal",
+				ErrConflictingRow,
+			)
+		}
+		next[key]++
+	}
+	return nil
 }
 
 func decodeSignedAssets(policies, names []string, quantities []int64) ([]model.SignedAssetQuantity, error) {

@@ -96,6 +96,28 @@ func TestTraceAddressSeedCursorPinsSnapshotAndPassesRepositoryKey(t *testing.T) 
 	}
 }
 
+func TestTraceAddressSeedBudgetDoesNotExceedNodeBudget(t *testing.T) {
+	t.Parallel()
+	traceLimits := limits.DefaultTrace()
+	traceLimits.MaxNodes = 3
+	reader := &fakeReader{
+		snapshot: model.Snapshot{
+			Event:           4,
+			CompleteHistory: false,
+			TrustMode:       model.TrustPeerObserved,
+		},
+	}
+	invocation := traceInvocation(ref(1, 0), traceLimits)
+	invocation.Trace.Seed = repository.TraceSeed{}
+	invocation.Trace.Address = "hex:6101"
+	if _, err := New(reader).Execute(context.Background(), invocation); err != nil {
+		t.Fatal(err)
+	}
+	if reader.lastSeedLimit != 3 {
+		t.Fatalf("address seed limit = %d, want node budget 3", reader.lastSeedLimit)
+	}
+}
+
 func TestForwardBFSHandlesConvergenceAndCycle(t *testing.T) {
 	t.Parallel()
 	a := ref(1, 0)
@@ -207,12 +229,9 @@ func TestTraceEdgeCapIsDeterministicAndExplicit(t *testing.T) {
 			model.Snapshot,
 			[]model.UTxORef,
 		) ([]model.FlowHyperedge, error) {
-			// Deliberately return reverse lexical order.
-			return []model.FlowHyperedge{
-				{Transaction: hash(9)},
-				{Transaction: hash(8)},
-			}, nil
+			return []model.FlowHyperedge{{Transaction: hash(8)}}, nil
 		},
+		forwardTruncated: true,
 	}
 	result, err := New(reader).Execute(context.Background(), traceInvocation(a, traceLimits))
 	if err != nil {
@@ -227,6 +246,48 @@ func TestTraceEdgeCapIsDeterministicAndExplicit(t *testing.T) {
 		response.Truncation.ContinuationFrontier[0] != a ||
 		response.Truncation.ContinuationFrontier[1] != b {
 		t.Fatalf("unexpected edge-cap response: %#v", response)
+	}
+	if len(reader.expansionBudgets) != 1 ||
+		reader.expansionBudgets[0].MaxEdges != 1 {
+		t.Fatalf("repository did not receive one-edge budget: %#v", reader.expansionBudgets)
+	}
+}
+
+func TestTraceMultiBatchPassesRemainingBudgetsAndExclusions(t *testing.T) {
+	t.Parallel()
+	a := ref(1, 0)
+	b := ref(2, 0)
+	traceLimits := limits.DefaultTrace()
+	traceLimits.MaxDepth = 1
+	traceLimits.MaxEdges = 3
+	traceLimits.FrontierBatch = 1
+	reader := &fakeReader{
+		snapshot: model.Snapshot{
+			Event:           5,
+			CompleteHistory: false,
+			TrustMode:       model.TrustPeerObserved,
+		},
+		seeds: repository.TraceSeedResult{UTxOs: []model.UTxORef{a, b}},
+		expandForward: func(
+			_ context.Context,
+			_ model.Snapshot,
+			frontier []model.UTxORef,
+		) ([]model.FlowHyperedge, error) {
+			return []model.FlowHyperedge{{Transaction: hash(frontier[0].TxHash[0] + 10)}}, nil
+		},
+	}
+	if _, err := New(reader).Execute(
+		context.Background(),
+		traceInvocation(a, traceLimits),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if len(reader.expansionBudgets) != 2 ||
+		reader.expansionBudgets[0].MaxEdges != 3 ||
+		len(reader.expansionBudgets[0].ExcludeTransactions) != 0 ||
+		reader.expansionBudgets[1].MaxEdges != 2 ||
+		len(reader.expansionBudgets[1].ExcludeTransactions) != 1 {
+		t.Fatalf("remaining budgets/exclusions = %#v", reader.expansionBudgets)
 	}
 }
 
@@ -339,14 +400,17 @@ type addressCall struct {
 }
 
 type fakeReader struct {
-	snapshot       model.Snapshot
-	snapshotCalls  int
-	lastAt         model.AtPoint
-	lastAddress    addressCall
-	seeds          repository.TraceSeedResult
-	lastTraceQuery repository.TraceQuery
-	expandForward  func(context.Context, model.Snapshot, []model.UTxORef) ([]model.FlowHyperedge, error)
-	expandReverse  func(context.Context, model.Snapshot, []model.UTxORef) ([]model.FlowHyperedge, error)
+	snapshot         model.Snapshot
+	snapshotCalls    int
+	lastAt           model.AtPoint
+	lastAddress      addressCall
+	seeds            repository.TraceSeedResult
+	lastTraceQuery   repository.TraceQuery
+	lastSeedLimit    uint32
+	expansionBudgets []repository.ExpansionBudget
+	forwardTruncated bool
+	expandForward    func(context.Context, model.Snapshot, []model.UTxORef) ([]model.FlowHyperedge, error)
+	expandReverse    func(context.Context, model.Snapshot, []model.UTxORef) ([]model.FlowHyperedge, error)
 }
 
 func (reader *fakeReader) Snapshot(_ context.Context, at model.AtPoint) (model.Snapshot, error) {
@@ -416,9 +480,10 @@ func (reader *fakeReader) TraceSeeds(
 	_ context.Context,
 	_ model.Snapshot,
 	query repository.TraceQuery,
-	_ uint32,
+	limit uint32,
 ) (repository.TraceSeedResult, []model.PartialHistoryBoundary, error) {
 	reader.lastTraceQuery = query
+	reader.lastSeedLimit = limit
 	return reader.seeds, nil, nil
 }
 
@@ -427,9 +492,14 @@ func (reader *fakeReader) ExpandForward(
 	snapshot model.Snapshot,
 	frontier []model.UTxORef,
 	_ model.AssetSelector,
-) ([]model.FlowHyperedge, []model.PartialHistoryBoundary, error) {
+	budget repository.ExpansionBudget,
+) (repository.ExpansionResult, []model.PartialHistoryBoundary, error) {
+	reader.expansionBudgets = append(reader.expansionBudgets, budget)
 	edges, err := reader.expandForward(ctx, snapshot, frontier)
-	return edges, nil, err
+	return repository.ExpansionResult{
+		Hyperedges: edges,
+		Truncated:  reader.forwardTruncated,
+	}, nil, err
 }
 
 func (reader *fakeReader) ExpandReverse(
@@ -437,10 +507,12 @@ func (reader *fakeReader) ExpandReverse(
 	snapshot model.Snapshot,
 	frontier []model.UTxORef,
 	_ model.AssetSelector,
-) ([]model.FlowHyperedge, []model.PartialHistoryBoundary, error) {
+	budget repository.ExpansionBudget,
+) (repository.ExpansionResult, []model.PartialHistoryBoundary, error) {
+	reader.expansionBudgets = append(reader.expansionBudgets, budget)
 	if reader.expandReverse == nil {
-		return nil, nil, nil
+		return repository.ExpansionResult{}, nil, nil
 	}
 	edges, err := reader.expandReverse(ctx, snapshot, frontier)
-	return edges, nil, err
+	return repository.ExpansionResult{Hyperedges: edges}, nil, err
 }

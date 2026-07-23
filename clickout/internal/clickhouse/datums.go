@@ -41,11 +41,15 @@ FROM datum_bodies
 WHERE ` + predicate + `
 GROUP BY datum_hash
 ORDER BY datum_hash`
-	queryCtx, finish := store.instrument(ctx, "inline_datums_batch")
+	queryCtx, finish := store.instrumentPhase(
+		ctx,
+		"inline_datums_batch",
+		hydrationPhaseLimits(uint64(len(hashes))),
+	)
 	defer finish()
 	rows, err := store.conn.Query(queryCtx, sql, values...)
 	if err != nil {
-		return err
+		return mapQueryError("inline_datums_batch", err)
 	}
 	defer rows.Close()
 	bodies := make(map[string]model.Bytes, len(hashes))
@@ -54,7 +58,7 @@ ORDER BY datum_hash`
 		var length uint32
 		var variants uint64
 		if err := rows.Scan(&rawHash, &body, &length, &contentHash, &variants); err != nil {
-			return err
+			return mapQueryError("inline_datums_batch", err)
 		}
 		hash, err := model.Hash32FromBytes(rawHash)
 		if err != nil {
@@ -74,7 +78,7 @@ ORDER BY datum_hash`
 		bodies[hash.String()] = verified
 	}
 	if err := rows.Err(); err != nil {
-		return err
+		return mapQueryError("inline_datums_batch", err)
 	}
 	for index := range outputs {
 		if outputs[index].DatumKind != "inline" || outputs[index].DatumHash == nil {

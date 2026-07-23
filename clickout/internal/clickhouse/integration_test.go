@@ -104,23 +104,27 @@ func TestContractReadsRollbackAndTrace(t *testing.T) {
 	if err != nil || len(withdrawals) != 1 || !withdrawals[0].Applied {
 		t.Fatalf("unexpected withdrawals: %#v, %v", withdrawals, err)
 	}
-	forward, boundaries, err := store.ExpandForward(
+	forwardResult, boundaries, err := store.ExpandForward(
 		ctx,
 		snapshot,
 		[]model.UTxORef{fixture.source},
 		model.AssetSelector{ADA: true},
+		repository.ExpansionBudget{MaxEdges: 100, MaxNodes: 1000},
 	)
+	forward := forwardResult.Hyperedges
 	if err != nil || len(boundaries) != 0 || len(forward) != 1 ||
 		forward[0].Transaction != fixture.txB || len(forward[0].ProducedOutputs) != 2 ||
 		len(forward[0].AppliedWithdrawals) != 1 || forward[0].FeeSink == nil {
 		t.Fatalf("unexpected forward edge: %#v, %#v, %v", forward, boundaries, err)
 	}
-	reverse, boundaries, err := store.ExpandReverse(
+	reverseResult, boundaries, err := store.ExpandReverse(
 		ctx,
 		snapshot,
 		[]model.UTxORef{fixture.destination},
 		model.AssetSelector{ADA: true},
+		repository.ExpansionBudget{MaxEdges: 100, MaxNodes: 1000},
 	)
+	reverse := reverseResult.Hyperedges
 	if err != nil || len(boundaries) != 0 || len(reverse) != 1 ||
 		len(reverse[0].ConsumedInputValues) != 1 ||
 		reverse[0].ConsumedInputValues[0].Ref != fixture.source {
@@ -132,12 +136,14 @@ func TestContractReadsRollbackAndTrace(t *testing.T) {
 		!invalidTx.Inputs[1].IsConsumed || !invalidTx.Inputs[1].SourceResolved {
 		t.Fatalf("invalid transaction semantics wrong: %#v, %v", invalidTx, err)
 	}
-	invalidEdges, _, err := store.ExpandForward(
+	invalidResult, _, err := store.ExpandForward(
 		ctx,
 		snapshot,
 		[]model.UTxORef{fixture.collateral},
 		model.AssetSelector{ADA: true},
+		repository.ExpansionBudget{MaxEdges: 100, MaxNodes: 1000},
 	)
+	invalidEdges := invalidResult.Hyperedges
 	if err != nil || len(invalidEdges) != 1 || len(invalidEdges[0].MintDeltas) != 0 ||
 		len(invalidEdges[0].AppliedWithdrawals) != 0 ||
 		invalidEdges[0].FeeSink == nil || invalidEdges[0].FeeSink.Lovelace != 300000 ||
@@ -630,7 +636,7 @@ func (fixture fixture) insert(t *testing.T, store *Store) {
          body_ordinal,role,is_consumed,source_is_resolved)
         VALUES
         (101,1,?,1,?,0,0,'regular',false,false),
-        (101,1,?,1,?,1,1,'collateral',true,false)`,
+        (101,1,?,1,?,1,0,'collateral',true,false)`,
 		hashArgument(fixture.txC), hashArgument(fixture.txA),
 		hashArgument(fixture.txC), hashArgument(fixture.txA))
 	exec(`INSERT INTO outputs

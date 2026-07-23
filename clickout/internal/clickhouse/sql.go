@@ -243,6 +243,7 @@ WITH
 const outputColumns = `
     o.tx_hash,
     o.output_index,
+    o.body_ordinal,
     b.block_hash,
     o.block_number,
     o.output_kind,
@@ -293,7 +294,14 @@ FROM fact_candidates AS i
 INNER JOIN active_candidate_publications AS ap
     ON i.publication_id = ap.publication_id
 INNER JOIN candidate_blocks AS b ON i.publication_id = b.publication_id
-ORDER BY i.block_number, i.tx_hash, i.body_ordinal
+ORDER BY
+    i.block_number,
+    i.tx_hash,
+    multiIf(i.role = 'regular', 0, i.role = 'collateral', 1, i.role = 'reference', 2, 3),
+    i.body_ordinal,
+    i.source_tx_hash,
+    i.source_output_index,
+    i.publication_id
 LIMIT 10001`)
 
 var spendByRefSQL = targetedFactSQL(`
@@ -359,7 +367,13 @@ FROM fact_candidates AS i
 INNER JOIN active_candidate_publications AS ap
     ON i.publication_id = ap.publication_id
 INNER JOIN candidate_blocks AS b ON i.publication_id = b.publication_id
-ORDER BY i.body_ordinal`)
+ORDER BY
+    i.tx_hash,
+    multiIf(i.role = 'regular', 0, i.role = 'collateral', 1, i.role = 'reference', 2, 3),
+    i.body_ordinal,
+    i.source_tx_hash,
+    i.source_output_index,
+    i.publication_id`)
 
 var outputsByTxSQL = targetedFactSQL(`
         SELECT *
@@ -372,7 +386,7 @@ FROM fact_candidates AS o
 INNER JOIN active_candidate_publications AS ap
     ON o.publication_id = ap.publication_id
 INNER JOIN candidate_blocks AS b ON o.publication_id = b.publication_id
-ORDER BY o.body_ordinal, o.output_index`)
+ORDER BY o.tx_hash, o.body_ordinal, o.output_index, o.publication_id`)
 
 const datumBodySQL = `
 SELECT

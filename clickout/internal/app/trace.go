@@ -44,6 +44,10 @@ func (engine *Engine) trace(
 	if err != nil {
 		return nil, err
 	}
+	seedLimit := limits.DefaultAddressPage
+	if len(seed.Address) > 0 && invocation.Trace.Limits.MaxNodes < seedLimit {
+		seedLimit = invocation.Trace.Limits.MaxNodes
+	}
 	seedResult, boundaries, err := engine.reader.TraceSeeds(
 		ctx,
 		snapshot,
@@ -53,7 +57,7 @@ func (engine *Engine) trace(
 			SeedLastKey: seedLastKey,
 			Asset:       invocation.Trace.Asset,
 		},
-		limits.DefaultAddressPage,
+		seedLimit,
 	)
 	if err != nil {
 		return nil, err
@@ -99,29 +103,59 @@ func (engine *Engine) trace(
 		next := make([]model.UTxORef, 0)
 		layerTimedOut := false
 		layerTruncated := false
-		for offset := 0; offset < len(frontier); offset += int(invocation.Trace.Limits.FrontierBatch) {
-			end := offset + int(invocation.Trace.Limits.FrontierBatch)
+		for offset := 0; offset < len(frontier); {
+			remainingEdges := invocation.Trace.Limits.MaxEdges - uint32(len(seenEdges))
+			if remainingEdges == 0 {
+				response.Truncation.Truncated = true
+				response.Truncation.Reason = "max_edges"
+				response.Truncation.ContinuationFrontier = append(
+					response.Truncation.ContinuationFrontier,
+					frontier[offset:]...,
+				)
+				layerTruncated = true
+				break
+			}
+			batchSize := invocation.Trace.Limits.FrontierBatch
+			if batchSize > remainingEdges {
+				batchSize = remainingEdges
+			}
+			remainingNodes := invocation.Trace.Limits.MaxNodes - uint32(len(visited))
+			if remainingNodes > 0 && batchSize > remainingNodes {
+				batchSize = remainingNodes
+			}
+			if batchSize == 0 {
+				batchSize = 1
+			}
+			batchStart := offset
+			end := offset + int(batchSize)
 			if end > len(frontier) {
 				end = len(frontier)
 			}
 			var (
-				edges      []model.FlowHyperedge
+				expansion  repository.ExpansionResult
 				unresolved []model.PartialHistoryBoundary
 				err        error
 			)
+			budget := repository.ExpansionBudget{
+				MaxEdges:            remainingEdges,
+				MaxNodes:            max(remainingNodes, 1),
+				ExcludeTransactions: sortedEdgeHashes(seenEdges),
+			}
 			if invocation.Trace.Direction == repository.Forward {
-				edges, unresolved, err = engine.reader.ExpandForward(
+				expansion, unresolved, err = engine.reader.ExpandForward(
 					layerCtx,
 					snapshot,
 					frontier[offset:end],
 					invocation.Trace.Asset,
+					budget,
 				)
 			} else {
-				edges, unresolved, err = engine.reader.ExpandReverse(
+				expansion, unresolved, err = engine.reader.ExpandReverse(
 					layerCtx,
 					snapshot,
 					frontier[offset:end],
 					invocation.Trace.Asset,
+					budget,
 				)
 			}
 			response.UnresolvedPartialHistory = append(
@@ -146,24 +180,20 @@ func (engine *Engine) trace(
 				cancel()
 				return nil, err
 			}
-			sort.Slice(edges, func(left, right int) bool {
-				return edges[left].Transaction.String() < edges[right].Transaction.String()
-			})
-			for _, edge := range edges {
-				if _, exists := seenEdges[edge.Transaction.String()]; !exists {
-					if uint32(len(seenEdges)) >= invocation.Trace.Limits.MaxEdges {
-						response.Truncation.Truncated = true
-						response.Truncation.Reason = "max_edges"
-						response.Truncation.ContinuationFrontier = append(
-							response.Truncation.ContinuationFrontier,
-							frontier[offset:]...,
-						)
-						layerTruncated = true
-						break
-					}
-					seenEdges[edge.Transaction.String()] = struct{}{}
-					response.Data.Hyperedges = append(response.Data.Hyperedges, edge)
+			if len(expansion.Hyperedges) > int(remainingEdges) {
+				cancel()
+				return nil, errors.New("repository exceeded trace expansion edge budget")
+			}
+			for index, edge := range expansion.Hyperedges {
+				key := edge.Transaction.String()
+				if _, exists := seenEdges[key]; exists ||
+					(index > 0 &&
+						expansion.Hyperedges[index-1].Transaction.String() >= key) {
+					cancel()
+					return nil, errors.New("repository returned duplicate or unordered hyperedges")
 				}
+				seenEdges[key] = struct{}{}
+				response.Data.Hyperedges = append(response.Data.Hyperedges, edge)
 				if invocation.Trace.Direction == repository.Forward {
 					for _, output := range edge.ProducedOutputs {
 						if assetMatches(output, invocation.Trace.Asset) {
@@ -178,7 +208,15 @@ func (engine *Engine) trace(
 					}
 				}
 			}
-			if layerTruncated {
+			offset = end
+			if expansion.Truncated {
+				response.Truncation.Truncated = true
+				response.Truncation.Reason = "max_edges"
+				response.Truncation.ContinuationFrontier = append(
+					response.Truncation.ContinuationFrontier,
+					frontier[batchStart:]...,
+				)
+				layerTruncated = true
 				break
 			}
 		}
@@ -232,6 +270,23 @@ func (engine *Engine) trace(
 	response.Data.Visited = uint32(len(visited))
 	response.QueryMetrics = collector.Snapshot()
 	return response, nil
+}
+
+func sortedEdgeHashes(seen map[string]struct{}) []model.Hash32 {
+	keys := make([]string, 0, len(seen))
+	for key := range seen {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	result := make([]model.Hash32, 0, len(keys))
+	for _, key := range keys {
+		hash, err := model.ParseHash32(key)
+		if err != nil {
+			panic("invalid internal transaction hash: " + key)
+		}
+		result = append(result, hash)
+	}
+	return result
 }
 
 func uniqueSorted(values []model.UTxORef) []model.UTxORef {

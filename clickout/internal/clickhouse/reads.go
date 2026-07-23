@@ -137,6 +137,9 @@ func (store *Store) usesByRef(
 	if err := rows.Err(); err != nil {
 		return nil, false, err
 	}
+	if err := validateSpendRows(result, spendByBlockThenTransaction); err != nil {
+		return nil, false, err
+	}
 	truncated := len(result) > 10_000
 	if truncated {
 		result = result[:10_000]
@@ -347,7 +350,13 @@ func (store *Store) inputsByTx(
 		}
 		inputs = append(inputs, input)
 	}
-	return inputs, boundaries, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	if err := validateCompleteSpendRows(inputs); err != nil {
+		return nil, nil, err
+	}
+	return inputs, boundaries, nil
 }
 
 func (store *Store) outputsByTx(
@@ -371,6 +380,9 @@ func (store *Store) outputsByTx(
 		outputs = append(outputs, output)
 	}
 	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := validateCompleteOutputRows(outputs); err != nil {
 		return nil, err
 	}
 	if err := store.hydrateInlineDatums(ctx, outputs); err != nil {

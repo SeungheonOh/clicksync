@@ -13,20 +13,21 @@ type aliasingOutputScanner struct {
 func (row *aliasingOutputScanner) Scan(dest ...any) error {
 	*(dest[0].(*[]byte)) = row.tx
 	*(dest[1].(*uint32)) = 0
-	*(dest[2].(*[]byte)) = row.block
-	*(dest[3].(*uint64)) = 1
-	*(dest[4].(*string)) = "regular"
-	*(dest[5].(*[]byte)) = row.address
-	*(dest[6].(*string)) = "none"
-	*(dest[7].(**string)) = nil
-	*(dest[8].(*uint64)) = 1
-	*(dest[9].(*[]string)) = []string{}
+	*(dest[2].(*uint32)) = 0
+	*(dest[3].(*[]byte)) = row.block
+	*(dest[4].(*uint64)) = 1
+	*(dest[5].(*string)) = "regular"
+	*(dest[6].(*[]byte)) = row.address
+	*(dest[7].(*string)) = "none"
+	*(dest[8].(**string)) = nil
+	*(dest[9].(*uint64)) = 1
 	*(dest[10].(*[]string)) = []string{}
-	*(dest[11].(*[]uint64)) = []uint64{}
-	*(dest[12].(*string)) = "none"
-	*(dest[13].(**string)) = nil
+	*(dest[11].(*[]string)) = []string{}
+	*(dest[12].(*[]uint64)) = []uint64{}
+	*(dest[13].(*string)) = "none"
 	*(dest[14].(**string)) = nil
 	*(dest[15].(**string)) = nil
+	*(dest[16].(**string)) = nil
 	return nil
 }
 

@@ -39,6 +39,17 @@ type TraceSeedResult struct {
 	ContinuationCursor string
 }
 
+type ExpansionBudget struct {
+	MaxEdges            uint32
+	MaxNodes            uint32
+	ExcludeTransactions []model.Hash32
+}
+
+type ExpansionResult struct {
+	Hyperedges []model.FlowHyperedge
+	Truncated  bool
+}
+
 // Reader is the complete Clickout/Clicksync boundary. Implementations consume
 // only the documented ClickHouse schema and always receive the one immutable
 // snapshot captured for the enclosing request.
@@ -53,6 +64,6 @@ type Reader interface {
 	Withdrawals(context.Context, model.Snapshot, model.Hash32) ([]model.Withdrawal, error)
 
 	TraceSeeds(context.Context, model.Snapshot, TraceQuery, uint32) (TraceSeedResult, []model.PartialHistoryBoundary, error)
-	ExpandForward(context.Context, model.Snapshot, []model.UTxORef, model.AssetSelector) ([]model.FlowHyperedge, []model.PartialHistoryBoundary, error)
-	ExpandReverse(context.Context, model.Snapshot, []model.UTxORef, model.AssetSelector) ([]model.FlowHyperedge, []model.PartialHistoryBoundary, error)
+	ExpandForward(context.Context, model.Snapshot, []model.UTxORef, model.AssetSelector, ExpansionBudget) (ExpansionResult, []model.PartialHistoryBoundary, error)
+	ExpandReverse(context.Context, model.Snapshot, []model.UTxORef, model.AssetSelector, ExpansionBudget) (ExpansionResult, []model.PartialHistoryBoundary, error)
 }
