@@ -123,12 +123,23 @@ type BatchResult struct {
 }
 
 type ManifestUpdate struct {
-	EventSeq    uint64
-	Tip         Point
-	WriterID    [16]byte
-	WriterBuild string
-	UpdatedAt   time.Time
+	EventSeq        uint64
+	Tip             Point
+	Kind            ManifestUpdateKind
+	RemoteAdoptions uint64
+	WriterID        [16]byte
+	WriterBuild     string
+	UpdatedAt       time.Time
 }
+
+type ManifestUpdateKind string
+
+const (
+	ManifestAdoption  ManifestUpdateKind = "adoption"
+	ManifestRollback  ManifestUpdateKind = "rollback"
+	ManifestGenesis   ManifestUpdateKind = "genesis"
+	ManifestReconcile ManifestUpdateKind = "reconcile"
+)
 
 type Descendant struct {
 	PublicationID uint64
@@ -190,7 +201,7 @@ type Backend interface {
 	InsertRollbackHeader(context.Context, RollbackCommit) error
 	RollbackCommitted(context.Context, RollbackCommit) (bool, error)
 
-	PersistManifest(context.Context, ManifestUpdate) error
+	PersistManifest(context.Context, Lock, ManifestUpdate) error
 }
 
 // BatchBackend is the table-oriented physical insert surface. One method call
@@ -539,11 +550,15 @@ func (coordinator *Coordinator) PublishBatch(
 			return BatchResult{}, fmt.Errorf("commit adoption batch: %w", insertErr)
 		}
 	}
+	lastCommitted := pointFromBlock(attempts[len(attempts)-1].Block)
+	if attempts[len(attempts)-1].Block.Synthetic {
+		lastCommitted = Point{Origin: true}
+	}
 	result := BatchResult{
 		PublicationIDs: append([]uint64(nil), publicationIDs...),
 		FirstEventSeq:  firstEvent,
 		LastEventSeq:   lastEvent,
-		LastCommitted:  pointFromBlock(attempts[len(attempts)-1].Block),
+		LastCommitted:  lastCommitted,
 	}
 	if err := coordinator.inject(AfterAdoption); err != nil {
 		return result, &CommittedError{
@@ -560,12 +575,24 @@ func (coordinator *Coordinator) PublishBatch(
 		}
 	}
 	last := attempts[len(attempts)-1]
-	if err := coordinator.backend.PersistManifest(ctx, ManifestUpdate{
-		EventSeq:    lastEvent,
-		Tip:         pointFromBlock(last.Block),
-		WriterID:    coordinator.config.WriterID,
-		WriterBuild: coordinator.config.WriterBuild,
-		UpdatedAt:   coordinator.config.Now().UTC(),
+	var remoteAdoptions uint64
+	for _, attempt := range attempts {
+		if !attempt.Block.Synthetic {
+			remoteAdoptions++
+		}
+	}
+	updateKind := ManifestAdoption
+	if remoteAdoptions == 0 {
+		updateKind = ManifestGenesis
+	}
+	if err := coordinator.backend.PersistManifest(ctx, coordinator.lock, ManifestUpdate{
+		EventSeq:        lastEvent,
+		Tip:             lastCommitted,
+		Kind:            updateKind,
+		RemoteAdoptions: remoteAdoptions,
+		WriterID:        coordinator.config.WriterID,
+		WriterBuild:     coordinator.config.WriterBuild,
+		UpdatedAt:       coordinator.config.Now().UTC(),
 	}); err != nil {
 		return result, &CommittedError{
 			PublicationID: last.PublicationID,
@@ -706,11 +733,12 @@ func (coordinator *Coordinator) Rollback(ctx context.Context, request RollbackRe
 	update := ManifestUpdate{
 		EventSeq:    eventSeq,
 		Tip:         request.To,
+		Kind:        ManifestRollback,
 		WriterID:    coordinator.config.WriterID,
 		WriterBuild: coordinator.config.WriterBuild,
 		UpdatedAt:   coordinator.config.Now().UTC(),
 	}
-	if err := coordinator.backend.PersistManifest(ctx, update); err != nil {
+	if err := coordinator.backend.PersistManifest(ctx, coordinator.lock, update); err != nil {
 		return &CommittedError{
 			EventSeq: eventSeq,
 			Err:      fmt.Errorf("persist post-rollback manifest: %w", err),

@@ -209,7 +209,7 @@ func (backend *fakeBackend) RollbackCommitted(context.Context, RollbackCommit) (
 	backend.call("rollback_status")
 	return backend.rollbackStatus, backend.rollbackStatusError
 }
-func (backend *fakeBackend) PersistManifest(_ context.Context, update ManifestUpdate) error {
+func (backend *fakeBackend) PersistManifest(_ context.Context, _ Lock, update ManifestUpdate) error {
 	backend.call("manifest")
 	backend.manifestUpdates = append(backend.manifestUpdates, update)
 	return nil
@@ -878,7 +878,7 @@ func TestLostAdoptionResponseAndPostCommitFaultAreTyped(t *testing.T) {
 		t.Fatalf("post-commit fault = %T %v, want CommittedError", err, err)
 	}
 	if len(backend.manifestUpdates) != 0 {
-		t.Fatal("post-adoption crash unexpectedly persisted the manifest cache")
+		t.Fatal("post-adoption crash unexpectedly advanced authoritative manifest state")
 	}
 }
 

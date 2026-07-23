@@ -6,13 +6,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"math"
 	"time"
 
 	"github.com/google/uuid"
 
 	"clicksync/internal/model"
 	"clicksync/internal/publication"
+	"clicksync/migrations"
 )
 
 type ManifestSeed struct {
@@ -40,6 +40,7 @@ type OriginGenesisProof struct {
 
 type ManifestIdentity struct {
 	DatasetID              [16]byte
+	SchemaContractHash     model.Hash32
 	NetworkMagic           uint32
 	NetworkName            string
 	ByronGenesisID         model.Hash32
@@ -120,8 +121,18 @@ func mustManifestHash(encoded string) model.Hash32 {
 
 func (d *DB) InitializeManifest(
 	ctx context.Context,
+	lock LockAssertion,
 	seed ManifestSeed,
 ) error {
+	if lock == nil {
+		return errors.New("manifest initialization requires the real writer flock")
+	}
+	d.manifestMu.Lock()
+	defer d.manifestMu.Unlock()
+
+	if err := lock.AssertHeld(); err != nil {
+		return fmt.Errorf("manifest initialization flock is not held: %w", err)
+	}
 	if seed.DatasetID == ([16]byte{}) || seed.WriterID == ([16]byte{}) {
 		return errors.New("manifest dataset and writer IDs must be non-zero")
 	}
@@ -131,87 +142,66 @@ func (d *DB) InitializeManifest(
 	if err := validatePinnedMainnet(seed); err != nil {
 		return err
 	}
-	var rows uint64
-	if err := d.conn.QueryRow(ctx, `SELECT count() FROM clicksync.dataset_manifest`).Scan(&rows); err != nil {
-		return fmt.Errorf("count manifest rows: %w", err)
+	_, found, err := d.loadLatestManifestRecord(ctx)
+	if err != nil {
+		return err
 	}
-	if rows != 0 {
+	if found {
 		return d.validateManifestIdentity(ctx, seed)
 	}
 	createdAt := seed.CreatedAt.UTC()
 	if createdAt.IsZero() {
 		createdAt = time.Now().UTC()
 	}
-	startKind := "intersection"
-	var startSlot, startHash, startBlockNumber any
-	startIsByronEBB := false
+	trustStatus := "unavailable"
+	trustBasis := "partial_boundary"
+	servable := false
+	trustReason := "partial-history boundary awaits persisted bootstrap agreement"
 	if seed.Start.Origin {
-		startKind = "origin"
-	} else {
-		startSlot = seed.Start.Slot
-		startHash = bytesOf32(seed.Start.Hash)
-		startBlockNumber = seed.Start.BlockNumber
-		startIsByronEBB = seed.Start.IsByronEBB
+		trustBasis = "official_genesis"
+		trustReason = "official genesis has not been seeded and verified"
 	}
-	const query = `INSERT INTO clicksync.dataset_manifest
-(
-    manifest_key, revision, dataset_id, network_magic, network_name,
-    byron_genesis_id, byron_genesis_json_hash, shelley_genesis_id,
-    shelley_genesis_json_hash, start_kind, start_slot,
-    start_hash, start_block_number, start_is_byron_ebb,
-    genesis_seeded, complete_history, trust_mode,
-    committed_event_seq, committed_tip_origin, committed_tip_slot,
-    committed_tip_hash, committed_tip_block_number, committed_tip_is_byron_ebb,
-    writer_id, writer_build,
-    source_build, created_at, updated_at
-)`
-	batch, err := d.conn.PrepareBatch(ctx, query)
-	if err != nil {
-		return fmt.Errorf("prepare initial manifest: %w", err)
+	writerID := seed.WriterID
+	initial := manifestRecord{
+		ManifestKey:            manifestKey,
+		Revision:               1,
+		TransitionKind:         "initialize",
+		DatasetID:              seed.DatasetID,
+		SchemaContractHash:     migrations.ContractHash,
+		NetworkMagic:           seed.NetworkMagic,
+		NetworkName:            seed.NetworkName,
+		ByronGenesisID:         seed.ByronGenesisID,
+		ByronGenesisJSONHash:   seed.ByronGenesisJSONHash,
+		ShelleyGenesisID:       seed.ShelleyGenesisID,
+		ShelleyGenesisJSONHash: seed.ShelleyGenesisJSONHash,
+		Start:                  seed.Start,
+		TrustMode:              "peer_observed_structurally_verified",
+		TrustStatus:            trustStatus,
+		TrustBasis:             trustBasis,
+		CheckpointInterval:     manifestCheckpointBlocks,
+		TrustReason:            trustReason,
+		ServableFloor:          manifestHead{Point: seed.Start},
+		ServableFloorPermanent: false,
+		Physical:               manifestHead{Point: seed.Start},
+		Effective:              manifestHead{Point: seed.Start},
+		Servable:               servable,
+		VisibilityGeneration:   1,
+		WriterID:               &writerID,
+		WriterBuild:            seed.WriterBuild,
+		SourceBuild:            seed.SourceBuild,
+		CreatedAt:              createdAt,
+		UpdatedAt:              createdAt,
 	}
-	if err := batch.Append(
-		uint8(1),
-		uint64(1),
-		uuid.UUID(seed.DatasetID),
-		seed.NetworkMagic,
-		seed.NetworkName,
-		bytesOf32(seed.ByronGenesisID),
-		bytesOf32(seed.ByronGenesisJSONHash),
-		bytesOf32(seed.ShelleyGenesisID),
-		bytesOf32(seed.ShelleyGenesisJSONHash),
-		startKind,
-		startSlot,
-		startHash,
-		startBlockNumber,
-		startIsByronEBB,
-		false,
-		false,
-		"peer_observed_structurally_verified",
-		uint64(0),
-		seed.Start.Origin,
-		startSlot,
-		startHash,
-		startBlockNumber,
-		startIsByronEBB,
-		uuid.UUID(seed.WriterID),
-		seed.WriterBuild,
-		seed.SourceBuild,
-		createdAt,
-		createdAt,
-	); err != nil {
-		_ = batch.Abort()
-		return fmt.Errorf("append initial manifest: %w", err)
+	if err := lock.AssertHeld(); err != nil {
+		return fmt.Errorf("manifest initialization flock was lost before append: %w", err)
 	}
-	if err := batch.Send(); err != nil {
-		return fmt.Errorf("insert initial manifest: %w", err)
-	}
-	return nil
+	return d.appendManifestRecord(ctx, initial)
 }
 
 // LoadOrCreateManifest is the startup contract for the sole writer. It
 // generates dataset_id only while the held flock proves the manifest is truly
-// empty, reuses the stored identity on restart, and reconciles the cache from
-// authoritative adoption/rollback headers before returning.
+// empty, reuses the stored identity on restart, and repairs conservative
+// physical-head lag from raw adoption/rollback markers before returning.
 func (d *DB) LoadOrCreateManifest(
 	ctx context.Context,
 	lock LockAssertion,
@@ -252,7 +242,7 @@ func (d *DB) LoadOrCreateManifest(
 		if err := lock.AssertHeld(); err != nil {
 			return ManifestIdentity{}, fmt.Errorf("manifest creation flock was lost: %w", err)
 		}
-		if err := d.InitializeManifest(ctx, seed); err != nil {
+		if err := d.InitializeManifest(ctx, lock, seed); err != nil {
 			return ManifestIdentity{}, err
 		}
 	} else {
@@ -277,6 +267,7 @@ func (d *DB) LoadOrCreateManifest(
 	}
 	if err := d.ReconcileManifest(
 		ctx,
+		lock,
 		seed.WriterID,
 		seed.WriterBuild,
 		reconciledAt,
@@ -294,53 +285,22 @@ func configuredStartMatchesStored(configured, stored publication.Point) bool {
 }
 
 func (d *DB) validateManifestIdentity(ctx context.Context, seed ManifestSeed) error {
-	const query = `
-SELECT
-    dataset_id, network_magic, network_name, byron_genesis_id,
-    byron_genesis_json_hash, shelley_genesis_id, shelley_genesis_json_hash,
-    start_kind, start_slot, start_hash, start_block_number, start_is_byron_ebb
-FROM clicksync.dataset_manifest
-ORDER BY revision DESC
-LIMIT 1`
-	var dataset uuid.UUID
-	var magic uint32
-	var network string
-	var byronID, byronJSON, shelleyID, shelleyJSON []byte
-	var startKind string
-	var startSlot, startNumber *uint64
-	var startHash []byte
-	var startIsByronEBB bool
-	if err := d.conn.QueryRow(ctx, query).Scan(
-		&dataset,
-		&magic,
-		&network,
-		&byronID,
-		&byronJSON,
-		&shelleyID,
-		&shelleyJSON,
-		&startKind,
-		&startSlot,
-		&startHash,
-		&startNumber,
-		&startIsByronEBB,
-	); err != nil {
-		return fmt.Errorf("read manifest identity: %w", err)
+	record, found, err := d.loadLatestManifestRecord(ctx)
+	if err != nil {
+		return err
 	}
-	if dataset != uuid.UUID(seed.DatasetID) ||
-		magic != seed.NetworkMagic ||
-		network != seed.NetworkName ||
-		!equalHashBytes(seed.ByronGenesisID, byronID) ||
-		!equalHashBytes(seed.ByronGenesisJSONHash, byronJSON) ||
-		!equalHashBytes(seed.ShelleyGenesisID, shelleyID) ||
-		!equalHashBytes(seed.ShelleyGenesisJSONHash, shelleyJSON) ||
-		!manifestStartMatches(
-			seed.Start,
-			startKind,
-			startSlot,
-			startHash,
-			startNumber,
-			startIsByronEBB,
-		) {
+	if !found {
+		return errors.New("dataset manifest is not initialized")
+	}
+	if record.DatasetID != seed.DatasetID ||
+		record.SchemaContractHash != migrations.ContractHash ||
+		record.NetworkMagic != seed.NetworkMagic ||
+		record.NetworkName != seed.NetworkName ||
+		record.ByronGenesisID != seed.ByronGenesisID ||
+		record.ByronGenesisJSONHash != seed.ByronGenesisJSONHash ||
+		record.ShelleyGenesisID != seed.ShelleyGenesisID ||
+		record.ShelleyGenesisJSONHash != seed.ShelleyGenesisJSONHash ||
+		record.Start != seed.Start {
 		return errors.New("configured dataset/network/genesis identity conflicts with existing manifest")
 	}
 	return nil
@@ -383,115 +343,32 @@ func (d *DB) LoadManifestIdentity(ctx context.Context) (ManifestIdentity, error)
 func (d *DB) LoadManifestIdentityIfExists(
 	ctx context.Context,
 ) (ManifestIdentity, bool, error) {
-	const query = `
-SELECT
-    dataset_id, network_magic, network_name, byron_genesis_id,
-    byron_genesis_json_hash, shelley_genesis_id, shelley_genesis_json_hash,
-    start_kind, start_slot, start_hash, start_block_number, start_is_byron_ebb,
-    genesis_seeded,
-    complete_history
-FROM clicksync.dataset_manifest
-WHERE revision = (SELECT max(revision) FROM clicksync.dataset_manifest)`
-	rows, err := d.conn.Query(ctx, query)
-	if err != nil {
-		return ManifestIdentity{}, false, fmt.Errorf("query manifest identity: %w", err)
+	record, found, err := d.loadLatestManifestRecord(ctx)
+	if err != nil || !found {
+		return ManifestIdentity{}, found, err
 	}
-	defer rows.Close()
-	var identities []ManifestIdentity
-	for rows.Next() {
-		identity, err := scanManifestIdentity(rows.Scan)
-		if err != nil {
-			return ManifestIdentity{}, false, err
-		}
-		identities = append(identities, identity)
+	if record.SchemaContractHash != migrations.ContractHash {
+		return ManifestIdentity{}, false, errors.New(
+			"dataset manifest schema contract hash differs from this binary",
+		)
 	}
-	if err := rows.Err(); err != nil {
-		return ManifestIdentity{}, false, fmt.Errorf("iterate manifest identity: %w", err)
-	}
-	return uniqueManifestIdentity(identities)
+	return manifestIdentityFromRecord(record), true, nil
 }
 
-func scanManifestIdentity(scan func(...any) error) (ManifestIdentity, error) {
-	var (
-		dataset                          uuid.UUID
-		magic                            uint32
-		network, startKind               string
-		byronIDBytes, byronJSONBytes     []byte
-		shelleyIDBytes, shelleyJSONBytes []byte
-		startSlot, startNumber           *uint64
-		startHashBytes                   []byte
-		startIsByronEBB                  bool
-		genesisSeeded, completeHistory   bool
-	)
-	if err := scan(
-		&dataset,
-		&magic,
-		&network,
-		&byronIDBytes,
-		&byronJSONBytes,
-		&shelleyIDBytes,
-		&shelleyJSONBytes,
-		&startKind,
-		&startSlot,
-		&startHashBytes,
-		&startNumber,
-		&startIsByronEBB,
-		&genesisSeeded,
-		&completeHistory,
-	); err != nil {
-		return ManifestIdentity{}, fmt.Errorf("scan manifest identity: %w", err)
-	}
-	byronID, err := hash32(byronIDBytes)
-	if err != nil {
-		return ManifestIdentity{}, err
-	}
-	byronJSON, err := hash32(byronJSONBytes)
-	if err != nil {
-		return ManifestIdentity{}, err
-	}
-	shelleyID, err := hash32(shelleyIDBytes)
-	if err != nil {
-		return ManifestIdentity{}, err
-	}
-	shelleyJSON, err := hash32(shelleyJSONBytes)
-	if err != nil {
-		return ManifestIdentity{}, err
-	}
-	start := publication.Point{Origin: true}
-	if startKind == "intersection" {
-		if startSlot == nil || startNumber == nil {
-			return ManifestIdentity{}, errors.New("manifest intersection is incomplete")
-		}
-		startHash, err := hash32(startHashBytes)
-		if err != nil {
-			return ManifestIdentity{}, err
-		}
-		start = publication.Point{
-			Slot:        *startSlot,
-			Hash:        startHash,
-			BlockNumber: *startNumber,
-			IsByronEBB:  startIsByronEBB,
-		}
-	} else if startKind != "origin" {
-		return ManifestIdentity{}, fmt.Errorf("unknown manifest start kind %q", startKind)
-	} else if startSlot != nil || len(startHashBytes) != 0 ||
-		startNumber != nil || startIsByronEBB {
-		return ManifestIdentity{}, errors.New("manifest Origin boundary carries non-Origin metadata")
-	}
-	var datasetID [16]byte
-	copy(datasetID[:], dataset[:])
+func manifestIdentityFromRecord(record manifestRecord) ManifestIdentity {
 	return ManifestIdentity{
-		DatasetID:              datasetID,
-		NetworkMagic:           magic,
-		NetworkName:            network,
-		ByronGenesisID:         byronID,
-		ByronGenesisJSONHash:   byronJSON,
-		ShelleyGenesisID:       shelleyID,
-		ShelleyGenesisJSONHash: shelleyJSON,
-		Start:                  start,
-		GenesisSeeded:          genesisSeeded,
-		CompleteHistory:        completeHistory,
-	}, nil
+		DatasetID:              record.DatasetID,
+		SchemaContractHash:     record.SchemaContractHash,
+		NetworkMagic:           record.NetworkMagic,
+		NetworkName:            record.NetworkName,
+		ByronGenesisID:         record.ByronGenesisID,
+		ByronGenesisJSONHash:   record.ByronGenesisJSONHash,
+		ShelleyGenesisID:       record.ShelleyGenesisID,
+		ShelleyGenesisJSONHash: record.ShelleyGenesisJSONHash,
+		Start:                  record.Start,
+		GenesisSeeded:          record.GenesisSeeded,
+		CompleteHistory:        record.CompleteHistory,
+	}
 }
 
 func uniqueManifestIdentity(
@@ -526,7 +403,7 @@ func (d *DB) RecoverGenesisPublication(
 	ctx context.Context,
 	expectedDigest model.Hash32,
 ) (GenesisPublication, bool, error) {
-	snapshot, err := d.CommittedSnapshot(ctx)
+	snapshot, err := d.RawCommittedSnapshot(ctx)
 	if err != nil {
 		return GenesisPublication{}, false, err
 	}
@@ -722,7 +599,7 @@ GROUP BY publication_id`
 	if len(seen) != len(expectedByID) {
 		return errors.New("synthetic genesis publication bundle is incomplete")
 	}
-	snapshot, err := d.CommittedSnapshot(ctx)
+	snapshot, err := d.RawCommittedSnapshot(ctx)
 	if err != nil {
 		return err
 	}
@@ -760,9 +637,10 @@ GROUP BY publication_id`
 	if err := lock.AssertHeld(); err != nil {
 		return fmt.Errorf("writer flock was lost before genesis tip reconciliation: %w", err)
 	}
-	if err := d.PersistManifest(ctx, publication.ManifestUpdate{
+	if err := d.PersistManifest(ctx, lock, publication.ManifestUpdate{
 		EventSeq:    snapshot,
 		Tip:         publication.Point{Origin: true},
+		Kind:        publication.ManifestGenesis,
 		WriterID:    writerID,
 		WriterBuild: writerBuild,
 		UpdatedAt:   now.UTC(),
@@ -772,26 +650,65 @@ GROUP BY publication_id`
 	if err := lock.AssertHeld(); err != nil {
 		return fmt.Errorf("writer flock was lost before genesis completion marker: %w", err)
 	}
-	const completeQuery = `
-INSERT INTO clicksync.dataset_manifest
-SELECT * REPLACE
-(
-    revision + 1 AS revision,
-    true AS genesis_seeded,
-    true AS complete_history,
-    ? AS updated_at
-)
-FROM
-(
-    SELECT *
-    FROM clicksync.dataset_manifest
-    ORDER BY revision DESC
-    LIMIT 1
-)`
-	if err := d.conn.Exec(ctx, completeQuery, now.UTC()); err != nil {
-		return fmt.Errorf("mark exact genesis bundle complete: %w", err)
-	}
-	return nil
+	return d.transitionManifest(
+		ctx,
+		lock,
+		"genesis_complete",
+		now,
+		func(latest manifestRecord) (bool, error) {
+			if !latest.GenesisSeeded {
+				return false, nil
+			}
+			if !latest.CompleteHistory ||
+				latest.TrustStatus != "agreed" ||
+				latest.TrustBasis != "official_genesis" ||
+				!latest.Servable ||
+				!latest.ServableFloorPermanent ||
+				!latest.ServableFloor.Point.Origin ||
+				latest.ServableFloor.EventSeq != 0 ||
+				latest.Effective != latest.Physical {
+				return false, errors.New(
+					"genesis-seeded manifest carries conflicting trust/visibility state",
+				)
+			}
+			return true, nil
+		},
+		func(next *manifestRecord) error {
+			if !next.Start.Origin || !next.Physical.Point.Origin {
+				return errors.New("official genesis completion requires an Origin manifest head")
+			}
+			next.GenesisSeeded = true
+			next.CompleteHistory = true
+			next.TrustStatus = "agreed"
+			next.TrustBasis = "official_genesis"
+			next.CheckID = nil
+			next.AgreementGroup = nil
+			next.CheckAttempt = 0
+			next.CorroborationRequired = 0
+			next.CorroborationConfirmed = 0
+			next.Disagreement = false
+			next.TrustReason = "official genesis distribution verified exactly"
+			next.CheckStartedAt = nil
+			next.CheckCompletedAt = nil
+			next.Checked = nil
+			agreed := next.Physical
+			next.LastAgreed = &agreed
+			agreedAt := manifestTime(now)
+			next.LastAgreedAt = &agreedAt
+			next.ServableFloor = manifestHead{Point: publication.Point{Origin: true}}
+			next.ServableFloorPermanent = true
+			if next.Effective != next.Physical || !next.Servable {
+				next.VisibilityGeneration++
+			}
+			next.Effective = next.Physical
+			next.Servable = true
+			next.PrimarySuffix = 0
+			writer := writerID
+			next.WriterID = &writer
+			next.WriterBuild = writerBuild
+			return nil
+		},
+	)
 }
 
 func (d *DB) validateGenesisFacts(
@@ -904,8 +821,28 @@ GROUP BY publication_id`
 	return nil
 }
 
-func (d *DB) PersistManifest(ctx context.Context, update publication.ManifestUpdate) error {
-	committed, err := d.CommittedSnapshot(ctx)
+func (d *DB) PersistManifest(
+	ctx context.Context,
+	authority publication.Lock,
+	update publication.ManifestUpdate,
+) error {
+	switch update.Kind {
+	case publication.ManifestAdoption:
+		if update.RemoteAdoptions == 0 {
+			return errors.New("remote adoption manifest update has zero adopted blocks")
+		}
+	case publication.ManifestRollback, publication.ManifestGenesis:
+		if update.RemoteAdoptions != 0 {
+			return fmt.Errorf("%s manifest update carries remote adoption count", update.Kind)
+		}
+	case publication.ManifestReconcile:
+		if update.RemoteAdoptions != 0 {
+			return errors.New("reconcile manifest update must derive remote adoptions from physical facts")
+		}
+	default:
+		return fmt.Errorf("unknown manifest physical update kind %q", update.Kind)
+	}
+	committed, err := d.RawCommittedSnapshot(ctx)
 	if err != nil {
 		return err
 	}
@@ -916,100 +853,207 @@ func (d *DB) PersistManifest(ctx context.Context, update publication.ManifestUpd
 			committed,
 		)
 	}
-	var latestRevision uint64
-	if err := d.conn.QueryRow(
+	return d.transitionManifest(
 		ctx,
-		`SELECT max(revision) FROM clicksync.dataset_manifest`,
-	).Scan(&latestRevision); err != nil {
-		return fmt.Errorf("read manifest revision: %w", err)
+		authority,
+		"physical_"+string(update.Kind),
+		update.UpdatedAt,
+		func(latest manifestRecord) (bool, error) {
+			if update.EventSeq < latest.Physical.EventSeq {
+				return false, fmt.Errorf(
+					"physical manifest event regressed from %d to %d",
+					latest.Physical.EventSeq,
+					update.EventSeq,
+				)
+			}
+			if update.EventSeq == latest.Physical.EventSeq {
+				if update.Tip != latest.Physical.Point {
+					return false, errors.New(
+						"same physical manifest event has a conflicting point",
+					)
+				}
+				// The latest authoritative trust state is the intended
+				// carry-forward. This is the lost-response/restart retry.
+				return true, nil
+			}
+			if update.Kind == publication.ManifestReconcile {
+				if err := validateManifestReconcileAdvance(latest, update); err != nil {
+					return false, err
+				}
+			}
+			return false, nil
+		},
+		func(next *manifestRecord) error {
+			if next.PendingRollback != nil {
+				return errors.New("ordinary physical-head append cannot bypass a pending rollback")
+			}
+			previous := next.Physical
+			remoteAdoptions := update.RemoteAdoptions
+			if update.Kind == publication.ManifestReconcile {
+				remoteAdoptions, err = d.remoteAdoptionsBetween(
+					ctx,
+					previous.EventSeq,
+					update.EventSeq,
+				)
+				if err != nil {
+					return err
+				}
+			}
+			visibilityDiscontinuity := update.Kind == publication.ManifestRollback
+			if update.Kind == publication.ManifestReconcile {
+				visibilityDiscontinuity, err = d.rawEventIsRollback(ctx, update.EventSeq)
+				if err != nil {
+					return err
+				}
+			}
+			if err := applyPhysicalManifestUpdate(
+				next,
+				update,
+				remoteAdoptions,
+				visibilityDiscontinuity,
+			); err != nil {
+				return err
+			}
+			return nil
+		},
+	)
+}
+
+func validateManifestReconcileAdvance(
+	latest manifestRecord,
+	update publication.ManifestUpdate,
+) error {
+	if latest.PendingRollback != nil {
+		if update.EventSeq == latest.PendingRollback.EventSeq &&
+			update.Tip == latest.PendingRollback.To {
+			return errors.New(
+				"pending rollback reached its reserved raw event; specialized recovery is required",
+			)
+		}
+		return errors.New("raw event does not match the pending rollback reservation")
 	}
-	if latestRevision == 0 {
-		return errors.New("dataset manifest is not initialized")
-	}
-	if latestRevision == math.MaxUint64 {
-		return errors.New("dataset manifest revision space exhausted")
-	}
-	var tipSlot, tipHash, tipNumber any
-	tipIsByronEBB := false
-	if !update.Tip.Origin {
-		tipSlot = update.Tip.Slot
-		tipHash = string(update.Tip.Hash[:])
-		tipNumber = update.Tip.BlockNumber
-		tipIsByronEBB = update.Tip.IsByronEBB
-	}
-	const query = `INSERT INTO clicksync.dataset_manifest
-(
-    manifest_key, revision, dataset_id, network_magic, network_name,
-    byron_genesis_id, byron_genesis_json_hash, shelley_genesis_id,
-    shelley_genesis_json_hash, start_kind, start_slot,
-    start_hash, start_block_number, start_is_byron_ebb,
-    genesis_seeded, complete_history, trust_mode,
-    committed_event_seq, committed_tip_origin, committed_tip_slot,
-    committed_tip_hash, committed_tip_block_number, committed_tip_is_byron_ebb,
-    writer_id, writer_build,
-    source_build, created_at, updated_at
-)
-SELECT
-    manifest_key,
-    revision + 1,
-    dataset_id,
-    network_magic,
-    network_name,
-    byron_genesis_id,
-    byron_genesis_json_hash,
-    shelley_genesis_id,
-    shelley_genesis_json_hash,
-    start_kind,
-    start_slot,
-    start_hash,
-    start_block_number,
-    start_is_byron_ebb,
-    genesis_seeded,
-    complete_history,
-    trust_mode,
-    ?,
-    ?,
-    ?,
-    ?,
-    ?,
-    ?,
-    ?,
-    ?,
-    source_build,
-    created_at,
-    ?
-FROM
-(
-    SELECT *
-    FROM clicksync.dataset_manifest
-    ORDER BY revision DESC
-    LIMIT 1
-)`
-	if err := d.conn.Exec(
-		ctx,
-		query,
-		update.EventSeq,
-		update.Tip.Origin,
-		tipSlot,
-		tipHash,
-		tipNumber,
-		tipIsByronEBB,
-		uuid.UUID(update.WriterID),
-		update.WriterBuild,
-		update.UpdatedAt.UTC(),
-	); err != nil {
-		return fmt.Errorf("insert reconciled manifest: %w", err)
+	if latest.TrustStatus == "checking" || latest.TrustStatus == "disputed" {
+		return fmt.Errorf(
+			"unexpected raw event %d advanced past a %s manifest barrier at %d",
+			update.EventSeq,
+			latest.TrustStatus,
+			latest.Physical.EventSeq,
+		)
 	}
 	return nil
 }
 
+func applyPhysicalManifestUpdate(
+	next *manifestRecord,
+	update publication.ManifestUpdate,
+	remoteAdoptions uint64,
+	visibilityDiscontinuity bool,
+) error {
+	previous := next.Physical
+	next.Physical = manifestHead{EventSeq: update.EventSeq, Point: update.Tip}
+
+	rollback := manifestPointBefore(update.Tip, previous.Point)
+	if update.Kind == publication.ManifestRollback &&
+		manifestPointBefore(previous.Point, update.Tip) {
+		return errors.New("rollback manifest update moves the physical point forward")
+	}
+	if update.Kind == publication.ManifestAdoption && rollback {
+		return errors.New("adoption manifest update moves the physical point backward")
+	}
+	if remoteAdoptions > manifestMaximumSuffix ||
+		next.PrimarySuffix > manifestMaximumSuffix-remoteAdoptions {
+		return fmt.Errorf(
+			"physical suffix would exceed %d without a sampled check",
+			manifestMaximumSuffix,
+		)
+	}
+	next.PrimarySuffix += remoteAdoptions
+
+	switch next.TrustStatus {
+	case "agreed":
+		next.Effective = next.Physical
+		next.Servable = true
+	case "unavailable":
+		if next.Servable || next.LastAgreed != nil {
+			next.Effective = next.Physical
+			next.Servable = true
+		}
+	case "checking", "disputed":
+		if manifestPointBefore(next.Physical.Point, next.Effective.Point) {
+			next.Effective = next.Physical
+		}
+	default:
+		return fmt.Errorf("unknown manifest trust status %q", next.TrustStatus)
+	}
+	if visibilityDiscontinuity {
+		next.VisibilityGeneration++
+	}
+	writerID := update.WriterID
+	next.WriterID = &writerID
+	next.WriterBuild = update.WriterBuild
+	return nil
+}
+
+func (d *DB) rawEventIsRollback(ctx context.Context, eventSeq uint64) (bool, error) {
+	var count uint64
+	if err := d.conn.QueryRow(
+		ctx,
+		`SELECT count() FROM clicksync.rollbacks WHERE event_seq = ?`,
+		eventSeq,
+	).Scan(&count); err != nil {
+		return false, fmt.Errorf("classify raw manifest reconciliation event: %w", err)
+	}
+	if count > 1 {
+		return false, errors.New("raw rollback event has duplicate physical headers")
+	}
+	return count == 1, nil
+}
+
+func manifestPointBefore(left, right publication.Point) bool {
+	if left.Origin {
+		return !right.Origin
+	}
+	if right.Origin {
+		return false
+	}
+	if left.BlockNumber != right.BlockNumber {
+		return left.BlockNumber < right.BlockNumber
+	}
+	return left.Slot < right.Slot
+}
+
+func (d *DB) remoteAdoptionsBetween(
+	ctx context.Context,
+	afterEvent uint64,
+	throughEvent uint64,
+) (uint64, error) {
+	if throughEvent <= afterEvent {
+		return 0, nil
+	}
+	const query = `
+SELECT uniqExact(tuple(events.event_seq, events.publication_id))
+FROM clicksync.chain_events AS events
+INNER JOIN clicksync.blocks AS blocks
+    ON blocks.publication_id = events.publication_id
+WHERE events.event_kind = 'adoption'
+  AND events.event_seq > ?
+  AND events.event_seq <= ?
+  AND NOT blocks.synthetic`
+	var count uint64
+	if err := d.conn.QueryRow(ctx, query, afterEvent, throughEvent).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count remote adoptions for manifest reconciliation: %w", err)
+	}
+	return count, nil
+}
+
 func (d *DB) ReconcileManifest(
 	ctx context.Context,
+	authority publication.Lock,
 	writerID [16]byte,
 	writerBuild string,
 	now time.Time,
 ) error {
-	snapshot, err := d.CommittedSnapshot(ctx)
+	snapshot, err := d.RawCommittedSnapshot(ctx)
 	if err != nil {
 		return err
 	}
@@ -1017,9 +1061,10 @@ func (d *DB) ReconcileManifest(
 	if err != nil {
 		return err
 	}
-	return d.PersistManifest(ctx, publication.ManifestUpdate{
+	return d.PersistManifest(ctx, authority, publication.ManifestUpdate{
 		EventSeq:    snapshot,
 		Tip:         tip,
+		Kind:        publication.ManifestReconcile,
 		WriterID:    writerID,
 		WriterBuild: writerBuild,
 		UpdatedAt:   now.UTC(),
@@ -1139,43 +1184,14 @@ HAVING count() > 0`
 }
 
 func (d *DB) manifestStartPoint(ctx context.Context) (publication.Point, error) {
-	const query = `
-SELECT start_kind, start_slot, start_hash, start_block_number, start_is_byron_ebb
-FROM clicksync.dataset_manifest
-ORDER BY revision DESC
-LIMIT 1`
-	var kind string
-	var slot, number *uint64
-	var hashBytes []byte
-	var isByronEBB bool
-	if err := d.conn.QueryRow(ctx, query).Scan(
-		&kind,
-		&slot,
-		&hashBytes,
-		&number,
-		&isByronEBB,
-	); err != nil {
-		return publication.Point{}, fmt.Errorf("read manifest start point: %w", err)
-	}
-	if kind == "origin" {
-		if slot != nil || len(hashBytes) != 0 || number != nil || isByronEBB {
-			return publication.Point{}, errors.New("Origin manifest has a non-null start point")
-		}
-		return publication.Point{Origin: true}, nil
-	}
-	if kind != "intersection" || slot == nil || number == nil {
-		return publication.Point{}, errors.New("intersection manifest start point is incomplete")
-	}
-	hash, err := hash32(hashBytes)
+	record, found, err := d.loadLatestManifestRecord(ctx)
 	if err != nil {
 		return publication.Point{}, err
 	}
-	return publication.Point{
-		Slot:        *slot,
-		Hash:        hash,
-		BlockNumber: *number,
-		IsByronEBB:  isByronEBB,
-	}, nil
+	if !found {
+		return publication.Point{}, errors.New("dataset manifest is not initialized")
+	}
+	return record.Start, nil
 }
 
 func equalHashBytes(hash model.Hash32, value []byte) bool {

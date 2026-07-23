@@ -1,0 +1,23 @@
+clicksync canonical fresh UTxO-flow dataset contract
+
+dataset_manifest is an append-only MergeTree ordered by (manifest_key, revision)
+with index_granularity 64. Its bounded authoritative head carries immutable
+dataset/network/genesis/start identity, this contract hash, a client-verified
+transition digest chain, physical/effective/floor event-point snapshots,
+sampled-peer trust state, visibility generation, and pending rollback
+reservation state.
+
+blocks, transactions, inputs, outputs, datum_bodies, datum_observations,
+withdrawals, redeemers, and transaction_metadata are immutable physical facts.
+chain_events and rollbacks are append-only canonical membership events.
+peer_observations are append-only trust evidence. writer_audit is operational
+history and is not writer authority.
+
+Visibility is determined by the manifest effective event snapshot and
+append-only adoption/invalidation membership. Raw transaction or block CBOR,
+script bodies, certificates, governance actions, votes, and proposals are not
+part of this dataset.
+
+The sampling cadence is 512 primary blocks. A physical suffix may contain at
+most 767 blocks. checking and disputed trust clamp the effective head;
+unavailable trust serves the physical head with explicit warning and lag.

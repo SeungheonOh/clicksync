@@ -18,6 +18,20 @@ import (
 )
 
 func (d *DB) CommittedSnapshot(ctx context.Context) (uint64, error) {
+	record, found, err := d.loadLatestManifestRecord(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if !found {
+		return 0, errors.New("dataset manifest is not initialized")
+	}
+	return record.Effective.EventSeq, nil
+}
+
+// RawCommittedSnapshot is the physical adoption/rollback marker. It is only
+// for publication verification and startup manifest reconciliation; query and
+// chain-sync readers must use the validated manifest effective snapshot.
+func (d *DB) RawCommittedSnapshot(ctx context.Context) (uint64, error) {
 	const query = `
 SELECT greatest(
     (SELECT max(event_seq) FROM clicksync.chain_events WHERE event_kind = 'adoption'),

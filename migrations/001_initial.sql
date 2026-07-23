@@ -4,7 +4,12 @@ CREATE TABLE IF NOT EXISTS clicksync.dataset_manifest
 (
     manifest_key UInt8 DEFAULT 1,
     revision UInt64,
+    transition_id UUID,
+    transition_kind String,
+    previous_row_digest Nullable(FixedString(32)),
+    row_digest FixedString(32),
     dataset_id UUID,
+    schema_contract_hash FixedString(32),
     network_magic UInt32,
     network_name String,
     byron_genesis_id FixedString(32),
@@ -19,31 +24,181 @@ CREATE TABLE IF NOT EXISTS clicksync.dataset_manifest
     genesis_seeded Bool,
     complete_history Bool,
     trust_mode String,
-    committed_event_seq UInt64,
-    committed_tip_origin Bool,
-    committed_tip_slot Nullable(UInt64),
-    committed_tip_hash Nullable(FixedString(32)),
-    committed_tip_block_number Nullable(UInt64),
-    committed_tip_is_byron_ebb Bool,
+    trust_status Enum8(
+        'agreed' = 1,
+        'checking' = 2,
+        'unavailable' = 3,
+        'disputed' = 4
+    ),
+    trust_basis Enum8(
+        'official_genesis' = 1,
+        'sampled_peer' = 2,
+        'partial_boundary' = 3,
+        'primary_only' = 4
+    ),
+    check_id Nullable(UUID),
+    agreement_group Nullable(UUID),
+    check_attempt UInt32,
+    corroboration_required UInt16,
+    corroboration_confirmed UInt16,
+    checkpoint_interval UInt64,
+    primary_suffix UInt64,
+    disagreement Bool,
+    trust_reason String,
+    check_started_at Nullable(DateTime64(6, 'UTC')),
+    check_completed_at Nullable(DateTime64(6, 'UTC')),
+    checked_event_seq Nullable(UInt64),
+    checked_point_origin Nullable(Bool),
+    checked_point_slot Nullable(UInt64),
+    checked_point_hash Nullable(FixedString(32)),
+    checked_point_block_number Nullable(UInt64),
+    checked_point_is_byron_ebb Nullable(Bool),
+    last_agreed_event_seq Nullable(UInt64),
+    last_agreed_point_origin Nullable(Bool),
+    last_agreed_point_slot Nullable(UInt64),
+    last_agreed_point_hash Nullable(FixedString(32)),
+    last_agreed_point_block_number Nullable(UInt64),
+    last_agreed_point_is_byron_ebb Nullable(Bool),
+    last_agreed_at Nullable(DateTime64(6, 'UTC')),
+    servable_floor_event_seq UInt64,
+    servable_floor_origin Bool,
+    servable_floor_slot Nullable(UInt64),
+    servable_floor_hash Nullable(FixedString(32)),
+    servable_floor_block_number Nullable(UInt64),
+    servable_floor_is_byron_ebb Bool,
+    servable_floor_permanent Bool,
+    physical_event_seq UInt64,
+    physical_tip_origin Bool,
+    physical_tip_slot Nullable(UInt64),
+    physical_tip_hash Nullable(FixedString(32)),
+    physical_tip_block_number Nullable(UInt64),
+    physical_tip_is_byron_ebb Bool,
+    effective_event_seq UInt64,
+    effective_tip_origin Bool,
+    effective_tip_slot Nullable(UInt64),
+    effective_tip_hash Nullable(FixedString(32)),
+    effective_tip_block_number Nullable(UInt64),
+    effective_tip_is_byron_ebb Bool,
+    servable Bool,
+    visibility_generation UInt64,
+    pending_rollback_state Enum8(
+        'none' = 0,
+        'reserved' = 1,
+        'invalidations_written' = 2
+    ),
+    pending_rollback_id Nullable(UUID),
+    pending_rollback_event_seq Nullable(UInt64),
+    pending_rollback_to_origin Nullable(Bool),
+    pending_rollback_to_slot Nullable(UInt64),
+    pending_rollback_to_hash Nullable(FixedString(32)),
+    pending_rollback_to_block_number Nullable(UInt64),
+    pending_rollback_to_is_byron_ebb Nullable(Bool),
+    pending_rollback_old_physical_event_seq Nullable(UInt64),
+    pending_rollback_old_physical_origin Nullable(Bool),
+    pending_rollback_old_physical_slot Nullable(UInt64),
+    pending_rollback_old_physical_hash Nullable(FixedString(32)),
+    pending_rollback_old_physical_block_number Nullable(UInt64),
+    pending_rollback_old_physical_is_byron_ebb Nullable(Bool),
+    pending_rollback_started_at Nullable(DateTime64(6, 'UTC')),
     writer_id Nullable(UUID),
     writer_build String,
     source_build String,
     created_at DateTime64(6, 'UTC'),
     updated_at DateTime64(6, 'UTC'),
     CONSTRAINT dataset_manifest_singleton CHECK manifest_key = 1,
+    CONSTRAINT dataset_manifest_revision CHECK revision > 0,
     CONSTRAINT dataset_manifest_trust CHECK trust_mode = 'peer_observed_structurally_verified',
     CONSTRAINT dataset_manifest_start_point CHECK
         (start_kind = 'origin' AND isNull(start_slot) AND isNull(start_hash) AND isNull(start_block_number) AND NOT start_is_byron_ebb)
         OR
         (start_kind = 'intersection' AND isNotNull(start_slot) AND isNotNull(start_hash) AND isNotNull(start_block_number)),
-    CONSTRAINT dataset_manifest_tip CHECK
-        (committed_tip_origin AND isNull(committed_tip_slot) AND isNull(committed_tip_hash) AND isNull(committed_tip_block_number) AND NOT committed_tip_is_byron_ebb)
+    CONSTRAINT dataset_manifest_checked_point CHECK
+        multiIf(
+            isNull(checked_point_origin),
+                isNull(checked_event_seq) AND isNull(checked_point_slot) AND isNull(checked_point_hash) AND isNull(checked_point_block_number) AND isNull(checked_point_is_byron_ebb),
+            isNotNull(checked_point_origin) AND assumeNotNull(checked_point_origin),
+                isNotNull(checked_event_seq) AND isNull(checked_point_slot) AND isNull(checked_point_hash) AND isNull(checked_point_block_number) AND isNotNull(checked_point_is_byron_ebb) AND NOT assumeNotNull(checked_point_is_byron_ebb),
+            isNotNull(checked_event_seq) AND isNotNull(checked_point_slot) AND isNotNull(checked_point_hash) AND isNotNull(checked_point_block_number) AND isNotNull(checked_point_is_byron_ebb)
+        ),
+    CONSTRAINT dataset_manifest_last_agreed_point CHECK
+        multiIf(
+            isNull(last_agreed_point_origin),
+                isNull(last_agreed_event_seq) AND isNull(last_agreed_point_slot) AND isNull(last_agreed_point_hash) AND isNull(last_agreed_point_block_number) AND isNull(last_agreed_point_is_byron_ebb) AND isNull(last_agreed_at),
+            isNotNull(last_agreed_point_origin) AND assumeNotNull(last_agreed_point_origin),
+                isNotNull(last_agreed_event_seq) AND isNull(last_agreed_point_slot) AND isNull(last_agreed_point_hash) AND isNull(last_agreed_point_block_number) AND isNotNull(last_agreed_point_is_byron_ebb) AND NOT assumeNotNull(last_agreed_point_is_byron_ebb) AND isNotNull(last_agreed_at),
+            isNotNull(last_agreed_event_seq) AND isNotNull(last_agreed_point_slot) AND isNotNull(last_agreed_point_hash) AND isNotNull(last_agreed_point_block_number) AND isNotNull(last_agreed_point_is_byron_ebb) AND isNotNull(last_agreed_at)
+        ),
+    CONSTRAINT dataset_manifest_floor_point CHECK
+        (servable_floor_origin AND isNull(servable_floor_slot) AND isNull(servable_floor_hash) AND isNull(servable_floor_block_number) AND NOT servable_floor_is_byron_ebb)
         OR
-        (NOT committed_tip_origin AND isNotNull(committed_tip_slot) AND isNotNull(committed_tip_hash) AND isNotNull(committed_tip_block_number)),
+        (NOT servable_floor_origin AND isNotNull(servable_floor_slot) AND isNotNull(servable_floor_hash) AND isNotNull(servable_floor_block_number)),
+    CONSTRAINT dataset_manifest_physical_tip CHECK
+        (physical_tip_origin AND isNull(physical_tip_slot) AND isNull(physical_tip_hash) AND isNull(physical_tip_block_number) AND NOT physical_tip_is_byron_ebb)
+        OR
+        (NOT physical_tip_origin AND isNotNull(physical_tip_slot) AND isNotNull(physical_tip_hash) AND isNotNull(physical_tip_block_number)),
+    CONSTRAINT dataset_manifest_effective_tip CHECK
+        (effective_tip_origin AND isNull(effective_tip_slot) AND isNull(effective_tip_hash) AND isNull(effective_tip_block_number) AND NOT effective_tip_is_byron_ebb)
+        OR
+        (NOT effective_tip_origin AND isNotNull(effective_tip_slot) AND isNotNull(effective_tip_hash) AND isNotNull(effective_tip_block_number)),
+    CONSTRAINT dataset_manifest_pending_rollback CHECK
+        multiIf(
+            pending_rollback_state = 'none',
+                isNull(pending_rollback_id)
+                AND isNull(pending_rollback_event_seq)
+                AND isNull(pending_rollback_to_origin)
+                AND isNull(pending_rollback_to_slot)
+                AND isNull(pending_rollback_to_hash)
+                AND isNull(pending_rollback_to_block_number)
+                AND isNull(pending_rollback_to_is_byron_ebb)
+                AND isNull(pending_rollback_old_physical_event_seq)
+                AND isNull(pending_rollback_old_physical_origin)
+                AND isNull(pending_rollback_old_physical_slot)
+                AND isNull(pending_rollback_old_physical_hash)
+                AND isNull(pending_rollback_old_physical_block_number)
+                AND isNull(pending_rollback_old_physical_is_byron_ebb)
+                AND isNull(pending_rollback_started_at),
+            isNotNull(pending_rollback_id)
+            AND isNotNull(pending_rollback_event_seq)
+            AND isNotNull(pending_rollback_to_origin)
+            AND multiIf(
+                assumeNotNull(pending_rollback_to_origin),
+                    isNull(pending_rollback_to_slot)
+                    AND isNull(pending_rollback_to_hash)
+                    AND isNull(pending_rollback_to_block_number)
+                    AND isNotNull(pending_rollback_to_is_byron_ebb)
+                    AND NOT assumeNotNull(pending_rollback_to_is_byron_ebb),
+                isNotNull(pending_rollback_to_slot)
+                    AND isNotNull(pending_rollback_to_hash)
+                    AND isNotNull(pending_rollback_to_block_number)
+                    AND isNotNull(pending_rollback_to_is_byron_ebb)
+            )
+            AND isNotNull(pending_rollback_old_physical_event_seq)
+            AND isNotNull(pending_rollback_old_physical_origin)
+            AND multiIf(
+                assumeNotNull(pending_rollback_old_physical_origin),
+                    isNull(pending_rollback_old_physical_slot)
+                    AND isNull(pending_rollback_old_physical_hash)
+                    AND isNull(pending_rollback_old_physical_block_number)
+                    AND isNotNull(pending_rollback_old_physical_is_byron_ebb)
+                    AND NOT assumeNotNull(pending_rollback_old_physical_is_byron_ebb),
+                isNotNull(pending_rollback_old_physical_slot)
+                    AND isNotNull(pending_rollback_old_physical_hash)
+                    AND isNotNull(pending_rollback_old_physical_block_number)
+                    AND isNotNull(pending_rollback_old_physical_is_byron_ebb)
+            )
+            AND isNotNull(pending_rollback_started_at)
+        ),
+    CONSTRAINT dataset_manifest_check_identity CHECK
+        (trust_status != 'checking')
+        OR
+        (isNotNull(check_id) AND isNotNull(agreement_group) AND isNotNull(checked_event_seq) AND isNotNull(checked_point_origin) AND isNotNull(check_started_at)),
+    CONSTRAINT dataset_manifest_corroboration CHECK corroboration_confirmed <= corroboration_required,
+    CONSTRAINT dataset_manifest_cadence CHECK checkpoint_interval = 512 AND primary_suffix <= 767,
     CONSTRAINT dataset_manifest_completeness CHECK complete_history = (start_kind = 'origin' AND genesis_seeded)
 )
-ENGINE = ReplacingMergeTree(revision)
-ORDER BY manifest_key;
+ENGINE = MergeTree
+ORDER BY (manifest_key, revision)
+SETTINGS index_granularity = 64;
 
 CREATE TABLE IF NOT EXISTS clicksync.blocks
 (

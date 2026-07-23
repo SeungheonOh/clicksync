@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
@@ -14,7 +15,8 @@ import (
 )
 
 type DB struct {
-	conn clickhouse.Conn
+	conn       clickhouse.Conn
+	manifestMu sync.Mutex
 }
 
 func Open(cfg config.Config) (*DB, error) {

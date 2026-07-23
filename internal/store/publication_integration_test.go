@@ -78,6 +78,7 @@ func TestNativePublicationBinaryRoundTrip(t *testing.T) {
 	if identity.DatasetID == ([16]byte{}) || identity.Start.BlockNumber != 9 {
 		t.Fatalf("generated manifest identity = %+v", identity)
 	}
+	agreeIntegrationBoundary(t, ctx, db, lock, now)
 	if loaded, found, err := db.LoadManifestIdentityIfExists(ctx); err != nil {
 		t.Fatal(err)
 	} else if !found || loaded != identity {
@@ -537,12 +538,22 @@ WHERE tx_hash = ?`, string(fourthTx[:])).Scan(&effectiveCollateralFee); err != n
 	if err := db.InsertRollbackHeader(ctx, rollback); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err = db.CommittedSnapshot(ctx)
+	snapshot, err = db.RawCommittedSnapshot(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if snapshot != 3 {
-		t.Fatalf("rollback snapshot = %d, want 3", snapshot)
+		t.Fatalf("raw rollback snapshot = %d, want 3", snapshot)
+	}
+	effectiveBeforeReconcile, err := db.CommittedSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if effectiveBeforeReconcile != 2 {
+		t.Fatalf(
+			"unreconciled rollback changed effective snapshot to %d",
+			effectiveBeforeReconcile,
+		)
 	}
 	committed, err := db.RollbackCommitted(ctx, rollback)
 	if err != nil {
@@ -594,7 +605,7 @@ WHERE tx_hash = ?`, string(fourthTx[:])).Scan(&effectiveCollateralFee); err != n
 	if _, err := db.ActiveDescendants(ctx, snapshot, result.LastCommitted, 10); err == nil {
 		t.Fatal("inactive descendant was accepted as a rollback target")
 	}
-	if err := db.ReconcileManifest(ctx, writerID, "integration", now.Add(3*time.Second)); err != nil {
+	if err := db.ReconcileManifest(ctx, lock, writerID, "integration", now.Add(3*time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	candidates, err := db.IntersectionCandidates(ctx)
@@ -618,12 +629,13 @@ WHERE tx_hash = ?`, string(fourthTx[:])).Scan(&effectiveCollateralFee); err != n
 	var manifestEBB bool
 	if err := db.conn.QueryRow(ctx, `
 SELECT
-    committed_event_seq,
-    committed_tip_slot,
-    committed_tip_hash,
-    committed_tip_block_number,
-    committed_tip_is_byron_ebb
+    physical_event_seq,
+    physical_tip_slot,
+    physical_tip_hash,
+    physical_tip_block_number,
+    physical_tip_is_byron_ebb
 FROM clicksync.dataset_manifest
+PREWHERE manifest_key = 1
 ORDER BY revision DESC
 LIMIT 1`).Scan(
 		&manifestEvent,
@@ -837,6 +849,7 @@ func TestNativeIntersectionCandidatesDenseGeometricAndByronBoundary(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
+	agreeIntegrationBoundary(t, ctx, db, lock, now)
 	noOpRollback := publication.RollbackCommit{
 		RollbackID:            id16(0xa2),
 		EventSeq:              1,
@@ -858,10 +871,15 @@ func TestNativeIntersectionCandidatesDenseGeometricAndByronBoundary(t *testing.T
 	} else if !committed {
 		t.Fatal("no-op rollback exact readback was not committed")
 	}
-	if snapshot, err := db.CommittedSnapshot(ctx); err != nil {
+	if snapshot, err := db.RawCommittedSnapshot(ctx); err != nil {
 		t.Fatal(err)
 	} else if snapshot != 1 {
-		t.Fatalf("no-op rollback snapshot = %d, want 1", snapshot)
+		t.Fatalf("raw no-op rollback snapshot = %d, want 1", snapshot)
+	}
+	if snapshot, err := db.CommittedSnapshot(ctx); err != nil {
+		t.Fatal(err)
+	} else if snapshot != 0 {
+		t.Fatalf("unreconciled effective snapshot = %d, want 0", snapshot)
 	}
 	restartSeed := seed
 	restartSeed.Start.BlockNumber = 0
@@ -932,6 +950,57 @@ func TestNativeIntersectionCandidatesDenseGeometricAndByronBoundary(t *testing.T
 			successor,
 			terminal,
 		)
+	}
+}
+
+// agreeIntegrationBoundary establishes the safe floor that production startup
+// obtains from persisted bootstrap observations. Observation/manifest binding
+// is exercised by the trust-gate integration suite; this publication fixture
+// only needs a servable effective snapshot before testing physical facts.
+func agreeIntegrationBoundary(
+	t *testing.T,
+	ctx context.Context,
+	db *DB,
+	lock LockAssertion,
+	at time.Time,
+) {
+	t.Helper()
+	checkID := id16(0xe1)
+	groupID := id16(0xe2)
+	if err := db.transitionManifest(
+		ctx,
+		lock,
+		"bootstrap_agreed",
+		at,
+		func(latest manifestRecord) (bool, error) {
+			return latest.TrustStatus == "agreed" && latest.LastAgreed != nil, nil
+		},
+		func(next *manifestRecord) error {
+			next.TrustStatus = "agreed"
+			next.TrustBasis = "sampled_peer"
+			next.CheckID = &checkID
+			next.AgreementGroup = &groupID
+			next.CheckAttempt = 1
+			next.CorroborationRequired = 2
+			next.CorroborationConfirmed = 2
+			next.Disagreement = false
+			next.TrustReason = "publication integration bootstrap agreement"
+			started := manifestTime(at.Add(-time.Second))
+			completed := manifestTime(at)
+			next.CheckStartedAt = &started
+			next.CheckCompletedAt = &completed
+			checked := next.Physical
+			next.Checked = &checked
+			next.LastAgreed = &checked
+			next.LastAgreedAt = &completed
+			next.Effective = next.Physical
+			next.Servable = true
+			next.PrimarySuffix = 0
+			next.VisibilityGeneration++
+			return nil
+		},
+	); err != nil {
+		t.Fatal(err)
 	}
 }
 
