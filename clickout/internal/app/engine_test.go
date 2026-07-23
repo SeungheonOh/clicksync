@@ -91,7 +91,7 @@ func TestTraceAddressSeedCursorPinsSnapshotAndPassesRepositoryKey(t *testing.T) 
 		t.Fatalf("seed cursor was not pinned/passed: at=%#v query=%#v", reader.lastAt, reader.lastTraceQuery)
 	}
 	if response.Truncation.ContinuationCursor != "next-seed-cursor" ||
-		!response.Truncation.LosslessResume {
+		response.Truncation.LosslessResume {
 		t.Fatalf("seed continuation was not actionable: %#v", response.Truncation)
 	}
 }

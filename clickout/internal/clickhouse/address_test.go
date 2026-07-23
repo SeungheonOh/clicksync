@@ -88,3 +88,15 @@ func TestAddressKeyOrderingDoesNotTreatHashAsAddressIdentity(t *testing.T) {
 		t.Fatal("raw address did not break an address-hash collision")
 	}
 }
+
+func TestAddressMembershipCandidatesDoNotDependOnBlockRows(t *testing.T) {
+	t.Parallel()
+	sql, values := publicationRowsSQL([]uint64{7, 9})
+	if strings.Contains(sql, "blocks") ||
+		!strings.Contains(sql, "SELECT toUInt64(?) AS publication_id\nUNION ALL") ||
+		len(values) != 2 ||
+		values[0] != uint64(7) ||
+		values[1] != uint64(9) {
+		t.Fatalf("publication candidate rows are not literal/fail-closed: %q %#v", sql, values)
+	}
+}

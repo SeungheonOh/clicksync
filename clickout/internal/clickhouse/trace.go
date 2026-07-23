@@ -276,20 +276,278 @@ func (store *Store) hydrateExpansion(
 	candidates []model.Hash32,
 	budget repository.ExpansionBudget,
 ) (repository.ExpansionResult, []model.PartialHistoryBoundary, error) {
-	candidates, truncated := acceptTraceCandidates(candidates, budget.MaxEdges)
+	candidates, candidateTruncated := acceptTraceCandidates(candidates, budget.MaxEdges)
+	nodesByTransaction, err := store.traceCandidateNodes(ctx, snapshot, candidates)
+	if err != nil {
+		return repository.ExpansionResult{}, nil, err
+	}
+	candidates, nodeTruncated, err := fitTraceCandidateNodes(
+		candidates,
+		nodesByTransaction,
+		budget.MaxNodes,
+	)
+	if err != nil {
+		return repository.ExpansionResult{}, nil, err
+	}
 	edges, boundaries, err := store.hyperedgesByTx(ctx, snapshot, candidates)
 	if err != nil {
 		return repository.ExpansionResult{}, nil, err
 	}
-	for _, edge := range edges {
-		if err := validateHyperedgeResources(edge, budget.MaxNodes); err != nil {
-			return repository.ExpansionResult{}, nil, err
-		}
+	verified, postHydrationTruncated, err := fitTraceEdgeNodes(edges, budget.MaxNodes)
+	if err != nil {
+		return repository.ExpansionResult{}, nil, err
+	}
+	if postHydrationTruncated || len(verified) != len(edges) {
+		return repository.ExpansionResult{}, nil, ErrConflictingRow
 	}
 	return repository.ExpansionResult{
 		Hyperedges: edges,
-		Truncated:  truncated,
+		Truncated:  candidateTruncated || nodeTruncated,
 	}, boundaries, nil
+}
+
+func (store *Store) traceCandidateNodes(
+	ctx context.Context,
+	snapshot model.Snapshot,
+	candidates []model.Hash32,
+) (map[string]map[string]struct{}, error) {
+	result := make(map[string]map[string]struct{}, len(candidates))
+	if len(candidates) == 0 {
+		return result, nil
+	}
+	for _, hash := range candidates {
+		result[hash.String()] = make(map[string]struct{})
+	}
+	if err := store.traceInputCandidateNodes(ctx, snapshot, candidates, result); err != nil {
+		return nil, err
+	}
+	if err := store.traceOutputCandidateNodes(ctx, snapshot, candidates, result); err != nil {
+		return nil, err
+	}
+	for _, hash := range candidates {
+		if len(result[hash.String()]) == 0 {
+			return nil, ErrConflictingRow
+		}
+	}
+	return result, nil
+}
+
+func (store *Store) traceInputCandidateNodes(
+	ctx context.Context,
+	snapshot model.Snapshot,
+	candidates []model.Hash32,
+	result map[string]map[string]struct{},
+) error {
+	predicate, values := hashPredicate("i.tx_hash", candidates)
+	sql := targetedFactSQL(`
+        SELECT *
+        FROM inputs AS i
+        WHERE `+predicate+`
+          AND i.publication_id <= publication_watermark
+`, `
+SELECT
+    tx_hash,
+    groupArray(source_tx_hash),
+    groupArray(source_output_index)
+FROM
+(
+    SELECT DISTINCT
+        i.tx_hash,
+        i.source_tx_hash,
+        i.source_output_index
+    FROM fact_candidates AS i
+    INNER JOIN active_candidate_publications AS ap
+        ON i.publication_id = ap.publication_id
+    ORDER BY i.tx_hash, i.source_tx_hash, i.source_output_index
+)
+GROUP BY tx_hash
+ORDER BY tx_hash`)
+	return store.scanTraceCandidateNodes(
+		ctx,
+		"trace_input_node_identities",
+		sql,
+		activeArguments(snapshot, values...),
+		uint64(len(candidates)),
+		result,
+	)
+}
+
+func (store *Store) traceOutputCandidateNodes(
+	ctx context.Context,
+	snapshot model.Snapshot,
+	candidates []model.Hash32,
+	result map[string]map[string]struct{},
+) error {
+	predicate, values := hashPredicate("o.tx_hash", candidates)
+	sql := targetedFactSQL(`
+        SELECT *
+        FROM outputs AS o
+        WHERE `+predicate+`
+          AND o.publication_id <= publication_watermark
+`, `
+SELECT
+    tx_hash,
+    groupArray(tx_hash),
+    groupArray(output_index)
+FROM
+(
+    SELECT DISTINCT
+        o.tx_hash,
+        o.output_index
+    FROM fact_candidates AS o
+    INNER JOIN active_candidate_publications AS ap
+        ON o.publication_id = ap.publication_id
+    ORDER BY o.tx_hash, o.output_index
+)
+GROUP BY tx_hash
+ORDER BY tx_hash`)
+	return store.scanTraceCandidateNodes(
+		ctx,
+		"trace_output_node_identities",
+		sql,
+		activeArguments(snapshot, values...),
+		uint64(len(candidates)),
+		result,
+	)
+}
+
+func (store *Store) scanTraceCandidateNodes(
+	ctx context.Context,
+	phase string,
+	sql string,
+	arguments []any,
+	maxRows uint64,
+	result map[string]map[string]struct{},
+) error {
+	queryCtx, finish := store.instrumentPhase(
+		ctx,
+		phase,
+		hydrationPhaseLimits(maxRows),
+	)
+	defer finish()
+	rows, err := store.conn.Query(queryCtx, sql, arguments...)
+	if err != nil {
+		return mapQueryError(phase, err)
+	}
+	defer rows.Close()
+	seenTransactions := make(map[string]struct{}, maxRows)
+	for rows.Next() {
+		var txHash []byte
+		var nodeHashes []string
+		var nodeIndexes []uint32
+		if err := rows.Scan(&txHash, &nodeHashes, &nodeIndexes); err != nil {
+			return mapQueryError(phase, err)
+		}
+		tx, err := model.Hash32FromBytes(txHash)
+		if err != nil {
+			return err
+		}
+		key := tx.String()
+		nodes, exists := result[key]
+		if !exists {
+			return ErrConflictingRow
+		}
+		if _, duplicate := seenTransactions[key]; duplicate {
+			return ErrConflictingRow
+		}
+		seenTransactions[key] = struct{}{}
+		if len(nodeHashes) != len(nodeIndexes) {
+			return errors.New("trace node identity arrays have unequal lengths")
+		}
+		var previous model.UTxORef
+		for index := range nodeHashes {
+			hash, err := model.Hash32FromBytes([]byte(nodeHashes[index]))
+			if err != nil {
+				return err
+			}
+			ref := model.UTxORef{TxHash: hash, Index: nodeIndexes[index]}
+			if index > 0 && compareUTxORefs(previous, ref) >= 0 {
+				return ErrConflictingRow
+			}
+			previous = ref
+			nodes[ref.String()] = struct{}{}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return mapQueryError(phase, err)
+	}
+	return nil
+}
+
+func compareUTxORefs(left, right model.UTxORef) int {
+	if compared := bytes.Compare(left.TxHash[:], right.TxHash[:]); compared != 0 {
+		return compared
+	}
+	switch {
+	case left.Index < right.Index:
+		return -1
+	case left.Index > right.Index:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func fitTraceCandidateNodes(
+	candidates []model.Hash32,
+	nodesByTransaction map[string]map[string]struct{},
+	maxNodes uint32,
+) ([]model.Hash32, bool, error) {
+	seen := make(map[string]struct{}, maxNodes)
+	for index, candidate := range candidates {
+		nodes, exists := nodesByTransaction[candidate.String()]
+		if !exists || len(nodes) == 0 {
+			return nil, false, ErrConflictingRow
+		}
+		added := 0
+		for node := range nodes {
+			if _, exists := seen[node]; !exists {
+				added++
+			}
+		}
+		if len(seen)+added > int(maxNodes) {
+			if index == 0 {
+				return nil, false, &ResourceLimitError{
+					Phase: "trace_hyperedge",
+					Cause: fmt.Errorf(
+						"transaction %s has %d unique input/output nodes, remaining limit %d",
+						candidate,
+						len(nodes),
+						maxNodes,
+					),
+				}
+			}
+			return candidates[:index], true, nil
+		}
+		for node := range nodes {
+			seen[node] = struct{}{}
+		}
+	}
+	return candidates, false, nil
+}
+
+func fitTraceEdgeNodes(
+	edges []model.FlowHyperedge,
+	maxNodes uint32,
+) ([]model.FlowHyperedge, bool, error) {
+	nodes := make(map[string]map[string]struct{}, len(edges))
+	candidates := make([]model.Hash32, len(edges))
+	for index, edge := range edges {
+		candidates[index] = edge.Transaction
+		edgeNodes := make(map[string]struct{}, len(edge.Inputs)+len(edge.ProducedOutputs))
+		for _, input := range edge.Inputs {
+			edgeNodes[input.Source.String()] = struct{}{}
+		}
+		for _, output := range edge.ProducedOutputs {
+			edgeNodes[output.Ref.String()] = struct{}{}
+		}
+		nodes[edge.Transaction.String()] = edgeNodes
+	}
+	accepted, truncated, err := fitTraceCandidateNodes(candidates, nodes, maxNodes)
+	if err != nil {
+		return nil, false, err
+	}
+	return edges[:len(accepted)], truncated, nil
 }
 
 func acceptTraceCandidates(

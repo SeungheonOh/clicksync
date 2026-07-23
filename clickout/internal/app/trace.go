@@ -76,7 +76,7 @@ func (engine *Engine) trace(
 		response.Truncation.Truncated = true
 		response.Truncation.Reason = "address_seed_limit"
 		response.Truncation.ContinuationCursor = seedResult.ContinuationCursor
-		response.Truncation.LosslessResume = seedResult.ContinuationCursor != ""
+		response.Truncation.LosslessResume = false
 	}
 
 	frontier := uniqueSorted(seedResult.UTxOs)
@@ -264,9 +264,7 @@ func (engine *Engine) trace(
 	response.Truncation.ContinuationFrontier = uniqueSorted(
 		response.Truncation.ContinuationFrontier,
 	)
-	if response.Truncation.ContinuationCursor == "" {
-		response.Truncation.LosslessResume = false
-	}
+	response.Truncation.LosslessResume = false
 	response.Data.Visited = uint32(len(visited))
 	response.QueryMetrics = collector.Snapshot()
 	return response, nil

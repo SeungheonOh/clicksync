@@ -23,6 +23,8 @@ func TestEveryAddressAndTracePhaseUsesThrowModeResourceSettings(t *testing.T) {
 		{"inline_datums_batch", hydrationPhaseLimits(100)},
 		{"trace_forward_candidates", candidatePhaseLimits(101)},
 		{"trace_reverse_candidates", candidatePhaseLimits(101)},
+		{"trace_input_node_identities", hydrationPhaseLimits(100)},
+		{"trace_output_node_identities", hydrationPhaseLimits(100)},
 		{"trace_transactions", traceHydrationPhaseLimits()},
 		{"trace_consumed_inputs", traceHydrationPhaseLimits()},
 		{"trace_output_values", traceHydrationPhaseLimits()},
@@ -118,6 +120,58 @@ func TestHyperedgeNodeBudgetIsAtomicAndCountsUniqueUTxOs(t *testing.T) {
 	err := validateHyperedgeResources(edge, 2)
 	if !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("oversized edge was not rejected atomically: %v", err)
+	}
+}
+
+func TestTraceNodeBudgetChoosesAtomicCumulativePrefix(t *testing.T) {
+	t.Parallel()
+	first := repeatedHash(1)
+	second := repeatedHash(2)
+	candidates := []model.Hash32{first, second}
+	node := func(refs ...model.UTxORef) map[string]struct{} {
+		result := make(map[string]struct{}, len(refs))
+		for _, ref := range refs {
+			result[ref.String()] = struct{}{}
+		}
+		return result
+	}
+	a := model.UTxORef{TxHash: repeatedHash(10), Index: 0}
+	b := model.UTxORef{TxHash: repeatedHash(11), Index: 0}
+	c := model.UTxORef{TxHash: repeatedHash(12), Index: 0}
+	d := model.UTxORef{TxHash: repeatedHash(13), Index: 0}
+
+	accepted, truncated, err := fitTraceCandidateNodes(
+		candidates,
+		map[string]map[string]struct{}{
+			first.String():  node(a, b),
+			second.String(): node(c, d),
+		},
+		2,
+	)
+	if err != nil || !truncated || len(accepted) != 1 || accepted[0] != first {
+		t.Fatalf("disjoint edge prefix = %#v truncated=%v err=%v", accepted, truncated, err)
+	}
+	accepted, truncated, err = fitTraceCandidateNodes(
+		candidates,
+		map[string]map[string]struct{}{
+			first.String():  node(a, b),
+			second.String(): node(a, b),
+		},
+		2,
+	)
+	if err != nil || truncated || len(accepted) != 2 {
+		t.Fatalf("overlapping edges did not share node budget: %#v truncated=%v err=%v", accepted, truncated, err)
+	}
+	_, _, err = fitTraceCandidateNodes(
+		candidates,
+		map[string]map[string]struct{}{
+			first.String():  node(a, b, c),
+			second.String(): node(d),
+		},
+		2,
+	)
+	if !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("oversized first edge was not a typed resource failure: %v", err)
 	}
 }
 

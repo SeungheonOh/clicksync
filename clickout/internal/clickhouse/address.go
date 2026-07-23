@@ -383,12 +383,14 @@ func (store *Store) activeAddressPublications(
 	if len(publications) == 0 {
 		return result, nil
 	}
-	predicate, values := uint64Predicate("publication_id", publications)
+	candidateSQL, values := publicationRowsSQL(publications)
 	sql := targetedFactSQL(`
-        SELECT *
-        FROM blocks
-        WHERE `+predicate+`
-          AND publication_id <= publication_watermark
+        SELECT publication_id
+        FROM
+        (
+`+candidateSQL+`
+        )
+        WHERE publication_id <= publication_watermark
 `, `
 SELECT DISTINCT ap.publication_id
 FROM active_candidate_publications AS ap
@@ -628,17 +630,17 @@ func addressCandidatePredicate(alias string, candidates []addressCandidate) (str
 	return predicate + ")", values
 }
 
-func uint64Predicate(column string, values []uint64) (string, []any) {
-	predicate := column + " IN ("
-	arguments := make([]any, len(values))
-	for index, value := range values {
+func publicationRowsSQL(publications []uint64) (string, []any) {
+	rows := ""
+	values := make([]any, 0, len(publications))
+	for index, publicationID := range publications {
 		if index > 0 {
-			predicate += ","
+			rows += "\nUNION ALL\n"
 		}
-		predicate += "?"
-		arguments[index] = value
+		rows += "SELECT toUInt64(?) AS publication_id"
+		values = append(values, publicationID)
 	}
-	return predicate + ")", arguments
+	return rows, values
 }
 
 func tuplePredicate(hashColumn, indexColumn string, refs []model.UTxORef) (string, []any) {
