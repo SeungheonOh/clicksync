@@ -174,6 +174,57 @@ func TestPhysicalBatchTimerStaysAnchoredToFirstStagedBlock(t *testing.T) {
 	}
 }
 
+func TestExpiredPhysicalBatchTimerFlushesAfterHandlerMutexContention(t *testing.T) {
+	publisher := &fakePublisher{}
+	handler := newTestHandler(t, publisher)
+	handler.config.FlushAfter = 10 * time.Second
+	for number := uint64(11); number <= 12; number++ {
+		block := adapterTestBlock{
+			slot:   number,
+			number: number,
+			hash:   adapterHash(byte(number)),
+		}
+		if _, err := handler.RollForward(
+			context.Background(),
+			block,
+			adapterTip(block),
+			adapterEvidence(adapterTip(block)),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	handler.mu.Lock()
+	if handler.timer == nil || !handler.timer.Stop() {
+		handler.mu.Unlock()
+		t.Fatal("physical batch timer was not armed before contention")
+	}
+	timerStarted := make(chan struct{})
+	timerDone := make(chan struct{})
+	go func() {
+		close(timerStarted)
+		handler.flushFromTimer()
+		close(timerDone)
+	}()
+	<-timerStarted
+	select {
+	case <-timerDone:
+		handler.mu.Unlock()
+		t.Fatal("timer callback bypassed handler mutex")
+	case <-time.After(10 * time.Millisecond):
+	}
+	handler.mu.Unlock()
+	select {
+	case <-timerDone:
+	case <-time.After(time.Second):
+		t.Fatal("expired timer did not flush at first opportunity")
+	}
+	if len(publisher.batches) != 1 ||
+		len(publisher.batches[0].Items) != 2 {
+		t.Fatalf("timer batches = %#v", publisher.batches)
+	}
+}
+
 func TestObservedRollbackBarrierPreventsAttemptFinalizationFromPublishingDescendants(
 	t *testing.T,
 ) {

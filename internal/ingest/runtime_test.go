@@ -11,7 +11,96 @@ import (
 	pcommon "github.com/blinklabs-io/gouroboros/protocol/common"
 
 	"clicksync/internal/n2n"
+	"clicksync/internal/syncer"
 )
+
+func TestSignalShutdownSharesFinalizerDeadlineWithWriterAudit(t *testing.T) {
+	const timeout = 80 * time.Millisecond
+	budget, err := syncer.NewShutdownBudget(timeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signalCtx, signal := context.WithCancel(context.Background())
+	signal()
+	started := time.Now()
+	finalizeCtx, finishFinalizer := budget.Context(signalCtx)
+	finalizeDeadline, ok := finalizeCtx.Deadline()
+	if !ok {
+		t.Fatal("finalizer context has no shutdown deadline")
+	}
+	select {
+	case <-time.After(20 * time.Millisecond):
+	case <-finalizeCtx.Done():
+		t.Fatalf("finalizer lost its budget early: %v", finalizeCtx.Err())
+	}
+	finishFinalizer()
+
+	auditAttempted := false
+	var auditDeadline time.Time
+	err = releaseWithinShutdownBudget(
+		signalCtx,
+		budget,
+		func(ctx context.Context) error {
+			auditAttempted = true
+			var ok bool
+			auditDeadline, ok = ctx.Deadline()
+			if !ok {
+				return errors.New("writer audit context has no shutdown deadline")
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	)
+	if !auditAttempted {
+		t.Fatal("writer audit was not attempted after delayed finalization")
+	}
+	if !auditDeadline.Equal(finalizeDeadline) {
+		t.Fatalf(
+			"writer audit received fresh deadline %s; finalizer deadline was %s",
+			auditDeadline,
+			finalizeDeadline,
+		)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("writer audit error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > timeout+150*time.Millisecond {
+		t.Fatalf("aggregate shutdown took %s for %s budget", elapsed, timeout)
+	}
+}
+
+func TestWriterAuditIsAttemptedAfterFinalizerExhaustsShutdownBudget(t *testing.T) {
+	const timeout = 20 * time.Millisecond
+	budget, err := syncer.NewShutdownBudget(timeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signalCtx, signal := context.WithCancel(context.Background())
+	signal()
+	started := time.Now()
+	finalizeCtx, finishFinalizer := budget.Context(signalCtx)
+	<-finalizeCtx.Done()
+	finishFinalizer()
+
+	auditAttempted := false
+	err = releaseWithinShutdownBudget(
+		signalCtx,
+		budget,
+		func(ctx context.Context) error {
+			auditAttempted = true
+			return ctx.Err()
+		},
+	)
+	if !auditAttempted {
+		t.Fatal("writer audit was skipped after finalizer exhausted shutdown budget")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("writer audit error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > timeout+150*time.Millisecond {
+		t.Fatalf("aggregate shutdown took %s for %s budget", elapsed, timeout)
+	}
+}
 
 func TestBoundaryBootstrapRetriesTransientAvailabilityThenSucceeds(t *testing.T) {
 	calls := 0

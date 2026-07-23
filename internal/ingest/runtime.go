@@ -41,6 +41,10 @@ func RunSync(
 	if buildID == "" || buildID == "development" || buildID == "source-unset" {
 		return errors.New("sync requires an explicit reproducible source build ID")
 	}
+	shutdownBudget, err := syncer.NewShutdownBudget(shutdownTimeout)
+	if err != nil {
+		return err
+	}
 	writerID, err := newID()
 	if err != nil {
 		return err
@@ -136,15 +140,21 @@ func RunSync(
 		if !auditActive {
 			return
 		}
-		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
-		defer cancel()
 		reason := "graceful shutdown"
 		if retErr != nil {
 			reason = "terminal error: " + retErr.Error()
 		}
 		retErr = errors.Join(
 			retErr,
-			db.ReleaseWriterAudit(releaseCtx, lock, audit, time.Now(), reason),
+			releaseWithinShutdownBudget(ctx, shutdownBudget, func(releaseCtx context.Context) error {
+				return db.ReleaseWriterAudit(
+					releaseCtx,
+					lock,
+					audit,
+					time.Now(),
+					reason,
+				)
+			}),
 		)
 		auditActive = false
 	}()
@@ -218,6 +228,7 @@ func RunSync(
 		RollbackConfirmations: cfg.Corroboration,
 		CheckpointEveryBlocks: 1000,
 		FinalizeTimeout:       shutdownTimeout,
+		ShutdownBudget:        shutdownBudget,
 	}, db, handler, observer, transport)
 	if err != nil {
 		return err
@@ -255,6 +266,16 @@ func RunSync(
 		return cause
 	}
 	return runErr
+}
+
+func releaseWithinShutdownBudget(
+	ctx context.Context,
+	budget *syncer.ShutdownBudget,
+	release func(context.Context) error,
+) error {
+	releaseCtx, cancel := budget.Context(ctx)
+	defer cancel()
+	return release(releaseCtx)
 }
 
 func n2nPeers(peers []config.Peer) []n2n.Peer {

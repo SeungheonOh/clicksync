@@ -45,7 +45,7 @@ services:
       clickhouse:
         condition: service_healthy
     command: ["sync"]
-    # Exceeds the binary's 45s finalization/flush timeout.
+    # Exceeds one 45s deadline shared by finalization and writer-audit release.
     stop_grace_period: 60s
     environment:
       CLICKHOUSE_HOST: clickhouse

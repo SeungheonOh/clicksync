@@ -226,6 +226,7 @@ type Config struct {
 	RollbackConfirmations int
 	CheckpointEveryBlocks uint64
 	FinalizeTimeout       time.Duration
+	ShutdownBudget        *ShutdownBudget
 }
 
 type Supervisor struct {
@@ -1259,10 +1260,19 @@ func (h *attemptHandler) validateCallbackPeer(peer n2n.Peer) error {
 }
 
 func (h *attemptHandler) finish(ctx context.Context, cause string) error {
-	finalizeCtx, cancel := context.WithTimeout(
-		context.WithoutCancel(ctx),
-		h.supervisor.config.FinalizeTimeout,
-	)
+	var finalizeCtx context.Context
+	var cancel context.CancelFunc
+	if h.supervisor.config.ShutdownBudget != nil {
+		finalizeCtx, cancel = h.supervisor.config.ShutdownBudget.FinalizeContext(
+			ctx,
+			h.supervisor.config.FinalizeTimeout,
+		)
+	} else {
+		finalizeCtx, cancel = context.WithTimeout(
+			context.WithoutCancel(ctx),
+			h.supervisor.config.FinalizeTimeout,
+		)
+	}
 	defer cancel()
 	outcome, err := h.delegate.EndAttempt(finalizeCtx, AttemptEnd{
 		Source: h.currentEvidence(),

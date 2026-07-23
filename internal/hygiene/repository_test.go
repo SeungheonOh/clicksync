@@ -1,12 +1,18 @@
 package hygiene
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRepositoryHasOneGoIngestionPath(t *testing.T) {
@@ -211,29 +217,84 @@ func TestExecutableRuntimeHasNoArtificialSyncOrStorageCeiling(t *testing.T) {
 	}
 }
 
-func TestComposeStopGraceExceedsBinaryFinalizationWindow(t *testing.T) {
+func TestComposeStopGraceExceedsAggregateShutdownBudget(t *testing.T) {
 	_, file, _, _ := runtime.Caller(0)
 	root := filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
 	compose, err := os.ReadFile(filepath.Join(root, "compose.yaml"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	runtimeSource, err := os.ReadFile(
-		filepath.Join(root, "internal", "ingest", "runtime.go"),
+	runtimePath := filepath.Join(root, "internal", "ingest", "runtime.go")
+	shutdownBudget := durationConstant(t, runtimePath, "shutdownTimeout")
+	match := regexp.MustCompile(
+		`(?m)^\s+stop_grace_period:\s*([0-9]+)s\s*$`,
+	).FindSubmatch(compose)
+	if len(match) != 2 {
+		t.Fatal("clicksync service requires one numeric stop_grace_period in seconds")
+	}
+	graceSeconds, err := strconv.ParseInt(string(match[1]), 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grace := time.Duration(graceSeconds) * time.Second
+	const minimumRuntimeOverhead = 10 * time.Second
+	if grace < shutdownBudget+minimumRuntimeOverhead {
+		t.Fatalf(
+			"stop grace %s does not cover shared finalization/audit budget %s plus %s overhead",
+			grace,
+			shutdownBudget,
+			minimumRuntimeOverhead,
+		)
+	}
+}
+
+func durationConstant(t *testing.T, path string, name string) time.Duration {
+	t.Helper()
+	source, err := parser.ParseFile(
+		token.NewFileSet(),
+		path,
+		nil,
+		0,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(
-		string(runtimeSource),
-		"shutdownTimeout      = 45 * time.Second",
-	) {
-		t.Fatal("binary shutdown timeout changed; re-audit container stop grace")
+	var result time.Duration
+	ast.Inspect(source, func(node ast.Node) bool {
+		spec, ok := node.(*ast.ValueSpec)
+		if !ok {
+			return true
+		}
+		for index, ident := range spec.Names {
+			if ident.Name != name || index >= len(spec.Values) {
+				continue
+			}
+			product, ok := spec.Values[index].(*ast.BinaryExpr)
+			if !ok || product.Op != token.MUL {
+				return false
+			}
+			count, ok := product.X.(*ast.BasicLit)
+			if !ok || count.Kind != token.INT {
+				return false
+			}
+			unit, ok := product.Y.(*ast.SelectorExpr)
+			if !ok || unit.Sel.Name != "Second" {
+				return false
+			}
+			pkg, ok := unit.X.(*ast.Ident)
+			if !ok || pkg.Name != "time" {
+				return false
+			}
+			seconds, parseErr := strconv.ParseInt(count.Value, 10, 64)
+			if parseErr == nil {
+				result = time.Duration(seconds) * time.Second
+			}
+			return false
+		}
+		return true
+	})
+	if result <= 0 {
+		t.Fatalf("positive %s = <integer> * time.Second not found in %s", name, path)
 	}
-	if !strings.Contains(
-		string(compose),
-		"stop_grace_period: 60s",
-	) {
-		t.Fatal("clicksync service stop grace does not protect final flush")
-	}
+	return result
 }

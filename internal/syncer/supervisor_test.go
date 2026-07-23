@@ -2419,6 +2419,58 @@ func baseConfig() Config {
 	}
 }
 
+func TestCanceledAttemptFinalizerUsesSharedShutdownBudget(t *testing.T) {
+	const timeout = 40 * time.Millisecond
+	budget, err := NewShutdownBudget(timeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalizerEntered := make(chan struct{})
+	handler := &fakeHandler{
+		endAttempt: func(ctx context.Context, _ AttemptEnd) (CommitOutcome, error) {
+			if _, ok := ctx.Deadline(); !ok {
+				return CommitOutcome{}, errors.New("missing finalizer deadline")
+			}
+			close(finalizerEntered)
+			<-ctx.Done()
+			return CommitOutcome{}, ctx.Err()
+		},
+	}
+	supervisor := &Supervisor{
+		config: Config{
+			FinalizeTimeout: time.Second,
+			ShutdownBudget:  budget,
+		},
+	}
+	attempt := &attemptHandler{
+		supervisor: supervisor,
+		delegate:   handler,
+	}
+	signalCtx, signal := context.WithCancel(context.Background())
+	finished := make(chan error, 1)
+	go func() {
+		finished <- attempt.finish(signalCtx, "context canceled")
+	}()
+	<-finalizerEntered
+	signaledAt := time.Now()
+	signal()
+	err = <-finished
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("finalizer error = %v", err)
+	}
+	if elapsed := time.Since(signaledAt); elapsed > timeout+150*time.Millisecond {
+		t.Fatalf("finalizer took %s for %s shared budget", elapsed, timeout)
+	}
+	auditCtx, cancelAudit := budget.Context(signalCtx)
+	defer cancelAudit()
+	if _, ok := auditCtx.Deadline(); !ok {
+		t.Fatal("audit context has no shared deadline")
+	}
+	if !errors.Is(auditCtx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("audit context remained live after finalizer: %v", auditCtx.Err())
+	}
+}
+
 func newTestSupervisor(
 	t *testing.T,
 	config Config,
