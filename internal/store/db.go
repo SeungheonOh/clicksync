@@ -28,7 +28,8 @@ func Open(cfg config.Config) (*DB, error) {
 		Protocol:    clickhouse.Native,
 		DialTimeout: 10 * time.Second,
 		Settings: clickhouse.Settings{
-			"join_use_nulls": 1,
+			"join_use_nulls":                         1,
+			"min_table_rows_to_use_projection_index": 0,
 		},
 		Compression: &clickhouse.Compression{Method: clickhouse.CompressionLZ4},
 	})

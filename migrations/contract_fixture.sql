@@ -13,6 +13,7 @@ INSERT INTO clicksync.chain_events
     block_hash,
     slot,
     block_number,
+    is_byron_ebb,
     writer_id,
     recorded_at
 )
@@ -26,6 +27,7 @@ VALUES
     unhex(repeat('11', 32)),
     10,
     10,
+    false,
     toUUID('00000000-0000-0000-0000-000000000001'),
     now64(6)
 );
@@ -40,6 +42,7 @@ INSERT INTO clicksync.chain_events
     block_hash,
     slot,
     block_number,
+    is_byron_ebb,
     writer_id,
     recorded_at
 )
@@ -53,6 +56,7 @@ VALUES
     unhex(repeat('11', 32)),
     10,
     10,
+    false,
     toUUID('00000000-0000-0000-0000-000000000001'),
     now64(6)
 );
@@ -103,12 +107,17 @@ INSERT INTO clicksync.rollbacks
     rollback_to_origin,
     rollback_to_slot,
     rollback_to_hash,
+    rollback_to_block_number,
+    rollback_to_is_byron_ebb,
     old_tip_slot,
     old_tip_hash,
     old_tip_block_number,
+    old_tip_is_byron_ebb,
     depth,
     reason,
     observed_peers,
+    observed_operators,
+    corroboration_required,
     agreement_group,
     writer_id,
     recorded_at
@@ -120,12 +129,17 @@ VALUES
     true,
     NULL,
     NULL,
+    NULL,
+    false,
     10,
     unhex(repeat('11', 32)),
     10,
+    false,
     1,
     'contract fixture',
     ['peer-a', 'peer-b'],
+    ['operator-a', 'operator-b'],
+    2,
     toUUID('00000000-0000-0000-0000-000000000003'),
     toUUID('00000000-0000-0000-0000-000000000001'),
     now64(6)

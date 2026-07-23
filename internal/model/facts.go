@@ -146,6 +146,7 @@ type PeerObservation struct {
 	CheckpointSlot        *uint64
 	CheckpointHash        *Hash32
 	CheckpointBlockNumber *uint64
+	CheckpointIsByronEBB  *bool
 	AgreementGroup        *[16]byte
 	SelectedBodySource    bool
 	BodyHashVerified      bool

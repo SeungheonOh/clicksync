@@ -159,6 +159,15 @@ func TestContractReadsRollbackAndTrace(t *testing.T) {
 	if err != nil || sourceState.IsCurrent {
 		t.Fatalf("re-adoption did not restore spend: %#v, %v", sourceState, err)
 	}
+	fixture.commitNoOpRollback(t, store)
+	snapshot, err = store.Snapshot(ctx, model.AtPoint{Tip: true})
+	if err != nil || snapshot.Event != 5 {
+		t.Fatalf("no-op rollback header did not advance snapshot: %#v, %v", snapshot, err)
+	}
+	sourceState, _, err = store.UTxO(ctx, snapshot, fixture.source)
+	if err != nil || sourceState.IsCurrent {
+		t.Fatalf("no-op rollback changed active membership: %#v, %v", sourceState, err)
+	}
 
 	assertPrimaryKeyPlan(t, store, snapshot, fixture.source)
 	fixture.assertDatumDuplicateSemantics(t, store, snapshot)
@@ -269,18 +278,27 @@ func (fixture fixture) insert(t *testing.T, store *Store) {
 	dataset := "33333333-3333-4333-8333-333333333333"
 	zero := make([]byte, 32)
 	exec(`INSERT INTO dataset_manifest
-        (revision,dataset_id,network_magic,network_name,byron_genesis_hash,shelley_genesis_hash,
-         start_kind,start_slot,start_hash,genesis_seeded,complete_history,trust_mode,
+        (manifest_key,revision,dataset_id,network_magic,network_name,
+         byron_genesis_id,byron_genesis_json_hash,shelley_genesis_id,shelley_genesis_json_hash,
+         start_kind,start_slot,start_hash,start_block_number,start_is_byron_ebb,
+         genesis_seeded,complete_history,trust_mode,
          committed_event_seq,committed_tip_origin,committed_tip_slot,committed_tip_hash,
-         committed_tip_block_number,storage_state,active_data_bytes,database_filesystem_bytes,
-         merge_reserve_bytes,logs_runtime_bytes,build_cache_bytes,total_project_bytes,
-         high_water_active_bytes,high_water_total_bytes,warning_bytes,active_data_limit_bytes,
-         project_limit_bytes,writer_id,writer_build,source_build,created_at,updated_at)
+         committed_tip_block_number,committed_tip_is_byron_ebb,
+         writer_id,writer_build,source_build,created_at,updated_at)
         VALUES
-        (1,toUUID(?),764824073,'mainnet',?,?, 'intersection',1,?,false,false,?,
-         2,false,2,?,2,'ok',0,0,0,0,0,0,0,0,64424509440,75161927680,
-         107374182400,toUUID(?),'test','test',now64(6),now64(6))`,
-		dataset, string(zero), string(zero), hashArgument(fixture.block1), model.TrustPeerObserved, hashArgument(fixture.block2), writer)
+        (1,1,toUUID(?),764824073,'mainnet',?,?,?,?,
+         'intersection',1,?,1,false,false,false,?,
+         2,false,2,?,2,false,toUUID(?),'test','test',now64(6),now64(6))`,
+		dataset,
+		string(zero),
+		string(zero),
+		string(zero),
+		string(zero),
+		hashArgument(fixture.block1),
+		model.TrustPeerObserved,
+		hashArgument(fixture.block2),
+		writer,
+	)
 	for _, block := range []struct {
 		publication uint64
 		hash        model.Hash32
@@ -307,8 +325,8 @@ func (fixture fixture) insert(t *testing.T, store *Store) {
 			hashArgument(block.hash), writer)
 		exec(`INSERT INTO chain_events
             (event_seq,publication_id,event_kind,active,rollback_id,block_hash,slot,
-             block_number,writer_id,recorded_at)
-            VALUES (?,?, 'adoption',true,NULL,?,?,?,toUUID(?),now64(6))`,
+             block_number,is_byron_ebb,writer_id,recorded_at)
+            VALUES (?,?, 'adoption',true,NULL,?,?,?,false,toUUID(?),now64(6))`,
 			block.number, block.publication, hashArgument(block.hash), block.slot, block.number, writer)
 	}
 	exec(`INSERT INTO transactions
@@ -416,8 +434,8 @@ func (fixture fixture) insertHeaderlessRollback(t *testing.T, store *Store) {
 	t.Helper()
 	if err := store.conn.Exec(context.Background(), `INSERT INTO chain_events
         (event_seq,publication_id,event_kind,active,rollback_id,block_hash,slot,
-         block_number,writer_id,recorded_at)
-        VALUES (3,102,'invalidation',false,toUUID(?),?,2,2,
+         block_number,is_byron_ebb,writer_id,recorded_at)
+        VALUES (3,102,'invalidation',false,toUUID(?),?,2,2,false,
                 toUUID('22222222-2222-4222-8222-222222222222'),now64(6))`,
 		fixture.rollbackID, hashArgument(fixture.block2)); err != nil {
 		t.Fatal(err)
@@ -428,9 +446,12 @@ func (fixture fixture) commitRollback(t *testing.T, store *Store) {
 	t.Helper()
 	if err := store.conn.Exec(context.Background(), `INSERT INTO rollbacks
         (rollback_id,event_seq,rollback_to_origin,rollback_to_slot,rollback_to_hash,
-         old_tip_slot,old_tip_hash,old_tip_block_number,depth,reason,observed_peers,
+         rollback_to_block_number,rollback_to_is_byron_ebb,
+         old_tip_slot,old_tip_hash,old_tip_block_number,old_tip_is_byron_ebb,
+         depth,reason,observed_peers,observed_operators,corroboration_required,
          agreement_group,writer_id,recorded_at)
-        VALUES (toUUID(?),3,false,1,?,2,?,2,1,'test',['peer-a','peer-b'],NULL,
+        VALUES (toUUID(?),3,false,1,?,1,false,2,?,2,false,1,'test',
+                ['peer-a','peer-b'],['operator-a','operator-b'],2,NULL,
                 toUUID('22222222-2222-4222-8222-222222222222'),now64(6))`,
 		fixture.rollbackID, hashArgument(fixture.block1), hashArgument(fixture.block2)); err != nil {
 		t.Fatal(err)
@@ -441,10 +462,31 @@ func (fixture fixture) readopt(t *testing.T, store *Store) {
 	t.Helper()
 	if err := store.conn.Exec(context.Background(), `INSERT INTO chain_events
         (event_seq,publication_id,event_kind,active,rollback_id,block_hash,slot,
-         block_number,writer_id,recorded_at)
-        VALUES (4,102,'adoption',true,NULL,?,2,2,
+         block_number,is_byron_ebb,writer_id,recorded_at)
+        VALUES (4,102,'adoption',true,NULL,?,2,2,false,
                 toUUID('22222222-2222-4222-8222-222222222222'),now64(6))`,
 		hashArgument(fixture.block2)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (fixture fixture) commitNoOpRollback(t *testing.T, store *Store) {
+	t.Helper()
+	if err := store.conn.Exec(context.Background(), `INSERT INTO rollbacks
+        (rollback_id,event_seq,rollback_to_origin,rollback_to_slot,rollback_to_hash,
+         rollback_to_block_number,rollback_to_is_byron_ebb,
+         old_tip_slot,old_tip_hash,old_tip_block_number,old_tip_is_byron_ebb,
+         depth,reason,observed_peers,observed_operators,corroboration_required,
+         agreement_group,writer_id,recorded_at)
+        VALUES (
+            toUUID('55555555-5555-4555-8555-555555555555'),
+            5,false,2,?,2,false,2,?,2,false,0,'no-op corroboration',
+            ['peer-a','peer-b'],['operator-a','operator-b'],2,NULL,
+            toUUID('22222222-2222-4222-8222-222222222222'),now64(6)
+        )`,
+		hashArgument(fixture.block2),
+		hashArgument(fixture.block2),
+	); err != nil {
 		t.Fatal(err)
 	}
 }

@@ -7,11 +7,15 @@ CREATE TABLE IF NOT EXISTS clicksync.dataset_manifest
     dataset_id UUID,
     network_magic UInt32,
     network_name String,
-    byron_genesis_hash FixedString(32),
-    shelley_genesis_hash FixedString(32),
+    byron_genesis_id FixedString(32),
+    byron_genesis_json_hash FixedString(32),
+    shelley_genesis_id FixedString(32),
+    shelley_genesis_json_hash FixedString(32),
     start_kind Enum8('origin' = 1, 'intersection' = 2),
     start_slot Nullable(UInt64),
     start_hash Nullable(FixedString(32)),
+    start_block_number Nullable(UInt64),
+    start_is_byron_ebb Bool,
     genesis_seeded Bool,
     complete_history Bool,
     trust_mode String,
@@ -20,18 +24,7 @@ CREATE TABLE IF NOT EXISTS clicksync.dataset_manifest
     committed_tip_slot Nullable(UInt64),
     committed_tip_hash Nullable(FixedString(32)),
     committed_tip_block_number Nullable(UInt64),
-    storage_state Enum8('ok' = 1, 'warning' = 2, 'paused' = 3),
-    active_data_bytes UInt64,
-    database_filesystem_bytes UInt64,
-    merge_reserve_bytes UInt64,
-    logs_runtime_bytes UInt64,
-    build_cache_bytes UInt64,
-    total_project_bytes UInt64,
-    high_water_active_bytes UInt64,
-    high_water_total_bytes UInt64,
-    warning_bytes UInt64,
-    active_data_limit_bytes UInt64,
-    project_limit_bytes UInt64,
+    committed_tip_is_byron_ebb Bool,
     writer_id Nullable(UUID),
     writer_build String,
     source_build String,
@@ -40,20 +33,14 @@ CREATE TABLE IF NOT EXISTS clicksync.dataset_manifest
     CONSTRAINT dataset_manifest_singleton CHECK manifest_key = 1,
     CONSTRAINT dataset_manifest_trust CHECK trust_mode = 'peer_observed_structurally_verified',
     CONSTRAINT dataset_manifest_start_point CHECK
-        (start_kind = 'origin' AND isNull(start_slot) AND isNull(start_hash))
+        (start_kind = 'origin' AND isNull(start_slot) AND isNull(start_hash) AND isNull(start_block_number) AND NOT start_is_byron_ebb)
         OR
-        (start_kind = 'intersection' AND isNotNull(start_slot) AND isNotNull(start_hash)),
+        (start_kind = 'intersection' AND isNotNull(start_slot) AND isNotNull(start_hash) AND isNotNull(start_block_number)),
     CONSTRAINT dataset_manifest_tip CHECK
-        (committed_tip_origin AND isNull(committed_tip_slot) AND isNull(committed_tip_hash) AND isNull(committed_tip_block_number))
+        (committed_tip_origin AND isNull(committed_tip_slot) AND isNull(committed_tip_hash) AND isNull(committed_tip_block_number) AND NOT committed_tip_is_byron_ebb)
         OR
         (NOT committed_tip_origin AND isNotNull(committed_tip_slot) AND isNotNull(committed_tip_hash) AND isNotNull(committed_tip_block_number)),
-    CONSTRAINT dataset_manifest_completeness CHECK complete_history = (start_kind = 'origin' AND genesis_seeded),
-    CONSTRAINT dataset_manifest_budget CHECK
-        warning_bytes < active_data_limit_bytes
-        AND active_data_limit_bytes < project_limit_bytes
-        AND active_data_bytes <= total_project_bytes
-        AND high_water_active_bytes >= active_data_bytes
-        AND high_water_total_bytes >= total_project_bytes
+    CONSTRAINT dataset_manifest_completeness CHECK complete_history = (start_kind = 'origin' AND genesis_seeded)
 )
 ENGINE = ReplacingMergeTree(revision)
 ORDER BY manifest_key;
@@ -86,6 +73,7 @@ CREATE TABLE IF NOT EXISTS clicksync.blocks
     writer_id UUID,
     observed_at DateTime64(6, 'UTC'),
     inserted_at DateTime64(6, 'UTC'),
+    INDEX publication_idx publication_id TYPE minmax GRANULARITY 1,
     CONSTRAINT blocks_structural_verification CHECK synthetic OR (body_hash_verified AND transaction_hashes_verified)
 )
 ENGINE = MergeTree
@@ -102,8 +90,14 @@ CREATE TABLE IF NOT EXISTS clicksync.chain_events
     block_hash FixedString(32),
     slot UInt64,
     block_number UInt64,
+    is_byron_ebb Bool,
     writer_id UUID,
     recorded_at DateTime64(6, 'UTC'),
+    PROJECTION by_event_seq
+    (
+        SELECT event_seq, event_kind, publication_id, active, rollback_id, is_byron_ebb
+        ORDER BY (event_seq, event_kind, publication_id)
+    ),
     CONSTRAINT chain_events_kind CHECK
         (event_kind = 'adoption' AND active AND isNull(rollback_id))
         OR
@@ -120,24 +114,32 @@ CREATE TABLE IF NOT EXISTS clicksync.rollbacks
     rollback_to_origin Bool,
     rollback_to_slot Nullable(UInt64),
     rollback_to_hash Nullable(FixedString(32)),
+    rollback_to_block_number Nullable(UInt64),
+    rollback_to_is_byron_ebb Bool,
     old_tip_slot Nullable(UInt64),
     old_tip_hash Nullable(FixedString(32)),
     old_tip_block_number Nullable(UInt64),
+    old_tip_is_byron_ebb Bool,
     depth UInt32,
     reason String,
     observed_peers Array(String),
+    observed_operators Array(String),
+    corroboration_required UInt16,
     agreement_group Nullable(UUID),
     writer_id UUID,
     recorded_at DateTime64(6, 'UTC'),
     CONSTRAINT rollbacks_point CHECK
-        (rollback_to_origin AND isNull(rollback_to_slot) AND isNull(rollback_to_hash))
+        (rollback_to_origin AND isNull(rollback_to_slot) AND isNull(rollback_to_hash) AND isNull(rollback_to_block_number) AND NOT rollback_to_is_byron_ebb)
         OR
-        (NOT rollback_to_origin AND isNotNull(rollback_to_slot) AND isNotNull(rollback_to_hash)),
+        (NOT rollback_to_origin AND isNotNull(rollback_to_slot) AND isNotNull(rollback_to_hash) AND isNotNull(rollback_to_block_number)),
     CONSTRAINT rollbacks_old_tip CHECK
-        (isNull(old_tip_slot) AND isNull(old_tip_hash) AND isNull(old_tip_block_number))
+        (isNull(old_tip_slot) AND isNull(old_tip_hash) AND isNull(old_tip_block_number) AND NOT old_tip_is_byron_ebb)
         OR
         (isNotNull(old_tip_slot) AND isNotNull(old_tip_hash) AND isNotNull(old_tip_block_number)),
-    CONSTRAINT rollbacks_peers CHECK length(observed_peers) > 0
+    CONSTRAINT rollbacks_peers CHECK
+        length(observed_peers) = length(observed_operators)
+        AND length(observed_peers) > 0
+        AND length(arrayDistinct(observed_operators)) >= corroboration_required
 )
 ENGINE = MergeTree
 PARTITION BY intDiv(event_seq, 1000000)
@@ -168,6 +170,7 @@ CREATE TABLE IF NOT EXISTS clicksync.transactions
     redeemer_count UInt32,
     metadata_present Bool,
     datum_observation_count UInt32,
+    INDEX publication_idx publication_id TYPE minmax GRANULARITY 1,
     CONSTRAINT transactions_mint_arrays CHECK
         length(mint_policy_ids) = length(mint_asset_names)
         AND length(mint_policy_ids) = length(mint_quantities),
@@ -193,6 +196,12 @@ CREATE TABLE IF NOT EXISTS clicksync.inputs
     role Enum8('regular' = 1, 'collateral' = 2, 'reference' = 3),
     is_consumed Bool,
     source_is_resolved Bool,
+    INDEX publication_idx publication_id TYPE minmax GRANULARITY 1,
+    PROJECTION inputs_by_consuming_tx
+    (
+        SELECT tx_hash, publication_id, body_ordinal, _part_offset
+        ORDER BY (tx_hash, publication_id, body_ordinal)
+    ),
     CONSTRAINT inputs_reference_not_consumed CHECK role != 'reference' OR NOT is_consumed
 )
 ENGINE = MergeTree
@@ -209,6 +218,7 @@ CREATE TABLE IF NOT EXISTS clicksync.outputs
     body_ordinal UInt32,
     output_kind Enum8('regular' = 1, 'collateral_return' = 2, 'genesis' = 3),
     address String CODEC(ZSTD(3)),
+    address_hash UInt64 MATERIALIZED sipHash64(address),
     lovelace UInt64,
     asset_policy_ids Array(FixedString(28)),
     asset_names Array(String) CODEC(ZSTD(3)),
@@ -217,6 +227,12 @@ CREATE TABLE IF NOT EXISTS clicksync.outputs
     datum_hash Nullable(FixedString(32)),
     reference_script_hash Nullable(FixedString(28)),
     reference_script_language Nullable(String),
+    INDEX publication_idx publication_id TYPE minmax GRANULARITY 1,
+    PROJECTION outputs_by_address_hash
+    (
+        SELECT address_hash, _part_offset
+        ORDER BY address_hash
+    ),
     CONSTRAINT outputs_asset_arrays CHECK
         length(asset_policy_ids) = length(asset_names)
         AND length(asset_policy_ids) = length(asset_quantities),
@@ -242,6 +258,7 @@ CREATE TABLE IF NOT EXISTS clicksync.datum_bodies
     content_hash FixedString(32),
     first_publication_id UInt64,
     first_seen_at DateTime64(6, 'UTC'),
+    INDEX first_publication_idx first_publication_id TYPE minmax GRANULARITY 1,
     CONSTRAINT datum_bodies_length CHECK byte_length = length(datum_cbor),
     CONSTRAINT datum_bodies_content_hash CHECK datum_hash = content_hash
 )
@@ -257,7 +274,8 @@ CREATE TABLE IF NOT EXISTS clicksync.datum_observations
     tx_order UInt32,
     source_kind Enum8('inline_output' = 1, 'witness' = 2),
     source_ordinal UInt32,
-    output_index Nullable(UInt32)
+    output_index Nullable(UInt32),
+    INDEX publication_idx publication_id TYPE minmax GRANULARITY 1
 )
 ENGINE = MergeTree
 PARTITION BY intDiv(block_number, 1000000)
@@ -274,7 +292,8 @@ CREATE TABLE IF NOT EXISTS clicksync.withdrawals
     lovelace UInt64,
     is_applied Bool,
     credential_kind Enum8('key' = 1, 'script' = 2),
-    credential_hash FixedString(28)
+    credential_hash FixedString(28),
+    INDEX publication_idx publication_id TYPE minmax GRANULARITY 1
 )
 ENGINE = MergeTree
 PARTITION BY intDiv(block_number, 1000000)
@@ -310,6 +329,7 @@ CREATE TABLE IF NOT EXISTS clicksync.redeemers
     target_body_ordinal Nullable(UInt32),
     target_identity Nullable(String),
     resolved_script_hash Nullable(FixedString(28)),
+    INDEX publication_idx publication_id TYPE minmax GRANULARITY 1,
     CONSTRAINT redeemers_data_length CHECK data_byte_length = length(data_cbor),
     CONSTRAINT redeemers_spend_target CHECK
         purpose != 'spend'
@@ -336,6 +356,7 @@ CREATE TABLE IF NOT EXISTS clicksync.transaction_metadata
     metadata_cbor String CODEC(ZSTD(3)),
     byte_length UInt32,
     content_hash FixedString(32),
+    INDEX publication_idx publication_id TYPE minmax GRANULARITY 1,
     CONSTRAINT transaction_metadata_length CHECK byte_length = length(metadata_cbor),
     CONSTRAINT transaction_metadata_labels CHECK labels = arraySort(labels)
 )
@@ -346,6 +367,7 @@ ORDER BY (tx_hash, publication_id);
 CREATE TABLE IF NOT EXISTS clicksync.peer_observations
 (
     observation_id UUID,
+    observation_digest FixedString(32),
     observation_kind Enum8(
         'checkpoint' = 1,
         'source_change' = 2,
@@ -363,6 +385,7 @@ CREATE TABLE IF NOT EXISTS clicksync.peer_observations
     checkpoint_slot Nullable(UInt64),
     checkpoint_hash Nullable(FixedString(32)),
     checkpoint_block_number Nullable(UInt64),
+    checkpoint_is_byron_ebb Nullable(Bool),
     agreement_group Nullable(UUID),
     selected_body_source Bool,
     body_hash_verified Bool,
@@ -372,32 +395,33 @@ CREATE TABLE IF NOT EXISTS clicksync.peer_observations
     reason String,
     observed_at DateTime64(6, 'UTC'),
     CONSTRAINT peer_observations_checkpoint CHECK
-        (isNull(checkpoint_slot) AND isNull(checkpoint_hash) AND isNull(checkpoint_block_number))
+        (isNull(checkpoint_slot) AND isNull(checkpoint_hash) AND isNull(checkpoint_block_number) AND isNull(checkpoint_is_byron_ebb))
         OR
-        (isNotNull(checkpoint_slot) AND isNotNull(checkpoint_hash) AND isNotNull(checkpoint_block_number))
+        (isNotNull(checkpoint_slot) AND isNotNull(checkpoint_hash) AND isNotNull(checkpoint_block_number) AND isNotNull(checkpoint_is_byron_ebb))
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(observed_at)
 ORDER BY (observed_tip_hash, observed_at, peer_host, observation_id);
 
-CREATE TABLE IF NOT EXISTS clicksync.writer_lease
+CREATE TABLE IF NOT EXISTS clicksync.writer_audit
 (
     dataset_id UUID,
     revision UInt64,
-    lease_epoch UInt64,
     owner_id UUID,
-    fencing_token UUID,
-    state Enum8('active' = 1, 'released' = 2, 'expired' = 3),
+    state Enum8('active' = 1, 'released' = 2),
     build_id String,
     hostname String,
     process_id UInt32,
     acquired_at DateTime64(6, 'UTC'),
     heartbeat_at DateTime64(6, 'UTC'),
-    expires_at DateTime64(6, 'UTC'),
+    released_at Nullable(DateTime64(6, 'UTC')),
     release_reason String,
-    CONSTRAINT writer_lease_time CHECK
-        acquired_at <= heartbeat_at
-        AND heartbeat_at <= expires_at
+    lock_path String,
+    CONSTRAINT writer_audit_time CHECK acquired_at <= heartbeat_at,
+    CONSTRAINT writer_audit_state CHECK
+        (state = 'active' AND isNull(released_at))
+        OR
+        (state = 'released' AND isNotNull(released_at))
 )
 ENGINE = ReplacingMergeTree(revision)
 ORDER BY dataset_id;
