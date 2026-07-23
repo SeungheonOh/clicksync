@@ -178,6 +178,15 @@ func TestDijkstraNestedTransactionFailsBeforeNormalization(t *testing.T) {
 	}
 }
 
+func TestTransactionIDVerificationRejectsMismatch(t *testing.T) {
+	bodyCBOR := []byte{0xa0}
+	var wrong lcommon.Blake2b256
+	if err := verifyTransactionID(wrong, bodyCBOR); err == nil ||
+		!strings.Contains(err.Error(), "transaction ID mismatch") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 type txOptions struct {
 	inputs           []ledger.ShelleyTransactionInput
 	outputs          []ledger.BabbageTransactionOutput
