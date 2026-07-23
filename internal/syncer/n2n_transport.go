@@ -15,10 +15,11 @@ import (
 )
 
 type DirectTransport struct {
-	config    n2n.DialConfig
-	logger    *slog.Logger
-	runPeer   runPeerFunc
-	probePeer probePeerFunc
+	config            n2n.DialConfig
+	logger            *slog.Logger
+	runPeer           runPeerFunc
+	probePeer         probePeerFunc
+	probeRollbackPeer probeRollbackPeerFunc
 }
 
 type runPeerFunc func(
@@ -38,15 +39,25 @@ type probePeerFunc func(
 	*slog.Logger,
 ) (n2n.PointProbe, error)
 
+type probeRollbackPeerFunc func(
+	context.Context,
+	n2n.Peer,
+	n2n.DialConfig,
+	pcommon.Point,
+	pcommon.Point,
+	*slog.Logger,
+) (n2n.RollbackPointProbe, error)
+
 func NewDirectTransport(config n2n.DialConfig, logger *slog.Logger) (*DirectTransport, error) {
 	if logger == nil {
 		return nil, errors.New("nil direct N2N transport logger")
 	}
 	return &DirectTransport{
-		config:    config,
-		logger:    logger,
-		runPeer:   n2n.RunPeer,
-		probePeer: n2n.ProbePeer,
+		config:            config,
+		logger:            logger,
+		runPeer:           n2n.RunPeer,
+		probePeer:         n2n.ProbePeer,
+		probeRollbackPeer: n2n.ProbeRollbackPeer,
 	}, nil
 }
 
@@ -64,6 +75,32 @@ func (t *DirectTransport) Probe(
 		Tip:        cloneTip(result.Tip),
 		N2NVersion: result.Peer.N2NVersion,
 		Address:    result.Peer.Address,
+	}, nil
+}
+
+func (t *DirectTransport) ProbeRollback(
+	ctx context.Context,
+	peer n2n.Peer,
+	target pcommon.Point,
+	branch pcommon.Point,
+) (RollbackProbeResult, error) {
+	result, err := t.probeRollbackPeer(
+		ctx,
+		peer,
+		t.config,
+		target,
+		branch,
+		t.logger,
+	)
+	if err != nil {
+		return RollbackProbeResult{}, classifyDirectError(err)
+	}
+	return RollbackProbeResult{
+		TargetAccepted: result.TargetAccepted,
+		BranchAccepted: result.BranchAccepted,
+		Tip:            cloneTip(result.Tip),
+		N2NVersion:     result.Peer.N2NVersion,
+		Address:        result.Peer.Address,
 	}, nil
 }
 

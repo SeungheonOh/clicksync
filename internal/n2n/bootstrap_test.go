@@ -118,6 +118,41 @@ func TestBootstrapBoundaryPreservesUnavailableEvidence(t *testing.T) {
 	}
 }
 
+func TestBootstrapBoundaryClassifiesInsufficientCorroboration(t *testing.T) {
+	point := testPoint(10, 0x10)
+	peers := bootstrapPeers()[:2]
+	_, err := bootstrapBoundary(
+		context.Background(),
+		peers,
+		2,
+		bootstrapDialConfig(),
+		point,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		func(
+			_ context.Context,
+			peer Peer,
+			_ DialConfig,
+			_ pcommon.Point,
+			_ *slog.Logger,
+		) (BoundaryPeerEvidence, error) {
+			status := BoundaryAccepted
+			if peer.Operator == "two" {
+				status = BoundaryRejected
+			}
+			return BoundaryPeerEvidence{
+				Peer:        peer,
+				Status:      status,
+				BlockNumber: 9,
+			}, nil
+		},
+	)
+	var bootstrapErr *BoundaryBootstrapError
+	if !errors.As(err, &bootstrapErr) ||
+		bootstrapErr.Kind != BoundaryInsufficient {
+		t.Fatalf("insufficient corroboration error = %T %v", err, err)
+	}
+}
+
 func TestBootstrapBoundaryFailsClosedOnHeightDisagreement(t *testing.T) {
 	point := testPoint(10, 0x10)
 	peers := bootstrapPeers()
@@ -149,6 +184,7 @@ func TestBootstrapBoundaryFailsClosedOnHeightDisagreement(t *testing.T) {
 	)
 	var bootstrapErr *BoundaryBootstrapError
 	if !errors.As(err, &bootstrapErr) ||
+		bootstrapErr.Kind != BoundaryConflict ||
 		!strings.Contains(bootstrapErr.Reason, "conflicting block metadata") ||
 		len(bootstrapErr.Evidence) != 2 {
 		t.Fatalf("height disagreement error = %T %v", err, err)
@@ -216,6 +252,7 @@ func TestBootstrapBoundaryCarriesAndCorroboratesByronEBB(t *testing.T) {
 	)
 	var bootstrapErr *BoundaryBootstrapError
 	if !errors.As(err, &bootstrapErr) ||
+		bootstrapErr.Kind != BoundaryConflict ||
 		!strings.Contains(bootstrapErr.Reason, "conflicting block metadata") {
 		t.Fatalf("Byron EBB metadata disagreement = %T %v", err, err)
 	}

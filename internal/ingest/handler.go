@@ -3,6 +3,7 @@
 package ingest
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -223,13 +224,22 @@ func (handler *Handler) RollForward(
 func (handler *Handler) RollBackward(
 	ctx context.Context,
 	point n2n.ChainPoint,
-	_ chainsync.Tip,
+	tip chainsync.Tip,
 	evidence syncer.RollbackEvidence,
 ) (syncer.CommitOutcome, error) {
 	handler.mu.Lock()
 	defer handler.mu.Unlock()
 	handler.stopTimerLocked()
 	if handler.terminalErr != nil {
+		return handler.terminalOutcomeLocked(false)
+	}
+	confirmations, err := handler.rollbackConfirmationEvidence(
+		point,
+		tip,
+		evidence,
+	)
+	if err != nil {
+		handler.failLocked(err)
 		return handler.terminalOutcomeLocked(false)
 	}
 	target := publicationPoint(point)
@@ -253,7 +263,7 @@ func (handler *Handler) RollBackward(
 	request, err := handler.rollbackRequest(
 		target,
 		"corroborated remote rollback",
-		evidence.Confirmations,
+		confirmations,
 	)
 	if err != nil {
 		handler.failLocked(err)
@@ -274,6 +284,88 @@ func (handler *Handler) RollBackward(
 	outcome := handler.takeUnreportedLocked()
 	outcome.Committed = true
 	return outcome, nil
+}
+
+// RollbackObserved is a non-durable safety barrier. A valid ChainSync
+// rollback means every staged descendant may be off-chain; discard them
+// before network corroboration can block, fail, or be canceled.
+func (handler *Handler) RollbackObserved(
+	_ context.Context,
+	_ n2n.ChainPoint,
+	_ chainsync.Tip,
+) error {
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	handler.stopTimerLocked()
+	handler.clearPendingLocked()
+	return handler.terminalErr
+}
+
+func (handler *Handler) rollbackConfirmationEvidence(
+	target n2n.ChainPoint,
+	branchTip chainsync.Tip,
+	evidence syncer.RollbackEvidence,
+) ([]syncer.PeerEvidence, error) {
+	if !samePublicationPoint(
+		publicationPoint(target),
+		publicationPoint(evidence.Target),
+	) {
+		return nil, errors.New(
+			"rollback evidence target differs from callback target",
+		)
+	}
+	if !sameTip(branchTip, evidence.BranchTip) {
+		return nil, errors.New(
+			"rollback evidence branch tip differs from callback tip",
+		)
+	}
+	ret := make([]syncer.PeerEvidence, 0, len(evidence.Confirmations))
+	primaryFound := false
+	for _, confirmation := range evidence.Confirmations {
+		if !samePublicationPoint(
+			publicationPoint(target),
+			publicationPoint(confirmation.Target),
+		) {
+			return nil, errors.New(
+				"rollback confirmation target metadata differs",
+			)
+		}
+		if !sameTip(branchTip, confirmation.BranchTip) {
+			return nil, errors.New(
+				"rollback confirmation branch tip differs",
+			)
+		}
+		member := confirmation.Membership
+		if member.Peer.Host == "" || member.Peer.Operator == "" {
+			return nil, errors.New(
+				"rollback confirmation has incomplete session identity",
+			)
+		}
+		if member.Peer.Operator == evidence.Source.Primary.Peer.Operator {
+			if member.Peer.Host != evidence.Source.Primary.Peer.Host {
+				return nil, errors.New(
+					"rollback primary confirmation host differs",
+				)
+			}
+			if confirmation.Method != syncer.RollbackProofFollowBlockFetch {
+				return nil, errors.New(
+					"rollback primary confirmation lacks Follow BlockFetch proof",
+				)
+			}
+			primaryFound = true
+		} else if confirmation.Method != syncer.RollbackProofPairedSingleton {
+			return nil, errors.New(
+				"rollback secondary confirmation lacks paired singleton proof",
+			)
+		}
+		ret = append(ret, member)
+	}
+	if !primaryFound {
+		return nil, errors.New(
+			"rollback confirmations omit the callback source",
+		)
+	}
+	return ret, nil
 }
 
 func (handler *Handler) EndAttempt(
@@ -652,6 +744,12 @@ func samePublicationPoint(left, right publication.Point) bool {
 		left.Hash == right.Hash &&
 		left.BlockNumber == right.BlockNumber &&
 		left.IsByronEBB == right.IsByronEBB
+}
+
+func sameTip(left, right chainsync.Tip) bool {
+	return left.BlockNumber == right.BlockNumber &&
+		left.Point.Slot == right.Point.Slot &&
+		bytes.Equal(left.Point.Hash, right.Point.Hash)
 }
 
 func cloneTip(value chainsync.Tip) chainsync.Tip {

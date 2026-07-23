@@ -32,6 +32,7 @@ type Observer interface {
 type Handler interface {
 	Reconcile(context.Context, n2n.ChainPoint, SourceEvidence) (CommitOutcome, error)
 	RollForward(context.Context, lcommon.Block, chainsync.Tip, SourceEvidence) (CommitOutcome, error)
+	RollbackObserved(context.Context, n2n.ChainPoint, chainsync.Tip) error
 	RollBackward(context.Context, n2n.ChainPoint, chainsync.Tip, RollbackEvidence) (CommitOutcome, error)
 	EndAttempt(context.Context, AttemptEnd) (CommitOutcome, error)
 }
@@ -69,8 +70,31 @@ type SourceEvidence struct {
 type RollbackEvidence struct {
 	Source        SourceEvidence
 	Target        n2n.ChainPoint
-	Confirmations []PeerEvidence
+	BranchTip     chainsync.Tip
+	Confirmations []RollbackConfirmation
 }
+
+// RollbackConfirmation retains the one negotiated session identity that
+// proved both exact singleton memberships for one operator.
+type RollbackConfirmation struct {
+	Target     n2n.ChainPoint
+	BranchTip  chainsync.Tip
+	Membership PeerEvidence
+	Method     RollbackProofMethod
+}
+
+type RollbackProofMethod string
+
+const (
+	// RollbackProofFollowBlockFetch identifies the primary Follow session:
+	// n2n resolved the rollback target with validation-enabled exact
+	// BlockFetch before delivering the target metadata and branch tip in one
+	// callback.
+	RollbackProofFollowBlockFetch RollbackProofMethod = "follow_block_fetch"
+	// RollbackProofPairedSingleton identifies one fresh corroborator session
+	// that ran singleton ChainSync membership for target, then branch tip.
+	RollbackProofPairedSingleton RollbackProofMethod = "paired_singleton"
+)
 
 type AttemptEnd struct {
 	Source SourceEvidence
@@ -82,6 +106,14 @@ type Transport interface {
 	// resolution again. Accepted means the exact singleton point is on the
 	// peer's currently selected ChainSync chain.
 	Probe(context.Context, n2n.Peer, pcommon.Point) (ProbeResult, error)
+	// ProbeRollback proves target and branch membership on one fresh
+	// negotiated session, returning one actual connection identity and tip.
+	ProbeRollback(
+		context.Context,
+		n2n.Peer,
+		pcommon.Point,
+		pcommon.Point,
+	) (RollbackProbeResult, error)
 	Follow(context.Context, n2n.Peer, []n2n.ChainPoint, n2n.Handler) error
 }
 
@@ -109,6 +141,14 @@ type ProbeResult struct {
 	Tip        chainsync.Tip
 	N2NVersion uint16
 	Address    string
+}
+
+type RollbackProbeResult struct {
+	TargetAccepted bool
+	BranchAccepted bool
+	Tip            chainsync.Tip
+	N2NVersion     uint16
+	Address        string
 }
 
 type CorroborationUnavailableError struct {
@@ -289,6 +329,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			},
 			delegate:        s.handler,
 			committedBlocks: &committedBlocks,
+			quarantined:     quarantined,
 			sourceReason:    sourceReason,
 		}
 		err = s.transport.Follow(
@@ -562,6 +603,7 @@ type attemptHandler struct {
 	evidence        SourceEvidence
 	delegate        Handler
 	committedBlocks *uint64
+	quarantined     map[string]struct{}
 	committed       bool
 	started         bool
 	sourceReason    string
@@ -727,17 +769,41 @@ func (h *attemptHandler) RollBackward(
 	if err := h.validateCallbackPeer(peer); err != nil {
 		return h.terminal(err)
 	}
+	if err := validateRollbackOrder(point, tip); err != nil {
+		return h.terminal(err)
+	}
+	if err := h.delegate.RollbackObserved(ctx, point, tip); err != nil {
+		return h.terminal(fmt.Errorf(
+			"discard pending branch after rollback observation: %w",
+			err,
+		))
+	}
 	h.evidence.Primary.Tip = cloneTip(tip)
-	confirmed := []PeerEvidence{h.evidence.Primary}
+	confirmed := []RollbackConfirmation{{
+		Target:     cloneChainPoint(point),
+		BranchTip:  cloneTip(tip),
+		Membership: clonePeerEvidence(h.evidence.Primary),
+		Method:     RollbackProofFollowBlockFetch,
+	}}
 	confirmedOperators := map[string]struct{}{
-		h.evidence.Primary.Peer.Operator: {},
+		operatorKey(h.evidence.Primary.Peer.Operator): {},
 	}
 	confirmations := 1
+	sawUnavailable := false
 	for _, candidatePeer := range h.supervisor.config.Peers {
-		if _, duplicate := confirmedOperators[candidatePeer.Operator]; duplicate {
+		key := operatorKey(candidatePeer.Operator)
+		if _, duplicate := confirmedOperators[key]; duplicate {
 			continue
 		}
-		result, err := h.supervisor.transport.Probe(ctx, candidatePeer, tip.Point)
+		if h.operatorQuarantined(candidatePeer.Operator) {
+			continue
+		}
+		result, err := h.supervisor.transport.ProbeRollback(
+			ctx,
+			candidatePeer,
+			point.Point,
+			tip.Point,
+		)
 		observedPeer := candidatePeer
 		if result.Address != "" {
 			observedPeer.Address = result.Address
@@ -752,30 +818,91 @@ func (h *attemptHandler) RollBackward(
 			N2NVersion:            result.N2NVersion,
 			ObservedAt:            h.supervisor.now().UTC(),
 		}
+		quarantine := false
+		terminalProbeErr := error(nil)
 		if err != nil {
-			observation.Result = "unavailable"
-			observation.Reason = err.Error()
-		} else if !result.Accepted || result.Tip.BlockNumber < tip.BlockNumber {
+			var peerData *n2n.PeerDataViolation
+			var transportError *TransportError
+			switch {
+			case errors.Is(err, context.Canceled),
+				errors.Is(err, context.DeadlineExceeded):
+				observation.Result = "unavailable"
+				observation.Reason = err.Error()
+				terminalProbeErr = err
+			case errors.As(err, &peerData):
+				observation.Result = "quarantined"
+				observation.Reason = "peer_data_violation: " + err.Error()
+				quarantine = true
+			case errors.As(err, &transportError):
+				observation.Result = "unavailable"
+				observation.Reason = err.Error()
+				sawUnavailable = true
+			default:
+				observation.Result = "unavailable"
+				observation.Reason = "terminal_probe_failure: " + err.Error()
+				terminalProbeErr = fmt.Errorf(
+					"unclassified rollback proof failure is terminal: %w",
+					err,
+				)
+			}
+		} else if !result.TargetAccepted {
 			observation.Result = "quarantined"
-			observation.Reason = "peer did not confirm the rollback branch tip"
+			observation.Reason = "peer rejected the exact rollback target"
+			quarantine = true
+		} else if !result.BranchAccepted {
+			observation.Result = "quarantined"
+			observation.Reason = "peer rejected the exact rollback branch tip"
+			quarantine = true
+		} else if orderErr := validateRollbackProbeTip(
+			point,
+			tip,
+			result.Tip,
+		); orderErr != nil {
+			observation.Result = "quarantined"
+			observation.Reason = orderErr.Error()
+			quarantine = true
 		} else {
 			observation.Result = "agreed"
+			observation.Reason = "one session confirmed exact target and branch tip"
 			confirmations++
-			confirmedOperators[candidatePeer.Operator] = struct{}{}
-			confirmed = append(confirmed, PeerEvidence{
-				Peer:       observedPeer,
-				Tip:        cloneTip(result.Tip),
-				N2NVersion: result.N2NVersion,
+			confirmedOperators[key] = struct{}{}
+			confirmed = append(confirmed, RollbackConfirmation{
+				Target:    cloneChainPoint(point),
+				BranchTip: cloneTip(tip),
+				Membership: PeerEvidence{
+					Peer:       observedPeer,
+					Tip:        cloneTip(result.Tip),
+					N2NVersion: result.N2NVersion,
+				},
+				Method: RollbackProofPairedSingleton,
 			})
+		}
+		if quarantine {
+			h.quarantineOperator(candidatePeer.Operator)
 		}
 		if observeErr := h.supervisor.observer.Observe(ctx, observation); observeErr != nil {
 			return fmt.Errorf("record rollback observation: %w", observeErr)
+		}
+		if terminalProbeErr != nil {
+			if errors.Is(terminalProbeErr, context.Canceled) ||
+				errors.Is(terminalProbeErr, context.DeadlineExceeded) {
+				return terminalProbeErr
+			}
+			return h.terminal(terminalProbeErr)
+		}
+		if quarantine {
+			if remainingErr := h.supervisor.requireRemainingOperators(
+				h.quarantined,
+			); remainingErr != nil {
+				return h.terminal(remainingErr)
+			}
 		}
 		if confirmations >= h.supervisor.config.RollbackConfirmations {
 			outcome, err := h.delegate.RollBackward(ctx, point, tip, RollbackEvidence{
 				Source:        h.currentEvidence(),
 				Target:        cloneChainPoint(point),
-				Confirmations: cloneAgreement(confirmed),
+				BranchTip:     cloneTip(tip),
+				Confirmations: cloneRollbackConfirmations(confirmed),
 			})
 			if outcome.Committed {
 				h.committed = true
@@ -821,6 +948,15 @@ func (h *attemptHandler) RollBackward(
 			}
 			return nil
 		}
+	}
+	if sawUnavailable &&
+		h.remainingRollbackOperators() >=
+			h.supervisor.config.RollbackConfirmations {
+		return RetryableTransportError(fmt.Errorf(
+			"rollback corroboration unavailable: got %d of %d required independent confirmations",
+			confirmations,
+			h.supervisor.config.RollbackConfirmations,
+		))
 	}
 	return h.terminal(fmt.Errorf(
 		"rollback quarantined: got %d of %d required independent confirmations",
@@ -1215,8 +1351,27 @@ func cloneTip(tip chainsync.Tip) chainsync.Tip {
 func cloneAgreement(source []PeerEvidence) []PeerEvidence {
 	ret := make([]PeerEvidence, len(source))
 	for index, evidence := range source {
-		ret[index] = evidence
-		ret[index].Tip = cloneTip(evidence.Tip)
+		ret[index] = clonePeerEvidence(evidence)
+	}
+	return ret
+}
+
+func clonePeerEvidence(source PeerEvidence) PeerEvidence {
+	source.Tip = cloneTip(source.Tip)
+	return source
+}
+
+func cloneRollbackConfirmations(
+	source []RollbackConfirmation,
+) []RollbackConfirmation {
+	ret := make([]RollbackConfirmation, len(source))
+	for index, confirmation := range source {
+		ret[index] = RollbackConfirmation{
+			Target:     cloneChainPoint(confirmation.Target),
+			BranchTip:  cloneTip(confirmation.BranchTip),
+			Membership: clonePeerEvidence(confirmation.Membership),
+			Method:     confirmation.Method,
+		}
 	}
 	return ret
 }
@@ -1226,6 +1381,118 @@ func cloneSourceEvidence(source SourceEvidence) SourceEvidence {
 	source.Primary.Tip = cloneTip(source.Primary.Tip)
 	source.CheckpointMembers = cloneAgreement(source.CheckpointMembers)
 	return source
+}
+
+func validateRollbackOrder(
+	target n2n.ChainPoint,
+	branch chainsync.Tip,
+) error {
+	targetOrigin := isOriginPoint(target.Point)
+	branchOrigin := isOriginPoint(branch.Point)
+	if targetOrigin {
+		if target.BlockNumber != 0 || target.IsByronEBB {
+			return errors.New("Origin rollback target carries block metadata")
+		}
+	} else if len(target.Point.Hash) != 32 {
+		return fmt.Errorf(
+			"rollback target at slot %d has %d-byte hash",
+			target.Point.Slot,
+			len(target.Point.Hash),
+		)
+	}
+	if branchOrigin {
+		if !targetOrigin || branch.BlockNumber != 0 {
+			return errors.New("rollback target is after an Origin branch tip")
+		}
+		return nil
+	}
+	if len(branch.Point.Hash) != 32 {
+		return fmt.Errorf(
+			"rollback branch tip at slot %d has %d-byte hash",
+			branch.Point.Slot,
+			len(branch.Point.Hash),
+		)
+	}
+	if target.BlockNumber > branch.BlockNumber ||
+		target.Point.Slot > branch.Point.Slot {
+		return errors.New("rollback target is after the reported branch tip")
+	}
+	if pointsEqual(target.Point, branch.Point) &&
+		target.BlockNumber != branch.BlockNumber {
+		return errors.New(
+			"rollback target and branch tip share a point but not block metadata",
+		)
+	}
+	return nil
+}
+
+func validateRollbackProbeTip(
+	target n2n.ChainPoint,
+	branch chainsync.Tip,
+	remote chainsync.Tip,
+) error {
+	if err := validateRollbackOrder(target, branch); err != nil {
+		return err
+	}
+	if isOriginPoint(remote.Point) {
+		if !isOriginPoint(branch.Point) {
+			return errors.New(
+				"rollback proof remote tip precedes the exact branch tip",
+			)
+		}
+		return nil
+	}
+	if len(remote.Point.Hash) != 32 {
+		return fmt.Errorf(
+			"rollback proof remote tip at slot %d has %d-byte hash",
+			remote.Point.Slot,
+			len(remote.Point.Hash),
+		)
+	}
+	if remote.BlockNumber < branch.BlockNumber ||
+		remote.Point.Slot < branch.Point.Slot {
+		return errors.New(
+			"rollback proof remote tip precedes the exact branch tip",
+		)
+	}
+	return nil
+}
+
+func isOriginPoint(point pcommon.Point) bool {
+	return point.Slot == 0 && len(point.Hash) == 0
+}
+
+func operatorKey(operator string) string {
+	return strings.ToLower(strings.TrimSpace(operator))
+}
+
+func (h *attemptHandler) quarantineOperator(operator string) {
+	if h.quarantined == nil {
+		h.quarantined = make(map[string]struct{})
+	}
+	h.quarantined[operator] = struct{}{}
+}
+
+func (h *attemptHandler) operatorQuarantined(operator string) bool {
+	key := operatorKey(operator)
+	for quarantined := range h.quarantined {
+		if operatorKey(quarantined) == key {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *attemptHandler) remainingRollbackOperators() int {
+	seen := make(map[string]struct{}, len(h.supervisor.config.Peers))
+	for _, peer := range h.supervisor.config.Peers {
+		key := operatorKey(peer.Operator)
+		if key == "" || h.operatorQuarantined(peer.Operator) {
+			continue
+		}
+		seen[key] = struct{}{}
+	}
+	return len(seen)
 }
 
 func nextBackoff(current, maximum time.Duration) time.Duration {

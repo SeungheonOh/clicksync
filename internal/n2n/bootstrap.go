@@ -49,8 +49,16 @@ type BoundaryBootstrap struct {
 type BoundaryBootstrapError struct {
 	Required int
 	Evidence []BoundaryPeerEvidence
+	Kind     BoundaryBootstrapFailureKind
 	Reason   string
 }
+
+type BoundaryBootstrapFailureKind string
+
+const (
+	BoundaryInsufficient BoundaryBootstrapFailureKind = "insufficient"
+	BoundaryConflict     BoundaryBootstrapFailureKind = "conflict"
+)
 
 func (e *BoundaryBootstrapError) Error() string {
 	if e == nil {
@@ -163,6 +171,7 @@ func bootstrapBoundary(
 			return BoundaryBootstrap{}, &BoundaryBootstrapError{
 				Required: corroboration,
 				Evidence: cloneBoundaryEvidenceSlice(evidence),
+				Kind:     BoundaryConflict,
 				Reason: fmt.Sprintf(
 					"accepted peers decoded conflicting block metadata (%d, EBB=%t) and (%d, EBB=%t) for one exact point",
 					height,
@@ -178,6 +187,7 @@ func bootstrapBoundary(
 		return BoundaryBootstrap{}, &BoundaryBootstrapError{
 			Required: corroboration,
 			Evidence: cloneBoundaryEvidenceSlice(evidence),
+			Kind:     BoundaryInsufficient,
 			Reason: fmt.Sprintf(
 				"only %d independent peers accepted and fetched the exact point",
 				len(accepted),

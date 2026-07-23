@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	pcommon "github.com/blinklabs-io/gouroboros/protocol/common"
@@ -294,10 +295,19 @@ func bootstrapBoundaryWithRetry(
 		)
 	}
 	backoff := time.Second
+	quarantined := make(map[string]struct{}, len(peers))
 	for {
+		available := availableBoundaryPeers(peers, quarantined)
+		if len(available) < corroboration {
+			return n2n.BoundaryBootstrap{}, fmt.Errorf(
+				"boundary quarantine leaves %d independent operators, need %d",
+				len(available),
+				corroboration,
+			)
+		}
 		result, err := bootstrap(
 			ctx,
-			peers,
+			available,
 			corroboration,
 			dialConfig,
 			point,
@@ -306,7 +316,12 @@ func bootstrapBoundaryWithRetry(
 		if err == nil {
 			return result, nil
 		}
-		if !retryableBoundaryBootstrap(err) {
+		if !retryableBoundaryBootstrap(
+			err,
+			quarantined,
+			peers,
+			corroboration,
+		) {
 			return n2n.BoundaryBootstrap{}, err
 		}
 		if err := wait(ctx, backoff); err != nil {
@@ -321,7 +336,12 @@ func bootstrapBoundaryWithRetry(
 	}
 }
 
-func retryableBoundaryBootstrap(err error) bool {
+func retryableBoundaryBootstrap(
+	err error,
+	quarantined map[string]struct{},
+	peers []n2n.Peer,
+	corroboration int,
+) bool {
 	var closed *n2n.ProtocolChannelClosed
 	if errors.As(err, &closed) {
 		return true
@@ -330,19 +350,73 @@ func retryableBoundaryBootstrap(err error) bool {
 	if !errors.As(err, &unavailable) || len(unavailable.Evidence) == 0 {
 		return false
 	}
+	if unavailable.Kind == n2n.BoundaryConflict {
+		return false
+	}
+	if unavailable.Kind != "" &&
+		unavailable.Kind != n2n.BoundaryInsufficient {
+		return false
+	}
+	remaining := availableBoundaryPeers(peers, quarantined)
 	sawUnavailable := false
+	sawQuarantine := false
 	for _, evidence := range unavailable.Evidence {
+		operator, ok := configuredBoundaryOperator(
+			evidence.Peer.Operator,
+			remaining,
+		)
+		if !ok {
+			return false
+		}
 		switch evidence.Status {
 		case n2n.BoundaryAccepted:
 		case n2n.BoundaryUnavailable:
 			sawUnavailable = true
 		case n2n.BoundaryRejected, n2n.BoundaryPeerData:
-			return false
+			quarantined[operator] = struct{}{}
+			sawQuarantine = true
 		default:
 			return false
 		}
 	}
-	return sawUnavailable
+	if len(availableBoundaryPeers(peers, quarantined)) < corroboration {
+		return false
+	}
+	return sawUnavailable || sawQuarantine
+}
+
+func availableBoundaryPeers(
+	peers []n2n.Peer,
+	quarantined map[string]struct{},
+) []n2n.Peer {
+	ret := make([]n2n.Peer, 0, len(peers))
+	for _, peer := range peers {
+		if _, excluded := quarantined[boundaryOperatorKey(peer.Operator)]; excluded {
+			continue
+		}
+		ret = append(ret, peer)
+	}
+	return ret
+}
+
+func configuredBoundaryOperator(
+	operator string,
+	peers []n2n.Peer,
+) (string, bool) {
+	key := boundaryOperatorKey(operator)
+	if key == "" {
+		return "", false
+	}
+	for _, peer := range peers {
+		if boundaryOperatorKey(peer.Operator) == key {
+			return key, true
+		}
+	}
+	return "", false
+}
+
+func boundaryOperatorKey(operator string) string {
+	return strings.ToLower(strings.TrimSpace(operator))
 }
 
 func waitForContext(ctx context.Context, duration time.Duration) error {

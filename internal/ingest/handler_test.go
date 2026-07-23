@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -114,6 +115,178 @@ func TestHandlerStagesThenFinalizesExactCommittedTail(t *testing.T) {
 	}
 }
 
+func TestObservedRollbackBarrierPreventsAttemptFinalizationFromPublishingDescendants(
+	t *testing.T,
+) {
+	for _, scenario := range []string{
+		"paired proof unavailable",
+		"paired proof disagreement",
+		"context cancellation during proof",
+	} {
+		t.Run(scenario, func(t *testing.T) {
+			publisher := &fakePublisher{}
+			checkpoint := testAdapterChainPoint(10, 0x10)
+			handler := newTestHandlerWithState(
+				t,
+				publisher,
+				&fakeChainState{tip: publicationPoint(checkpoint)},
+			)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			transport := &rollbackBarrierTransport{
+				scenario:   scenario,
+				cancel:     cancel,
+				checkpoint: checkpoint,
+				block: adapterTestBlock{
+					slot:   11,
+					number: 11,
+					hash:   adapterHash(0x11),
+				},
+				branchTip: chainsync.Tip{
+					Point:       pcommon.NewPoint(12, adapterHash(0x12).Bytes()),
+					BlockNumber: 12,
+				},
+			}
+			supervisor, err := syncer.New(
+				syncer.Config{
+					Peers: []n2n.Peer{
+						{Host: "relay-a:3001", Operator: "operator-a"},
+						{Host: "relay-b:3001", Operator: "operator-b"},
+					},
+					Corroboration:         2,
+					InitialBackoff:        time.Millisecond,
+					MaxBackoff:            2 * time.Millisecond,
+					RollbackConfirmations: 2,
+					CheckpointEveryBlocks: 100,
+					FinalizeTimeout:       time.Second,
+				},
+				fixedCandidateSource{checkpoint},
+				handler,
+				noopSyncObserver{},
+				transport,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := supervisor.Run(ctx); err == nil {
+				t.Fatal("failed rollback proof unexpectedly completed sync")
+			}
+			if len(publisher.batches) != 0 ||
+				len(publisher.rollbacks) != 0 {
+				t.Fatalf(
+					"failed proof published batches=%d rollbacks=%d",
+					len(publisher.batches),
+					len(publisher.rollbacks),
+				)
+			}
+		})
+	}
+}
+
+type fixedCandidateSource []n2n.ChainPoint
+
+func (source fixedCandidateSource) IntersectionCandidates(
+	context.Context,
+) ([]n2n.ChainPoint, error) {
+	return append([]n2n.ChainPoint(nil), source...), nil
+}
+
+type noopSyncObserver struct{}
+
+func (noopSyncObserver) Observe(
+	context.Context,
+	syncer.Observation,
+) error {
+	return nil
+}
+
+type rollbackBarrierTransport struct {
+	scenario             string
+	cancel               context.CancelFunc
+	stopAfterUnavailable bool
+	checkpoint           n2n.ChainPoint
+	block                adapterTestBlock
+	branchTip            chainsync.Tip
+}
+
+func (transport *rollbackBarrierTransport) Probe(
+	_ context.Context,
+	peer n2n.Peer,
+	_ pcommon.Point,
+) (syncer.ProbeResult, error) {
+	if transport.stopAfterUnavailable {
+		transport.cancel()
+		return syncer.ProbeResult{}, context.Canceled
+	}
+	return syncer.ProbeResult{
+		Accepted: true,
+		Tip: chainsync.Tip{
+			Point:       transport.branchTip.Point,
+			BlockNumber: transport.branchTip.BlockNumber,
+		},
+		N2NVersion: 15,
+		Address:    peer.Host,
+	}, nil
+}
+
+func (transport *rollbackBarrierTransport) ProbeRollback(
+	_ context.Context,
+	_ n2n.Peer,
+	_ pcommon.Point,
+	_ pcommon.Point,
+) (syncer.RollbackProbeResult, error) {
+	switch transport.scenario {
+	case "paired proof unavailable":
+		transport.stopAfterUnavailable = true
+		return syncer.RollbackProbeResult{},
+			syncer.RetryableTransportError(errors.New("relay unavailable"))
+	case "paired proof disagreement":
+		return syncer.RollbackProbeResult{
+			TargetAccepted: false,
+			BranchAccepted: true,
+			Tip:            transport.branchTip,
+			N2NVersion:     15,
+			Address:        "relay-b:3001",
+		}, nil
+	case "context cancellation during proof":
+		transport.cancel()
+		return syncer.RollbackProbeResult{}, context.Canceled
+	default:
+		return syncer.RollbackProbeResult{}, errors.New("unknown scenario")
+	}
+}
+
+func (transport *rollbackBarrierTransport) Follow(
+	ctx context.Context,
+	peer n2n.Peer,
+	candidates []n2n.ChainPoint,
+	handler n2n.Handler,
+) error {
+	if len(candidates) != 1 {
+		return errors.New("expected one selected checkpoint")
+	}
+	peer.Address = peer.Host
+	peer.N2NVersion = 15
+	peer.Tip = &transport.branchTip
+	if err := handler.Reconcile(ctx, candidates[0], peer); err != nil {
+		return err
+	}
+	if err := handler.RollForward(
+		ctx,
+		transport.block,
+		transport.branchTip,
+		peer,
+	); err != nil {
+		return err
+	}
+	return handler.RollBackward(
+		ctx,
+		transport.checkpoint,
+		transport.branchTip,
+		peer,
+	)
+}
+
 func TestRollbackRetainsEligiblePrefixThenRecordsHeader(t *testing.T) {
 	publisher := &fakePublisher{}
 	handler := newTestHandler(t, publisher)
@@ -143,9 +316,7 @@ func TestRollbackRetainsEligiblePrefixThenRecordsHeader(t *testing.T) {
 		context.Background(),
 		target,
 		adapterTip(blocks[2]),
-		syncer.RollbackEvidence{
-			Confirmations: adapterEvidence(adapterTip(blocks[2])).CheckpointMembers,
-		},
+		adapterRollbackEvidence(target, adapterTip(blocks[2])),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -381,9 +552,7 @@ func TestRollbackReportsRetainedAdoptionWhenHeaderFailsPrecommit(t *testing.T) {
 		context.Background(),
 		target,
 		tip,
-		syncer.RollbackEvidence{
-			Confirmations: adapterEvidence(tip).CheckpointMembers,
-		},
+		adapterRollbackEvidence(target, tip),
 	)
 	if err == nil ||
 		!outcome.Committed ||
@@ -398,11 +567,19 @@ func TestRollbackReportsRetainedAdoptionWhenHeaderFailsPrecommit(t *testing.T) {
 }
 
 func newTestHandler(t *testing.T, publisher *fakePublisher) *Handler {
+	return newTestHandlerWithState(t, publisher, &fakeChainState{})
+}
+
+func newTestHandlerWithState(
+	t *testing.T,
+	publisher *fakePublisher,
+	state *fakeChainState,
+) *Handler {
 	t.Helper()
 	handler, err := NewHandler(
 		context.Background(),
 		publisher,
-		&fakeChainState{},
+		state,
 		HandlerConfig{
 			NetworkMagic:          n2n.MainnetNetworkMagic,
 			RollbackMaximumDepth:  100,
@@ -415,6 +592,13 @@ func newTestHandler(t *testing.T, publisher *fakePublisher) *Handler {
 		t.Fatal(err)
 	}
 	return handler
+}
+
+func testAdapterChainPoint(number uint64, fill byte) n2n.ChainPoint {
+	return n2n.NewChainPoint(
+		pcommon.NewPoint(number, adapterHash(fill).Bytes()),
+		number,
+	)
 }
 
 func adapterEvidence(tip chainsync.Tip) syncer.SourceEvidence {
@@ -433,6 +617,38 @@ func adapterEvidence(tip chainsync.Tip) syncer.SourceEvidence {
 			{Peer: n2n.Peer{Host: "relay-a:3001", Operator: "operator-a"}},
 			{Peer: n2n.Peer{Host: "relay-b:3001", Operator: "operator-b"}},
 		},
+	}
+}
+
+func adapterRollbackEvidence(
+	target n2n.ChainPoint,
+	tip chainsync.Tip,
+) syncer.RollbackEvidence {
+	source := adapterEvidence(tip)
+	confirmations := make(
+		[]syncer.RollbackConfirmation,
+		0,
+		len(source.CheckpointMembers),
+	)
+	for index, member := range source.CheckpointMembers {
+		member.Tip = tip
+		member.N2NVersion = 15
+		if member.Peer.Address == "" {
+			member.Peer.Address = fmt.Sprintf("192.0.2.%d:3001", index+1)
+		}
+		confirmations = append(confirmations, syncer.RollbackConfirmation{
+			Target:     target,
+			BranchTip:  tip,
+			Membership: member,
+			Method:     syncer.RollbackProofPairedSingleton,
+		})
+	}
+	confirmations[0].Method = syncer.RollbackProofFollowBlockFetch
+	return syncer.RollbackEvidence{
+		Source:        source,
+		Target:        target,
+		BranchTip:     tip,
+		Confirmations: confirmations,
 	}
 }
 

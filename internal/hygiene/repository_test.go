@@ -140,10 +140,32 @@ func TestExecutableRuntimeHasNoArtificialSyncOrStorageCeiling(t *testing.T) {
 		".env.example",
 		"Dockerfile",
 		"compose.yaml",
-		"cmd/clicksync/main.go",
-		"internal/config/config.go",
-		"internal/ingest/runtime.go",
-		"internal/syncer/supervisor.go",
+	}
+	for _, relRoot := range []string{"cmd", "internal", "migrations", "config"} {
+		err := filepath.WalkDir(
+			filepath.Join(root, relRoot),
+			func(path string, entry os.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
+				if entry.IsDir() {
+					return nil
+				}
+				if !entry.Type().IsRegular() ||
+					strings.HasSuffix(entry.Name(), "_test.go") {
+					return nil
+				}
+				rel, err := filepath.Rel(root, path)
+				if err != nil {
+					return err
+				}
+				executable = append(executable, rel)
+				return nil
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	forbidden := []string{
 		"max_blocks",

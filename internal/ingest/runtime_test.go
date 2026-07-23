@@ -15,6 +15,10 @@ import (
 
 func TestBoundaryBootstrapRetriesTransientAvailabilityThenSucceeds(t *testing.T) {
 	calls := 0
+	peers := []n2n.Peer{
+		{Host: "a", Operator: "operator-a"},
+		{Host: "b", Operator: "operator-b"},
+	}
 	expected := n2n.BoundaryBootstrap{
 		ChainPoint: n2n.NewChainPoint(
 			pcommon.NewPoint(10, adapterHash(0x10).Bytes()),
@@ -34,8 +38,8 @@ func TestBoundaryBootstrapRetriesTransientAvailabilityThenSucceeds(t *testing.T)
 			return n2n.BoundaryBootstrap{}, &n2n.BoundaryBootstrapError{
 				Required: 2,
 				Evidence: []n2n.BoundaryPeerEvidence{
-					{Status: n2n.BoundaryAccepted},
-					{Status: n2n.BoundaryUnavailable},
+					{Peer: peers[0], Status: n2n.BoundaryAccepted},
+					{Peer: peers[1], Status: n2n.BoundaryUnavailable},
 				},
 				Reason: "only one available corroboration",
 			}
@@ -45,7 +49,7 @@ func TestBoundaryBootstrapRetriesTransientAvailabilityThenSucceeds(t *testing.T)
 	var waits []time.Duration
 	result, err := bootstrapBoundaryWithRetry(
 		context.Background(),
-		[]n2n.Peer{{Host: "a"}, {Host: "b"}},
+		peers,
 		2,
 		n2n.DialConfig{},
 		expected.ChainPoint.Point,
@@ -77,6 +81,10 @@ func TestBoundaryBootstrapRetriesTransientAvailabilityThenSucceeds(t *testing.T)
 }
 
 func TestBoundaryBootstrapRejectionAndPeerDataAreTerminal(t *testing.T) {
+	peers := []n2n.Peer{
+		{Host: "a", Operator: "operator-a"},
+		{Host: "b", Operator: "operator-b"},
+	}
 	for name, status := range map[string]n2n.BoundaryEvidenceStatus{
 		"configured point rejection": n2n.BoundaryRejected,
 		"peer data violation":        n2n.BoundaryPeerData,
@@ -86,14 +94,14 @@ func TestBoundaryBootstrapRejectionAndPeerDataAreTerminal(t *testing.T) {
 			expectedErr := &n2n.BoundaryBootstrapError{
 				Required: 2,
 				Evidence: []n2n.BoundaryPeerEvidence{
-					{Status: n2n.BoundaryAccepted},
-					{Status: status},
+					{Peer: peers[0], Status: n2n.BoundaryAccepted},
+					{Peer: peers[1], Status: status},
 				},
 				Reason: name,
 			}
 			_, err := bootstrapBoundaryWithRetry(
 				context.Background(),
-				nil,
+				peers,
 				2,
 				n2n.DialConfig{},
 				pcommon.NewPoint(10, adapterHash(0x10).Bytes()),
@@ -123,10 +131,14 @@ func TestBoundaryBootstrapRejectionAndPeerDataAreTerminal(t *testing.T) {
 
 func TestBoundaryBootstrapContextCancellationInterruptsBackoff(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
+	peers := []n2n.Peer{
+		{Host: "a", Operator: "operator-a"},
+		{Host: "b", Operator: "operator-b"},
+	}
 	waits := 0
 	_, err := bootstrapBoundaryWithRetry(
 		ctx,
-		nil,
+		peers,
 		2,
 		n2n.DialConfig{},
 		pcommon.NewPoint(10, adapterHash(0x10).Bytes()),
@@ -142,8 +154,8 @@ func TestBoundaryBootstrapContextCancellationInterruptsBackoff(t *testing.T) {
 			return n2n.BoundaryBootstrap{}, &n2n.BoundaryBootstrapError{
 				Required: 2,
 				Evidence: []n2n.BoundaryPeerEvidence{
-					{Status: n2n.BoundaryUnavailable},
-					{Status: n2n.BoundaryUnavailable},
+					{Peer: peers[0], Status: n2n.BoundaryUnavailable},
+					{Peer: peers[1], Status: n2n.BoundaryUnavailable},
 				},
 				Reason: "all peers unavailable",
 			}
@@ -156,5 +168,168 @@ func TestBoundaryBootstrapContextCancellationInterruptsBackoff(t *testing.T) {
 	)
 	if !errors.Is(err, context.Canceled) || waits != 1 {
 		t.Fatalf("waits=%d error=%v", waits, err)
+	}
+}
+
+func TestBoundaryBootstrapUnknownEvidenceOperatorFailsClosed(t *testing.T) {
+	peers := []n2n.Peer{
+		{Host: "a", Operator: "operator-a"},
+		{Host: "b", Operator: "operator-b"},
+		{Host: "c", Operator: "operator-c"},
+	}
+	expectedErr := &n2n.BoundaryBootstrapError{
+		Required: 2,
+		Kind:     n2n.BoundaryInsufficient,
+		Evidence: []n2n.BoundaryPeerEvidence{
+			{Peer: peers[0], Status: n2n.BoundaryAccepted},
+			{
+				Peer:   n2n.Peer{Host: "unknown", Operator: "spoofed"},
+				Status: n2n.BoundaryPeerData,
+			},
+			{Peer: peers[1], Status: n2n.BoundaryUnavailable},
+		},
+		Reason: "spoofed evidence operator",
+	}
+	calls := 0
+	_, err := bootstrapBoundaryWithRetry(
+		context.Background(),
+		peers,
+		2,
+		n2n.DialConfig{},
+		pcommon.NewPoint(10, adapterHash(0x10).Bytes()),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		func(
+			context.Context,
+			[]n2n.Peer,
+			int,
+			n2n.DialConfig,
+			pcommon.Point,
+			*slog.Logger,
+		) (n2n.BoundaryBootstrap, error) {
+			calls++
+			return n2n.BoundaryBootstrap{}, expectedErr
+		},
+		func(context.Context, time.Duration) error {
+			t.Fatal("unknown evidence operator entered backoff")
+			return nil
+		},
+	)
+	if !errors.Is(err, expectedErr) || calls != 1 {
+		t.Fatalf("calls=%d error=%v", calls, err)
+	}
+}
+
+func TestBoundaryBootstrapQuarantinesOneOperatorThenRemainingPeersRecover(t *testing.T) {
+	peers := []n2n.Peer{
+		{Host: "a:3001", Operator: "operator-a"},
+		{Host: "b:3001", Operator: "operator-b"},
+		{Host: "c:3001", Operator: "operator-c"},
+	}
+	calls := 0
+	bootstrap := func(
+		_ context.Context,
+		got []n2n.Peer,
+		_ int,
+		_ n2n.DialConfig,
+		point pcommon.Point,
+		_ *slog.Logger,
+	) (n2n.BoundaryBootstrap, error) {
+		calls++
+		switch calls {
+		case 1:
+			if len(got) != 3 {
+				t.Fatalf("initial peers = %#v", got)
+			}
+			return n2n.BoundaryBootstrap{}, &n2n.BoundaryBootstrapError{
+				Required: 2,
+				Kind:     n2n.BoundaryInsufficient,
+				Evidence: []n2n.BoundaryPeerEvidence{
+					{Peer: peers[0], Status: n2n.BoundaryPeerData},
+					{Peer: peers[1], Status: n2n.BoundaryUnavailable},
+					{Peer: peers[2], Status: n2n.BoundaryUnavailable},
+				},
+				Reason: "one invalid peer and two transiently unavailable",
+			}
+		case 2:
+			if len(got) != 2 ||
+				got[0].Operator != "operator-b" ||
+				got[1].Operator != "operator-c" {
+				t.Fatalf("filtered peers = %#v", got)
+			}
+			return n2n.BoundaryBootstrap{}, &n2n.BoundaryBootstrapError{
+				Required: 2,
+				Kind:     n2n.BoundaryInsufficient,
+				Evidence: []n2n.BoundaryPeerEvidence{
+					{Peer: peers[1], Status: n2n.BoundaryUnavailable},
+					{Peer: peers[2], Status: n2n.BoundaryUnavailable},
+				},
+				Reason: "remaining peers still unavailable",
+			}
+		default:
+			return n2n.BoundaryBootstrap{
+				ChainPoint: n2n.NewChainPoint(point, 10),
+			}, nil
+		}
+	}
+	waits := 0
+	if _, err := bootstrapBoundaryWithRetry(
+		context.Background(),
+		peers,
+		2,
+		n2n.DialConfig{},
+		pcommon.NewPoint(10, adapterHash(0x10).Bytes()),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		bootstrap,
+		func(context.Context, time.Duration) error {
+			waits++
+			return nil
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 3 || waits != 2 {
+		t.Fatalf("calls=%d waits=%d", calls, waits)
+	}
+}
+
+func TestBoundaryBootstrapQuarantineExhaustionIsTerminal(t *testing.T) {
+	peers := []n2n.Peer{
+		{Host: "a:3001", Operator: "operator-a"},
+		{Host: "b:3001", Operator: "operator-b"},
+	}
+	calls := 0
+	_, err := bootstrapBoundaryWithRetry(
+		context.Background(),
+		peers,
+		2,
+		n2n.DialConfig{},
+		pcommon.NewPoint(10, adapterHash(0x10).Bytes()),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		func(
+			context.Context,
+			[]n2n.Peer,
+			int,
+			n2n.DialConfig,
+			pcommon.Point,
+			*slog.Logger,
+		) (n2n.BoundaryBootstrap, error) {
+			calls++
+			return n2n.BoundaryBootstrap{}, &n2n.BoundaryBootstrapError{
+				Required: 2,
+				Kind:     n2n.BoundaryInsufficient,
+				Evidence: []n2n.BoundaryPeerEvidence{
+					{Peer: peers[0], Status: n2n.BoundaryRejected},
+					{Peer: peers[1], Status: n2n.BoundaryUnavailable},
+				},
+				Reason: "one rejection exhausts threshold",
+			}
+		},
+		func(context.Context, time.Duration) error {
+			t.Fatal("exhausted quarantine entered backoff")
+			return nil
+		},
+	)
+	if err == nil || calls != 1 {
+		t.Fatalf("calls=%d error=%v", calls, err)
 	}
 }

@@ -48,6 +48,59 @@ func TestDirectTransportMapsFreshProbeProvenance(t *testing.T) {
 	}
 }
 
+func TestDirectTransportMapsOneSessionRollbackProof(t *testing.T) {
+	transport := testDirectTransport()
+	target := testPoint(8, 0x08)
+	branch := testPoint(12, 0x12)
+	calls := 0
+	transport.probeRollbackPeer = func(
+		_ context.Context,
+		peer n2n.Peer,
+		_ n2n.DialConfig,
+		gotTarget pcommon.Point,
+		gotBranch pcommon.Point,
+		_ *slog.Logger,
+	) (n2n.RollbackPointProbe, error) {
+		calls++
+		if !pointsEqual(gotTarget, target) ||
+			!pointsEqual(gotBranch, branch) {
+			t.Fatalf(
+				"rollback points target=%#v branch=%#v",
+				gotTarget,
+				gotBranch,
+			)
+		}
+		peer.Address = "198.51.100.42:3001"
+		peer.N2NVersion = 15
+		return n2n.RollbackPointProbe{
+			TargetAccepted: true,
+			BranchAccepted: true,
+			Peer:           peer,
+			Tip: chainsync.Tip{
+				Point:       testPoint(13, 0x13),
+				BlockNumber: 13,
+			},
+		}, nil
+	}
+	result, err := transport.ProbeRollback(
+		context.Background(),
+		testPeer("relay.example:3001", "operator"),
+		target,
+		branch,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 ||
+		!result.TargetAccepted ||
+		!result.BranchAccepted ||
+		result.Address != "198.51.100.42:3001" ||
+		result.N2NVersion != 15 ||
+		result.Tip.BlockNumber != 13 {
+		t.Fatalf("calls=%d result=%#v", calls, result)
+	}
+}
+
 func TestDirectTransportClassifiesProbeErrorsByConcreteType(t *testing.T) {
 	for name, testCase := range map[string]struct {
 		input     error

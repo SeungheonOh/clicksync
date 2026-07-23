@@ -755,7 +755,10 @@ func TestRollbackRequiresAndCarriesIndependentConfirmation(t *testing.T) {
 	secondary := testPeer("relay-b:3001", "operator-b")
 	rollbackPoint := testPoint(8, 0x08)
 	rollbackTarget := n2n.NewByronEBBChainPoint(rollbackPoint, 777)
-	branchTip := chainsync.Tip{Point: testPoint(12, 0x12), BlockNumber: 12}
+	branchTip := chainsync.Tip{
+		Point:       testPoint(12, 0x12),
+		BlockNumber: 800,
+	}
 	var evidence RollbackEvidence
 	var delegatedTarget n2n.ChainPoint
 	delegateCalls := 0
@@ -773,14 +776,31 @@ func TestRollbackRequiresAndCarriesIndependentConfirmation(t *testing.T) {
 		},
 	}
 	transport := &fakeTransport{
-		probe: func(_ context.Context, peer n2n.Peer, point pcommon.Point) (ProbeResult, error) {
-			if peer.Operator != "operator-b" || !pointsEqual(point, branchTip.Point) {
-				t.Fatalf("rollback probe = %s %#v", peer.Operator, point)
+		rollbackProbe: func(
+			_ context.Context,
+			peer n2n.Peer,
+			target pcommon.Point,
+			branch pcommon.Point,
+		) (RollbackProbeResult, error) {
+			if peer.Operator != "operator-b" ||
+				!pointsEqual(target, rollbackPoint) ||
+				!pointsEqual(branch, branchTip.Point) {
+				t.Fatalf(
+					"rollback probe = %s target:%#v branch:%#v",
+					peer.Operator,
+					target,
+					branch,
+				)
 			}
-			return ProbeResult{
-				Accepted:   true,
-				Tip:        chainsync.Tip{Point: testPoint(13, 0x13), BlockNumber: 13},
+			return RollbackProbeResult{
+				TargetAccepted: true,
+				BranchAccepted: true,
+				Tip: chainsync.Tip{
+					Point:       testPoint(13, 0x13),
+					BlockNumber: 801,
+				},
 				N2NVersion: 15,
+				Address:    "198.51.100.2:3001",
 			}, nil
 		},
 	}
@@ -816,9 +836,170 @@ func TestRollbackRequiresAndCarriesIndependentConfirmation(t *testing.T) {
 	if delegateCalls != 1 || len(evidence.Confirmations) != 2 ||
 		!chainPointsEqual(delegatedTarget, rollbackTarget) ||
 		!chainPointsEqual(evidence.Target, rollbackTarget) ||
-		evidence.Confirmations[0].Peer.Operator != "operator-a" ||
-		evidence.Confirmations[1].Peer.Operator != "operator-b" {
+		!pointsEqual(evidence.BranchTip.Point, branchTip.Point) ||
+		evidence.Confirmations[0].Membership.Peer.Operator != "operator-a" ||
+		evidence.Confirmations[1].Membership.Peer.Operator != "operator-b" ||
+		!chainPointsEqual(evidence.Confirmations[1].Target, rollbackTarget) ||
+		!pointsEqual(
+			evidence.Confirmations[1].BranchTip.Point,
+			branchTip.Point,
+		) ||
+		evidence.Confirmations[0].Method !=
+			RollbackProofFollowBlockFetch ||
+		evidence.Confirmations[1].Method !=
+			RollbackProofPairedSingleton ||
+		len(transport.rollbackProbes) != 1 {
 		t.Fatalf("typed rollback evidence = %#v, calls=%d", evidence, delegateCalls)
+	}
+}
+
+func TestRollbackCommonBranchTipCannotConfirmUnrelatedTarget(t *testing.T) {
+	primary := actualPeer(
+		testPeer("relay-a:3001", "operator-a"),
+		"198.51.100.1:3001",
+		15,
+	)
+	target := testChainPoint(8, 8, 0x08)
+	branchTip := chainsync.Tip{
+		Point:       testPoint(12, 0x12),
+		BlockNumber: 12,
+	}
+	delegateCalls := 0
+	delegate := &fakeHandler{
+		rollBackward: func(
+			context.Context,
+			n2n.ChainPoint,
+			chainsync.Tip,
+			RollbackEvidence,
+		) (CommitOutcome, error) {
+			delegateCalls++
+			return CommitOutcome{Committed: true}, nil
+		},
+	}
+	observer := &fakeObserver{}
+	transport := &fakeTransport{
+		rollbackProbe: func(
+			_ context.Context,
+			_ n2n.Peer,
+			gotTarget pcommon.Point,
+			gotBranch pcommon.Point,
+		) (RollbackProbeResult, error) {
+			if !pointsEqual(gotTarget, target.Point) ||
+				!pointsEqual(gotBranch, branchTip.Point) {
+				t.Fatalf(
+					"pair proof target=%#v branch=%#v",
+					gotTarget,
+					gotBranch,
+				)
+			}
+			return RollbackProbeResult{
+				TargetAccepted: false,
+				BranchAccepted: true,
+				Tip: chainsync.Tip{
+					Point:       testPoint(20, 0x20),
+					BlockNumber: 20,
+				},
+				N2NVersion: 15,
+				Address:    "198.51.100.2:3001",
+			}, nil
+		},
+	}
+	supervisor := newTestSupervisor(
+		t,
+		baseConfig(),
+		&fakeCandidates{},
+		delegate,
+		observer,
+		transport,
+	)
+	quarantined := make(map[string]struct{})
+	attempt := &attemptHandler{
+		supervisor: supervisor,
+		evidence: SourceEvidence{
+			Primary: PeerEvidence{
+				Peer:       primary,
+				Tip:        branchTip,
+				N2NVersion: 15,
+			},
+		},
+		delegate:        delegate,
+		committedBlocks: new(uint64),
+		quarantined:     quarantined,
+	}
+	err := attempt.RollBackward(
+		context.Background(),
+		target,
+		branchTip,
+		primary,
+	)
+	if err == nil || delegateCalls != 0 {
+		t.Fatalf("error=%v delegate calls=%d", err, delegateCalls)
+	}
+	if len(transport.rollbackProbes) != 1 ||
+		len(observer.observations) != 1 ||
+		observer.observations[0].Result != "quarantined" ||
+		!strings.Contains(
+			observer.observations[0].Reason,
+			"exact rollback target",
+		) {
+		t.Fatalf(
+			"probes=%#v observations=%#v",
+			transport.rollbackProbes,
+			observer.observations,
+		)
+	}
+	if _, ok := quarantined["operator-b"]; !ok {
+		t.Fatalf("disagreeing operator not quarantined: %#v", quarantined)
+	}
+}
+
+func TestMalformedRollbackDoesNotCrossPendingBranchBarrier(t *testing.T) {
+	primary := actualPeer(
+		testPeer("relay-a:3001", "operator-a"),
+		"198.51.100.1:3001",
+		15,
+	)
+	barrierCalls := 0
+	delegate := &fakeHandler{
+		rollbackObserved: func(
+			context.Context,
+			n2n.ChainPoint,
+			chainsync.Tip,
+		) error {
+			barrierCalls++
+			return nil
+		},
+	}
+	attempt := &attemptHandler{
+		supervisor: &Supervisor{
+			config:    baseConfig(),
+			handler:   delegate,
+			observer:  &fakeObserver{},
+			transport: &fakeTransport{},
+			now:       time.Now,
+		},
+		evidence: SourceEvidence{
+			Primary: PeerEvidence{
+				Peer:       primary,
+				N2NVersion: 15,
+			},
+		},
+		delegate:        delegate,
+		committedBlocks: new(uint64),
+	}
+	err := attempt.RollBackward(
+		context.Background(),
+		testChainPoint(13, 13, 0x13),
+		chainsync.Tip{
+			Point:       testPoint(12, 0x12),
+			BlockNumber: 12,
+		},
+		primary,
+	)
+	if err == nil ||
+		!strings.Contains(err.Error(), "after the reported branch tip") ||
+		barrierCalls != 0 {
+		t.Fatalf("barrier calls=%d error=%v", barrierCalls, err)
 	}
 }
 
@@ -851,16 +1032,18 @@ func TestRollbackRejectsCommittedPrefixTailDifferentFromTarget(t *testing.T) {
 		},
 	}
 	transport := &fakeTransport{
-		probe: func(
+		rollbackProbe: func(
 			_ context.Context,
 			_ n2n.Peer,
 			_ pcommon.Point,
-		) (ProbeResult, error) {
-			return ProbeResult{
-				Accepted:   true,
-				Tip:        branchTip,
-				N2NVersion: 15,
-				Address:    "198.51.100.2:3001",
+			_ pcommon.Point,
+		) (RollbackProbeResult, error) {
+			return RollbackProbeResult{
+				TargetAccepted: true,
+				BranchAccepted: true,
+				Tip:            branchTip,
+				N2NVersion:     15,
+				Address:        "198.51.100.2:3001",
 			}, nil
 		},
 	}
@@ -910,8 +1093,16 @@ func TestRollbackDisagreementQuarantinesBeforeHandlerCommit(t *testing.T) {
 	}
 	observer := &fakeObserver{}
 	transport := &fakeTransport{
-		probe: func(context.Context, n2n.Peer, pcommon.Point) (ProbeResult, error) {
-			return ProbeResult{Accepted: false}, nil
+		rollbackProbe: func(
+			context.Context,
+			n2n.Peer,
+			pcommon.Point,
+			pcommon.Point,
+		) (RollbackProbeResult, error) {
+			return RollbackProbeResult{
+				TargetAccepted: false,
+				BranchAccepted: true,
+			}, nil
 		},
 	}
 	supervisor := newTestSupervisor(
@@ -940,7 +1131,8 @@ func TestRollbackDisagreementQuarantinesBeforeHandlerCommit(t *testing.T) {
 		chainsync.Tip{Point: testPoint(12, 0x12), BlockNumber: 12},
 		primary,
 	)
-	if err == nil || !strings.Contains(err.Error(), "rollback quarantined") {
+	if err == nil ||
+		!strings.Contains(err.Error(), "peer quarantine leaves 1") {
 		t.Fatalf("error = %v", err)
 	}
 	if delegateCalls != 0 {
@@ -1312,11 +1504,21 @@ func TestDuplicateOperatorCannotSatisfyRollbackCorroboration(t *testing.T) {
 	config.RollbackConfirmations = 3
 	var probed []string
 	transport := &fakeTransport{
-		probe: func(_ context.Context, peer n2n.Peer, _ pcommon.Point) (ProbeResult, error) {
+		rollbackProbe: func(
+			_ context.Context,
+			peer n2n.Peer,
+			_ pcommon.Point,
+			_ pcommon.Point,
+		) (RollbackProbeResult, error) {
 			probed = append(probed, peer.Host)
-			return ProbeResult{
-				Accepted: peer.Operator == "operator-b",
-				Tip:      chainsync.Tip{Point: testPoint(20, 0x20), BlockNumber: 20},
+			accepted := peer.Operator == "operator-b"
+			return RollbackProbeResult{
+				TargetAccepted: accepted,
+				BranchAccepted: accepted,
+				Tip: chainsync.Tip{
+					Point:       testPoint(20, 0x20),
+					BlockNumber: 20,
+				},
 			}, nil
 		},
 	}
@@ -1357,7 +1559,8 @@ func TestDuplicateOperatorCannotSatisfyRollbackCorroboration(t *testing.T) {
 		chainsync.Tip{Point: testPoint(12, 0x12), BlockNumber: 12},
 		primary,
 	)
-	if err == nil || !strings.Contains(err.Error(), "got 2 of 3") {
+	if err == nil ||
+		!strings.Contains(err.Error(), "peer quarantine leaves 2") {
 		t.Fatalf("error = %v", err)
 	}
 	if delegateCalls != 0 {
@@ -1545,16 +1748,29 @@ type probeCall struct {
 	point pcommon.Point
 }
 
+type rollbackProbeCall struct {
+	peer   n2n.Peer
+	target pcommon.Point
+	branch pcommon.Point
+}
+
 type followCall struct {
 	peer       n2n.Peer
 	candidates []n2n.ChainPoint
 }
 
 type fakeTransport struct {
-	probe   func(context.Context, n2n.Peer, pcommon.Point) (ProbeResult, error)
-	follow  func(context.Context, n2n.Peer, []n2n.ChainPoint, n2n.Handler) error
-	probes  []probeCall
-	follows []followCall
+	probe         func(context.Context, n2n.Peer, pcommon.Point) (ProbeResult, error)
+	rollbackProbe func(
+		context.Context,
+		n2n.Peer,
+		pcommon.Point,
+		pcommon.Point,
+	) (RollbackProbeResult, error)
+	follow         func(context.Context, n2n.Peer, []n2n.ChainPoint, n2n.Handler) error
+	probes         []probeCall
+	rollbackProbes []rollbackProbeCall
+	follows        []followCall
 }
 
 func (f *fakeTransport) Probe(
@@ -1567,6 +1783,23 @@ func (f *fakeTransport) Probe(
 		return ProbeResult{}, errors.New("unexpected Probe")
 	}
 	return f.probe(ctx, peer, point)
+}
+
+func (f *fakeTransport) ProbeRollback(
+	ctx context.Context,
+	peer n2n.Peer,
+	target pcommon.Point,
+	branch pcommon.Point,
+) (RollbackProbeResult, error) {
+	f.rollbackProbes = append(f.rollbackProbes, rollbackProbeCall{
+		peer:   peer,
+		target: clonePoint(target),
+		branch: clonePoint(branch),
+	})
+	if f.rollbackProbe == nil {
+		return RollbackProbeResult{}, errors.New("unexpected ProbeRollback")
+	}
+	return f.rollbackProbe(ctx, peer, target, branch)
 }
 
 func (f *fakeTransport) Follow(
@@ -1587,15 +1820,27 @@ func (f *fakeTransport) Follow(
 }
 
 type fakeHandler struct {
-	reconcile    func(context.Context, n2n.ChainPoint, SourceEvidence) (CommitOutcome, error)
-	rollForward  func(context.Context, lcommon.Block, chainsync.Tip, SourceEvidence) (CommitOutcome, error)
-	rollBackward func(
+	reconcile        func(context.Context, n2n.ChainPoint, SourceEvidence) (CommitOutcome, error)
+	rollForward      func(context.Context, lcommon.Block, chainsync.Tip, SourceEvidence) (CommitOutcome, error)
+	rollbackObserved func(context.Context, n2n.ChainPoint, chainsync.Tip) error
+	rollBackward     func(
 		context.Context,
 		n2n.ChainPoint,
 		chainsync.Tip,
 		RollbackEvidence,
 	) (CommitOutcome, error)
 	endAttempt func(context.Context, AttemptEnd) (CommitOutcome, error)
+}
+
+func (f *fakeHandler) RollbackObserved(
+	ctx context.Context,
+	point n2n.ChainPoint,
+	tip chainsync.Tip,
+) error {
+	if f.rollbackObserved == nil {
+		return nil
+	}
+	return f.rollbackObserved(ctx, point, tip)
 }
 
 func (f *fakeHandler) Reconcile(
