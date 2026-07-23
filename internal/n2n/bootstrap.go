@@ -130,8 +130,11 @@ func bootstrapBoundary(
 			default:
 				var unavailable *RangeUnavailable
 				var violation *PeerDataViolation
+				var protocolClosed *ProtocolChannelClosed
 				switch {
 				case errors.As(err, &unavailable):
+					observation.Status = BoundaryUnavailable
+				case errors.As(err, &protocolClosed):
 					observation.Status = BoundaryUnavailable
 				case errors.As(err, &violation):
 					observation.Status = BoundaryPeerData
@@ -388,7 +391,7 @@ func pollBoundaryAsyncError(
 	select {
 	case err, ok := <-asyncErr:
 		if !ok {
-			return errors.New("peer protocol error channel closed during boundary bootstrap")
+			return &ProtocolChannelClosed{}
 		}
 		return classifyPeerProtocolError(err, point)
 	default:

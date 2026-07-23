@@ -65,13 +65,11 @@ func RunSync(
 			return errors.New("configured Origin conflicts with stored partial-history dataset")
 		}
 		start = publication.Point{Origin: true}
-		if !exists || !identity.GenesisSeeded || !identity.CompleteHistory {
-			bundle, err := genesis.Mainnet()
-			if err != nil {
-				return err
-			}
-			originBundle = &bundle
+		bundle, err := genesis.Mainnet()
+		if err != nil {
+			return err
 		}
+		originBundle = &bundle
 	case "intersection":
 		configured, err := config.ParseStartPoint(cfg.StartPoint)
 		if err != nil {
@@ -85,13 +83,15 @@ func RunSync(
 			}
 			start = identity.Start
 		} else {
-			result, err := n2n.BootstrapBoundary(
+			result, err := bootstrapBoundaryWithRetry(
 				ctx,
 				peers,
 				cfg.Corroboration,
 				dialConfig,
 				pcommon.NewPoint(configured.Slot, append([]byte(nil), configured.Hash[:]...)),
 				logger,
+				n2n.BootstrapBoundary,
+				waitForContext,
 			)
 			if err != nil {
 				return err
@@ -116,7 +116,7 @@ func RunSync(
 		SourceBuild:            buildID,
 		CreatedAt:              time.Now().UTC(),
 	}
-	if originBundle != nil {
+	if originBundle != nil && !exists {
 		seed.OriginGenesis = &originBundle.Proof
 	}
 	identity, err = db.LoadOrCreateManifest(ctx, lock, seed)
@@ -265,6 +265,95 @@ func n2nPeers(peers []config.Peer) []n2n.Peer {
 		}
 	}
 	return ret
+}
+
+type bootstrapBoundaryFunc func(
+	context.Context,
+	[]n2n.Peer,
+	int,
+	n2n.DialConfig,
+	pcommon.Point,
+	*slog.Logger,
+) (n2n.BoundaryBootstrap, error)
+
+type waitFunc func(context.Context, time.Duration) error
+
+func bootstrapBoundaryWithRetry(
+	ctx context.Context,
+	peers []n2n.Peer,
+	corroboration int,
+	dialConfig n2n.DialConfig,
+	point pcommon.Point,
+	logger *slog.Logger,
+	bootstrap bootstrapBoundaryFunc,
+	wait waitFunc,
+) (n2n.BoundaryBootstrap, error) {
+	if bootstrap == nil || wait == nil {
+		return n2n.BoundaryBootstrap{}, errors.New(
+			"boundary bootstrap and backoff functions are required",
+		)
+	}
+	backoff := time.Second
+	for {
+		result, err := bootstrap(
+			ctx,
+			peers,
+			corroboration,
+			dialConfig,
+			point,
+			logger,
+		)
+		if err == nil {
+			return result, nil
+		}
+		if !retryableBoundaryBootstrap(err) {
+			return n2n.BoundaryBootstrap{}, err
+		}
+		if err := wait(ctx, backoff); err != nil {
+			return n2n.BoundaryBootstrap{}, err
+		}
+		if backoff < 30*time.Second {
+			backoff *= 2
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+		}
+	}
+}
+
+func retryableBoundaryBootstrap(err error) bool {
+	var closed *n2n.ProtocolChannelClosed
+	if errors.As(err, &closed) {
+		return true
+	}
+	var unavailable *n2n.BoundaryBootstrapError
+	if !errors.As(err, &unavailable) || len(unavailable.Evidence) == 0 {
+		return false
+	}
+	sawUnavailable := false
+	for _, evidence := range unavailable.Evidence {
+		switch evidence.Status {
+		case n2n.BoundaryAccepted:
+		case n2n.BoundaryUnavailable:
+			sawUnavailable = true
+		case n2n.BoundaryRejected, n2n.BoundaryPeerData:
+			return false
+		default:
+			return false
+		}
+	}
+	return sawUnavailable
+}
+
+func waitForContext(ctx context.Context, duration time.Duration) error {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func newID() ([16]byte, error) {

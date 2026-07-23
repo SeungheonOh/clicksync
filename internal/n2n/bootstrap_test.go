@@ -348,6 +348,16 @@ func TestBootstrapBoundaryHonorsCanceledContext(t *testing.T) {
 	}
 }
 
+func TestBoundaryProtocolChannelClosureIsTypedTransportTermination(t *testing.T) {
+	asyncErr := make(chan error)
+	close(asyncErr)
+	err := pollBoundaryAsyncError(asyncErr, testPoint(10, 0x10))
+	var closed *ProtocolChannelClosed
+	if !errors.As(err, &closed) {
+		t.Fatalf("error = %T %v, want ProtocolChannelClosed", err, err)
+	}
+}
+
 func bootstrapPeers() []Peer {
 	return []Peer{
 		{Host: "one.example:3001", Operator: "one"},

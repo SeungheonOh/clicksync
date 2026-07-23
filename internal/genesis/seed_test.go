@@ -126,6 +126,33 @@ func TestEnsurePublishedFreshRecoveryAndSeededAudit(t *testing.T) {
 	); err == nil {
 		t.Fatal("genesis marker without exact active distribution was accepted")
 	}
+
+	state = &fakeState{
+		origin:    true,
+		seeded:    true,
+		recovered: recovered,
+		found:     true,
+	}
+	publisher = &fakePublisher{}
+	if err := EnsurePublished(
+		context.Background(),
+		state,
+		publisher,
+		fakeLock{},
+		bundle,
+		[16]byte{1},
+		"test",
+		now,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if publisher.calls != 0 || len(state.marked) != 0 {
+		t.Fatalf(
+			"exact seeded restart republished=%d remarkered=%+v",
+			publisher.calls,
+			state.marked,
+		)
+	}
 }
 
 func TestEnsurePublishedRequiresOriginAndFlock(t *testing.T) {
