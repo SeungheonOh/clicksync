@@ -538,6 +538,9 @@ func (coordinator *Coordinator) Rollback(ctx context.Context, request RollbackRe
 	if err := coordinator.assertWriter(); err != nil {
 		return err
 	}
+	if err := validatePoint(request.To); err != nil {
+		return fmt.Errorf("validate rollback target: %w", err)
+	}
 	if request.MaximumDepth == 0 {
 		return errors.New("rollback maximum depth must be non-zero")
 	}
@@ -574,11 +577,19 @@ func (coordinator *Coordinator) Rollback(ctx context.Context, request RollbackRe
 	if uint64(len(descendants)) > uint64(request.MaximumDepth) {
 		return fmt.Errorf("rollback depth %d exceeds configured maximum %d", len(descendants), request.MaximumDepth)
 	}
+	for index, descendant := range descendants {
+		if err := validatePoint(descendant.Point); err != nil {
+			return fmt.Errorf("validate rollback descendant %d: %w", index, err)
+		}
+	}
 	oldTip := request.To
 	if len(descendants) == 0 {
 		currentTip, err := coordinator.backend.CommittedTip(ctx, snapshot)
 		if err != nil {
 			return fmt.Errorf("read no-op rollback tip: %w", err)
+		}
+		if err := validatePoint(currentTip); err != nil {
+			return fmt.Errorf("validate committed rollback tip: %w", err)
 		}
 		if !samePoint(currentTip, request.To) {
 			return errors.New("rollback has no active descendants and target is not the committed tip")
@@ -844,6 +855,22 @@ func samePoint(left, right Point) bool {
 		left.Hash == right.Hash &&
 		left.BlockNumber == right.BlockNumber &&
 		left.IsByronEBB == right.IsByronEBB
+}
+
+func validatePoint(point Point) error {
+	if point.Origin {
+		if point.Slot != 0 ||
+			point.Hash != (model.Hash32{}) ||
+			point.BlockNumber != 0 ||
+			point.IsByronEBB {
+			return errors.New("Origin point carries non-Origin metadata")
+		}
+		return nil
+	}
+	if point.Hash == (model.Hash32{}) {
+		return errors.New("non-Origin point has a zero hash")
+	}
+	return nil
 }
 
 func validateBatchSuccessor(previous, current model.Block) error {

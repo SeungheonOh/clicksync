@@ -659,6 +659,26 @@ func TestNoOpRollbackCommitsOnlyAtAuthoritativeTip(t *testing.T) {
 	if notTip.rollbackHeaders != 0 {
 		t.Fatal("non-tip no-op rollback inserted a header")
 	}
+
+	for _, malformed := range []Point{
+		{Origin: true, Slot: 1},
+		{Slot: 1},
+	} {
+		backend := &fakeBackend{snapshot: 4, tip: malformed}
+		coordinator = newFakeCoordinator(
+			t,
+			backend,
+			&fakeAllocator{event: 4},
+			&fakeLock{held: true},
+			nil,
+		)
+		if err := coordinator.Rollback(context.Background(), request(malformed)); err == nil {
+			t.Fatalf("malformed rollback point %+v was accepted", malformed)
+		}
+		if len(backend.calls) != 0 {
+			t.Fatalf("malformed rollback point reached backend calls %v", backend.calls)
+		}
+	}
 }
 
 func TestStrictBundleValidationRejectsCorruptContent(t *testing.T) {
