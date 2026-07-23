@@ -42,6 +42,16 @@ type Source struct {
 	NetworkMagic uint32
 }
 
+func OfficialMainnetGenesisSource() Source {
+	return Source{
+		PeerHost:     "embedded-mainnet-genesis",
+		PeerAddress:  "blake2b-256:dbbdaeab0ea4ea58225892d8b1294f178b417f4a9d1ed3bbf629c40d8f74e86b",
+		Operator:     "intersect-official-genesis",
+		N2NVersion:   0,
+		NetworkMagic: 764824073,
+	}
+}
+
 type Counts struct {
 	Blocks            uint64
 	Transactions      uint64
@@ -330,7 +340,11 @@ func (coordinator *Coordinator) PublishBatch(
 	}
 	allObservations := make([]model.PeerObservation, 0)
 	for index, item := range input.Items {
-		if err := validateSource(item.Source, item.PeerObservations); err != nil {
+		if err := validateSource(
+			item.Source,
+			item.PeerObservations,
+			item.Block.Synthetic,
+		); err != nil {
 			return BatchResult{}, fmt.Errorf("validate source provenance for block %d: %w", index, err)
 		}
 		if err := validateBlock(item.Block); err != nil {
@@ -517,6 +531,13 @@ func (coordinator *Coordinator) PublishBatch(
 			Err:           err,
 		}
 	}
+	if err := coordinator.assertWriter(); err != nil {
+		return result, &CommittedError{
+			PublicationID: publicationIDs[len(publicationIDs)-1],
+			EventSeq:      lastEvent,
+			Err:           fmt.Errorf("writer flock lost before post-adoption manifest: %w", err),
+		}
+	}
 	last := attempts[len(attempts)-1]
 	if err := coordinator.backend.PersistManifest(ctx, ManifestUpdate{
 		EventSeq:    lastEvent,
@@ -654,6 +675,12 @@ func (coordinator *Coordinator) Rollback(ctx context.Context, request RollbackRe
 	}
 	if err := coordinator.inject(AfterRollbackHeader); err != nil {
 		return &CommittedError{EventSeq: eventSeq, Err: err}
+	}
+	if err := coordinator.assertWriter(); err != nil {
+		return &CommittedError{
+			EventSeq: eventSeq,
+			Err:      fmt.Errorf("writer flock lost before post-rollback manifest: %w", err),
+		}
 	}
 	update := ManifestUpdate{
 		EventSeq:    eventSeq,
@@ -836,6 +863,10 @@ func digestFacts(attempt Attempt) (model.Hash32, error) {
 		return model.Hash32{}, fmt.Errorf("encode fact digest: %w", err)
 	}
 	return sha256.Sum256(encoded), nil
+}
+
+func FactsDigest(block model.Block, source Source) (model.Hash32, error) {
+	return digestFacts(Attempt{Block: block, Source: source})
 }
 
 func pointFromBlock(block model.Block) Point {

@@ -28,6 +28,14 @@ type ManifestSeed struct {
 	WriterBuild            string
 	SourceBuild            string
 	CreatedAt              time.Time
+	OriginGenesis          *OriginGenesisProof
+}
+
+type OriginGenesisProof struct {
+	ByronJSONHash   model.Hash32
+	ShelleyJSONHash model.Hash32
+	AVVMEntries     uint32
+	InitialSupply   uint64
 }
 
 type ManifestIdentity struct {
@@ -44,8 +52,11 @@ type ManifestIdentity struct {
 }
 
 type GenesisPublication struct {
-	PublicationID uint64
-	FactsDigest   model.Hash32
+	PublicationID    uint64
+	FactsDigest      model.Hash32
+	TransactionCount uint32
+	OutputCount      uint32
+	InitialSupply    uint64
 }
 
 const (
@@ -53,6 +64,8 @@ const (
 	mainnetByronGenesisIDHex   = "5f20df933584822601f9e3f8c024eb5eb252fe8cefb24d1317dc3d432e940ebb"
 	mainnetByronGenesisJSONHex = "dbbdaeab0ea4ea58225892d8b1294f178b417f4a9d1ed3bbf629c40d8f74e86b"
 	mainnetShelleyGenesisIDHex = "1a3be38bcbb7911969283716ad7aa550250226b76a61fc51cc9a9a35d9276d81"
+	mainnetAVVMEntries         = uint32(14505)
+	mainnetInitialSupply       = uint64(31112484745000000)
 )
 
 func MainnetGenesisIdentity() (
@@ -77,6 +90,20 @@ func validatePinnedMainnet(seed ManifestSeed) error {
 		seed.ShelleyGenesisID != shelleyID ||
 		seed.ShelleyGenesisJSONHash != shelleyJSON {
 		return errors.New("dataset identity does not match the pinned mainnet network/genesis tuple")
+	}
+	return nil
+}
+
+func validateOriginGenesisProof(seed ManifestSeed) error {
+	if !seed.Start.Origin || seed.OriginGenesis == nil {
+		return errors.New("fresh Origin startup requires verified official genesis inputs")
+	}
+	proof := *seed.OriginGenesis
+	if proof.ByronJSONHash != seed.ByronGenesisJSONHash ||
+		proof.ShelleyJSONHash != seed.ShelleyGenesisJSONHash ||
+		proof.AVVMEntries != mainnetAVVMEntries ||
+		proof.InitialSupply != mainnetInitialSupply {
+		return errors.New("Origin genesis proof does not match the pinned mainnet distribution")
 	}
 	return nil
 }
@@ -211,11 +238,10 @@ func (d *DB) LoadOrCreateManifest(
 	}
 	if !found {
 		if seed.Start.Origin {
-			return ManifestIdentity{}, errors.New(
-				"Origin startup requires the pinned official genesis files and deterministic 14,505-entry AVVM seed",
-			)
-		}
-		if seed.Start.Hash == (model.Hash32{}) {
+			if err := validateOriginGenesisProof(seed); err != nil {
+				return ManifestIdentity{}, err
+			}
+		} else if seed.Start.Hash == (model.Hash32{}) {
 			return ManifestIdentity{}, errors.New("partial-history startup point hash is zero")
 		}
 		datasetID, err := uuid.NewRandom()
@@ -493,13 +519,116 @@ func (d *DB) GenesisState(ctx context.Context) (bool, bool, error) {
 	return identity.Start.Origin, identity.GenesisSeeded, nil
 }
 
+// RecoverGenesisPublication closes the crash window between the authoritative
+// synthetic adoption and the manifest seed marker. It returns only one exact
+// active mainnet distribution; orphan fact attempts are ignored.
+func (d *DB) RecoverGenesisPublication(
+	ctx context.Context,
+	expectedDigest model.Hash32,
+) (GenesisPublication, bool, error) {
+	snapshot, err := d.CommittedSnapshot(ctx)
+	if err != nil {
+		return GenesisPublication{}, false, err
+	}
+	const query = `
+SELECT
+    publication_id,
+    count(),
+    countDistinct(facts_digest),
+    any(facts_digest),
+    any(transaction_count),
+    any(input_count),
+    any(output_count)
+FROM clicksync.blocks
+WHERE synthetic
+GROUP BY publication_id`
+	rows, err := d.conn.Query(ctx, query)
+	if err != nil {
+		return GenesisPublication{}, false, fmt.Errorf("query synthetic genesis candidates: %w", err)
+	}
+	type candidate struct {
+		publication GenesisPublication
+		rows        uint64
+		variants    uint64
+		inputs      uint32
+	}
+	candidates := make(map[uint64]candidate)
+	var ids []uint64
+	for rows.Next() {
+		var item candidate
+		var digestBytes []byte
+		if err := rows.Scan(
+			&item.publication.PublicationID,
+			&item.rows,
+			&item.variants,
+			&digestBytes,
+			&item.publication.TransactionCount,
+			&item.inputs,
+			&item.publication.OutputCount,
+		); err != nil {
+			rows.Close()
+			return GenesisPublication{}, false, fmt.Errorf("scan synthetic genesis candidate: %w", err)
+		}
+		item.publication.FactsDigest, err = hash32(digestBytes)
+		if err != nil {
+			rows.Close()
+			return GenesisPublication{}, false, err
+		}
+		item.publication.InitialSupply = mainnetInitialSupply
+		candidates[item.publication.PublicationID] = item
+		ids = append(ids, item.publication.PublicationID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return GenesisPublication{}, false, fmt.Errorf("iterate synthetic genesis candidates: %w", err)
+	}
+	rows.Close()
+	if len(ids) == 0 {
+		return GenesisPublication{}, false, nil
+	}
+	active, err := d.activeCandidatePublications(ctx, snapshot, ids)
+	if err != nil {
+		return GenesisPublication{}, false, err
+	}
+	if len(active) == 0 {
+		return GenesisPublication{}, false, nil
+	}
+	if len(active) != 1 {
+		return GenesisPublication{}, false, errors.New("multiple active synthetic genesis publications")
+	}
+	item := candidates[active[0]]
+	if item.rows != 1 ||
+		item.variants != 1 ||
+		item.inputs != 0 ||
+		item.publication.FactsDigest != expectedDigest ||
+		item.publication.TransactionCount != mainnetAVVMEntries ||
+		item.publication.OutputCount != mainnetAVVMEntries {
+		return GenesisPublication{}, false, errors.New(
+			"active synthetic genesis publication differs from the official distribution",
+		)
+	}
+	if err := d.validateGenesisFacts(
+		ctx,
+		map[uint64]GenesisPublication{
+			item.publication.PublicationID: item.publication,
+		},
+	); err != nil {
+		return GenesisPublication{}, false, err
+	}
+	return item.publication, true, nil
+}
+
 func (d *DB) MarkGenesisSeeded(
 	ctx context.Context,
+	lock LockAssertion,
 	expected []GenesisPublication,
 	writerID [16]byte,
 	writerBuild string,
 	now time.Time,
 ) error {
+	if lock == nil {
+		return errors.New("genesis completion requires the real writer flock")
+	}
 	if len(expected) == 0 {
 		return errors.New("genesis completion requires an exact non-empty publication bundle")
 	}
@@ -511,15 +640,20 @@ func (d *DB) MarkGenesisSeeded(
 		return errors.New("partial-history dataset cannot be marked genesis-seeded")
 	}
 	ids := make([]uint64, 0, len(expected))
-	expectedDigest := make(map[uint64]model.Hash32, len(expected))
+	expectedByID := make(map[uint64]GenesisPublication, len(expected))
 	for _, item := range expected {
 		if item.PublicationID == 0 {
 			return errors.New("genesis publication ID is zero")
 		}
-		if _, duplicate := expectedDigest[item.PublicationID]; duplicate {
+		if item.TransactionCount == 0 ||
+			item.OutputCount == 0 ||
+			item.InitialSupply == 0 {
+			return errors.New("genesis publication expected counts and supply must be non-zero")
+		}
+		if _, duplicate := expectedByID[item.PublicationID]; duplicate {
 			return errors.New("duplicate expected genesis publication ID")
 		}
-		expectedDigest[item.PublicationID] = item.FactsDigest
+		expectedByID[item.PublicationID] = item
 		ids = append(ids, item.PublicationID)
 	}
 	const bundleQuery = `
@@ -529,7 +663,11 @@ SELECT
     countDistinct(tuple(facts_digest, synthetic)),
     any(facts_digest),
     min(synthetic),
-    max(synthetic)
+    max(synthetic),
+    any(transaction_count),
+    any(input_count),
+    any(output_count),
+    countDistinct(tuple(transaction_count, input_count, output_count))
 FROM clicksync.blocks
 WHERE publication_id IN ?
 GROUP BY publication_id`
@@ -545,6 +683,8 @@ GROUP BY publication_id`
 		var digestBytes []byte
 		var minimumSynthetic bool
 		var maximumSynthetic bool
+		var transactionCount, inputCount, outputCount uint32
+		var countVariants uint64
 		if err := rows.Scan(
 			&publicationID,
 			&rowCount,
@@ -552,6 +692,10 @@ GROUP BY publication_id`
 			&digestBytes,
 			&minimumSynthetic,
 			&maximumSynthetic,
+			&transactionCount,
+			&inputCount,
+			&outputCount,
+			&countVariants,
 		); err != nil {
 			rows.Close()
 			return err
@@ -561,16 +705,21 @@ GROUP BY publication_id`
 			rows.Close()
 			return err
 		}
-		if rowCount != 1 || variantCount != 1 ||
+		want, expected := expectedByID[publicationID]
+		if !expected ||
+			rowCount != 1 || variantCount != 1 || countVariants != 1 ||
 			!minimumSynthetic || !maximumSynthetic ||
-			expectedDigest[publicationID] != digest {
+			want.FactsDigest != digest ||
+			transactionCount != want.TransactionCount ||
+			inputCount != 0 ||
+			outputCount != want.OutputCount {
 			rows.Close()
 			return errors.New("synthetic genesis publication has duplicate or conflicting physical block rows")
 		}
 		seen[publicationID] = struct{}{}
 	}
 	rows.Close()
-	if len(seen) != len(expectedDigest) {
+	if len(seen) != len(expectedByID) {
 		return errors.New("synthetic genesis publication bundle is incomplete")
 	}
 	snapshot, err := d.CommittedSnapshot(ctx)
@@ -592,18 +741,24 @@ GROUP BY publication_id`
 	for _, publicationID := range active {
 		activeSet[publicationID] = struct{}{}
 	}
-	if len(activeSet) != len(expectedDigest) {
+	if len(activeSet) != len(expectedByID) {
 		return errors.New("visible synthetic genesis publication set differs from the exact expected bundle")
 	}
-	for publicationID := range expectedDigest {
+	for publicationID := range expectedByID {
 		if _, active := activeSet[publicationID]; !active {
 			return errors.New("expected synthetic genesis publication is not visible")
 		}
 	}
 	for publicationID := range activeSet {
-		if _, expected := expectedDigest[publicationID]; !expected {
+		if _, expected := expectedByID[publicationID]; !expected {
 			return errors.New("unexpected visible synthetic genesis publication")
 		}
+	}
+	if err := d.validateGenesisFacts(ctx, expectedByID); err != nil {
+		return err
+	}
+	if err := lock.AssertHeld(); err != nil {
+		return fmt.Errorf("writer flock was lost before genesis tip reconciliation: %w", err)
 	}
 	if err := d.PersistManifest(ctx, publication.ManifestUpdate{
 		EventSeq:    snapshot,
@@ -613,6 +768,9 @@ GROUP BY publication_id`
 		UpdatedAt:   now.UTC(),
 	}); err != nil {
 		return err
+	}
+	if err := lock.AssertHeld(); err != nil {
+		return fmt.Errorf("writer flock was lost before genesis completion marker: %w", err)
 	}
 	const completeQuery = `
 INSERT INTO clicksync.dataset_manifest
@@ -632,6 +790,116 @@ FROM
 )`
 	if err := d.conn.Exec(ctx, completeQuery, now.UTC()); err != nil {
 		return fmt.Errorf("mark exact genesis bundle complete: %w", err)
+	}
+	return nil
+}
+
+func (d *DB) validateGenesisFacts(
+	ctx context.Context,
+	expected map[uint64]GenesisPublication,
+) error {
+	ids := make([]uint64, 0, len(expected))
+	for publicationID := range expected {
+		ids = append(ids, publicationID)
+	}
+	const transactionQuery = `
+SELECT
+    publication_id,
+    count(),
+    uniqExact(tx_hash),
+    countIf(flow_kind != 'genesis')
+FROM clicksync.transactions
+WHERE publication_id IN ?
+GROUP BY publication_id`
+	transactionRows, err := d.conn.Query(ctx, transactionQuery, ids)
+	if err != nil {
+		return fmt.Errorf("query exact genesis transactions: %w", err)
+	}
+	transactionSeen := make(map[uint64]struct{}, len(expected))
+	for transactionRows.Next() {
+		var publicationID, rows, distinct, wrongKind uint64
+		if err := transactionRows.Scan(
+			&publicationID,
+			&rows,
+			&distinct,
+			&wrongKind,
+		); err != nil {
+			transactionRows.Close()
+			return fmt.Errorf("scan exact genesis transactions: %w", err)
+		}
+		want, ok := expected[publicationID]
+		if !ok ||
+			rows != uint64(want.TransactionCount) ||
+			distinct != rows ||
+			wrongKind != 0 {
+			transactionRows.Close()
+			return fmt.Errorf("publication %d genesis transaction set differs", publicationID)
+		}
+		transactionSeen[publicationID] = struct{}{}
+	}
+	if err := transactionRows.Err(); err != nil {
+		transactionRows.Close()
+		return fmt.Errorf("iterate exact genesis transactions: %w", err)
+	}
+	transactionRows.Close()
+
+	const outputQuery = `
+SELECT
+    publication_id,
+    count(),
+    uniqExact(tuple(tx_hash, output_index)),
+    sum(lovelace),
+    countIf(output_kind != 'genesis')
+FROM clicksync.outputs
+WHERE publication_id IN ?
+GROUP BY publication_id`
+	outputRows, err := d.conn.Query(ctx, outputQuery, ids)
+	if err != nil {
+		return fmt.Errorf("query exact genesis outputs: %w", err)
+	}
+	outputSeen := make(map[uint64]struct{}, len(expected))
+	for outputRows.Next() {
+		var publicationID, rows, distinct, supply, wrongKind uint64
+		if err := outputRows.Scan(
+			&publicationID,
+			&rows,
+			&distinct,
+			&supply,
+			&wrongKind,
+		); err != nil {
+			outputRows.Close()
+			return fmt.Errorf("scan exact genesis outputs: %w", err)
+		}
+		want, ok := expected[publicationID]
+		if !ok ||
+			rows != uint64(want.OutputCount) ||
+			distinct != rows ||
+			supply != want.InitialSupply ||
+			wrongKind != 0 {
+			outputRows.Close()
+			return fmt.Errorf("publication %d genesis output set/supply differs", publicationID)
+		}
+		outputSeen[publicationID] = struct{}{}
+	}
+	if err := outputRows.Err(); err != nil {
+		outputRows.Close()
+		return fmt.Errorf("iterate exact genesis outputs: %w", err)
+	}
+	outputRows.Close()
+
+	var inputs uint64
+	if err := d.conn.QueryRow(
+		ctx,
+		`SELECT count() FROM clicksync.inputs WHERE publication_id IN ?`,
+		ids,
+	).Scan(&inputs); err != nil {
+		return fmt.Errorf("query genesis inputs: %w", err)
+	}
+	if inputs != 0 {
+		return errors.New("synthetic genesis publications contain inputs")
+	}
+	if len(transactionSeen) != len(expected) || len(outputSeen) != len(expected) {
+		return errors.New("synthetic genesis transaction/output set is incomplete")
 	}
 	return nil
 }

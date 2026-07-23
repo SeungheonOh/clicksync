@@ -60,7 +60,17 @@ func validateBlock(block model.Block) error {
 func validateSource(
 	source Source,
 	observations []model.PeerObservation,
+	synthetic bool,
 ) error {
+	if synthetic {
+		if source != OfficialMainnetGenesisSource() {
+			return errors.New("synthetic block source is not the pinned official mainnet genesis")
+		}
+		if len(observations) != 0 {
+			return errors.New("official genesis publication cannot carry peer observations")
+		}
+		return nil
+	}
 	if source.PeerHost == "" || source.PeerAddress == "" || source.Operator == "" {
 		return errors.New("selected source host, address, and operator are required")
 	}

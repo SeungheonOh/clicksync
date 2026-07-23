@@ -464,6 +464,55 @@ func TestCompleteHistoryRejectsUnresolvedButAcceptsCrossBlockInput(t *testing.T)
 	}
 }
 
+func TestSyntheticGenesisRequiresPinnedOfficialSource(t *testing.T) {
+	txHash := filled32(0x61)
+	block := model.Block{
+		Hash:       filled32(0x60),
+		Era:        "Byron",
+		Type:       -1,
+		Synthetic:  true,
+		ObservedAt: testNow(),
+		Transactions: []model.Transaction{{
+			Hash:        txHash,
+			Phase2Valid: true,
+			FlowKind:    "genesis",
+			Outputs: []model.Output{{
+				TransactionHash: txHash,
+				Kind:            "genesis",
+				Address:         []byte{0x82, 0x01},
+				Lovelace:        1,
+				DatumKind:       "none",
+			}},
+		}},
+	}
+	backend := &fakeBackend{startOrigin: true}
+	coordinator := newFakeCoordinator(
+		t,
+		backend,
+		&fakeAllocator{},
+		&fakeLock{held: true},
+		nil,
+	)
+	if _, err := coordinator.Publish(
+		context.Background(),
+		block,
+		OfficialMainnetGenesisSource(),
+		nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	badSource := OfficialMainnetGenesisSource()
+	badSource.N2NVersion = 15
+	if _, err := coordinator.Publish(
+		context.Background(),
+		block,
+		badSource,
+		nil,
+	); err == nil {
+		t.Fatal("synthetic genesis accepted fabricated peer provenance")
+	}
+}
+
 func TestLostAdoptionResponseAndPostCommitFaultAreTyped(t *testing.T) {
 	backend := &fakeBackend{
 		adoptionInsertError: errors.New("lost response"),
@@ -518,6 +567,76 @@ func TestIndeterminateAdoptionIsFatal(t *testing.T) {
 	var indeterminate *IndeterminateCommitError
 	if !errors.As(err, &indeterminate) {
 		t.Fatalf("error = %T %v, want IndeterminateCommitError", err, err)
+	}
+}
+
+func TestLostFlockAfterAuthoritativeHeadersSkipsManifest(t *testing.T) {
+	adoptionBackend := &fakeBackend{}
+	adoptionLock := &fakeLock{held: true}
+	coordinator := newFakeCoordinator(
+		t,
+		adoptionBackend,
+		&fakeAllocator{},
+		adoptionLock,
+		func(point FaultPoint) error {
+			if point == AfterAdoption {
+				adoptionLock.held = false
+			}
+			return nil
+		},
+	)
+	_, err := coordinator.Publish(context.Background(), validBlock(), validSource(), nil)
+	var committed *CommittedError
+	if !errors.As(err, &committed) ||
+		adoptionBackend.adoptions != 1 ||
+		len(adoptionBackend.manifestUpdates) != 0 {
+		t.Fatalf(
+			"post-adoption flock loss err=%v adoptions=%d manifests=%d",
+			err,
+			adoptionBackend.adoptions,
+			len(adoptionBackend.manifestUpdates),
+		)
+	}
+
+	block := validBlock()
+	rollbackBackend := &fakeBackend{
+		snapshot: 1,
+		descendants: []Descendant{{
+			PublicationID: 1,
+			Point:         pointFromBlock(block),
+		}},
+	}
+	rollbackLock := &fakeLock{held: true}
+	coordinator = newFakeCoordinator(
+		t,
+		rollbackBackend,
+		&fakeAllocator{event: 1},
+		rollbackLock,
+		func(point FaultPoint) error {
+			if point == AfterRollbackHeader {
+				rollbackLock.held = false
+			}
+			return nil
+		},
+	)
+	err = coordinator.Rollback(context.Background(), RollbackRequest{
+		To:                    Point{Origin: true},
+		MaximumDepth:          2,
+		RequiredCorroboration: 2,
+		Observers: []RollbackObserver{
+			{Peer: "peer-a", Operator: "operator-a"},
+			{Peer: "peer-b", Operator: "operator-b"},
+		},
+	})
+	if !errors.As(err, &committed) ||
+		rollbackBackend.rollbackHeaders != 1 ||
+		len(rollbackBackend.manifestUpdates) != 0 {
+		t.Fatalf(
+			"post-rollback flock loss err=%v headers=%d manifests=%d",
+			err,
+			rollbackBackend.rollbackHeaders,
+			len(rollbackBackend.manifestUpdates),
+		)
 	}
 }
 
