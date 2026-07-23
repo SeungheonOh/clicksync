@@ -512,18 +512,28 @@ func (s *Supervisor) corroborate(
 				observation.Tip = result.Tip
 				observation.N2NVersion = result.N2NVersion
 			default:
-				observation.Result = "agreed"
 				observation.Tip = result.Tip
 				observation.N2NVersion = result.N2NVersion
-				acceptedPeer := peer
-				if result.Address != "" {
+				if validationErr := validateAcceptedProbe(
+					checkpoint,
+					result,
+				); validationErr != nil {
+					observation.Kind = "disagreement"
+					observation.Result = "quarantined"
+					observation.Reason = "invalid_accepted_probe: " +
+						validationErr.Error()
+					quarantined[peer.Operator] = struct{}{}
+					peerQuarantined = true
+				} else {
+					observation.Result = "agreed"
+					acceptedPeer := peer
 					acceptedPeer.Address = result.Address
-				}
-				if _, exists := byOperator[peer.Operator]; !exists {
-					byOperator[peer.Operator] = PeerEvidence{
-						Peer:       acceptedPeer,
-						Tip:        cloneTip(result.Tip),
-						N2NVersion: result.N2NVersion,
+					if _, exists := byOperator[peer.Operator]; !exists {
+						byOperator[peer.Operator] = PeerEvidence{
+							Peer:       acceptedPeer,
+							Tip:        cloneTip(result.Tip),
+							N2NVersion: result.N2NVersion,
+						}
 					}
 				}
 			}
@@ -544,6 +554,13 @@ func (s *Supervisor) corroborate(
 						"unclassified N2N probe failure is terminal: %w",
 						probeErr,
 					)
+				}
+			}
+			if peerQuarantined && probeErr == nil {
+				if err := s.requireRemainingOperators(
+					quarantined,
+				); err != nil {
+					return n2n.ChainPoint{}, nil, err
 				}
 			}
 		}
@@ -1107,9 +1124,30 @@ func (h *attemptHandler) confirmPublishedCheckpoint(
 			observation.Reason = "peer tip precedes committed checkpoint"
 			quarantine = true
 		default:
-			observation.Result = "agreed"
-			observation.Reason = "periodic independent checkpoint"
-			confirmedOperators[key] = struct{}{}
+			typedCheckpoint := n2n.NewChainPoint(
+				checkpoint,
+				checkpointBlockNumber,
+			)
+			if checkpointIsByronEBB {
+				typedCheckpoint = n2n.NewByronEBBChainPoint(
+					checkpoint,
+					checkpointBlockNumber,
+				)
+			}
+			if validationErr := validateAcceptedProbe(
+				typedCheckpoint,
+				result,
+			); validationErr != nil {
+				observation.Kind = "disagreement"
+				observation.Result = "quarantined"
+				observation.Reason = "invalid_accepted_probe: " +
+					validationErr.Error()
+				quarantine = true
+			} else {
+				observation.Result = "agreed"
+				observation.Reason = "periodic independent checkpoint"
+				confirmedOperators[key] = struct{}{}
+			}
 		}
 		if quarantine {
 			h.quarantineOperator(candidatePeer.Operator)
@@ -1616,6 +1654,34 @@ func validateRollbackProbeTip(
 		remote.Point.Slot < branch.Point.Slot {
 		return errors.New(
 			"rollback proof remote tip precedes the exact branch tip",
+		)
+	}
+	return nil
+}
+
+func validateAcceptedProbe(
+	checkpoint n2n.ChainPoint,
+	result ProbeResult,
+) error {
+	if !result.Accepted {
+		return errors.New("probe did not accept the exact checkpoint")
+	}
+	if strings.TrimSpace(result.Address) == "" {
+		return errors.New("accepted probe omitted actual remote address")
+	}
+	if result.N2NVersion < 7 || result.N2NVersion > 15 {
+		return fmt.Errorf(
+			"accepted probe reported unsupported N2N version %d",
+			result.N2NVersion,
+		)
+	}
+	if err := validateRollbackOrder(
+		checkpoint,
+		result.Tip,
+	); err != nil {
+		return fmt.Errorf(
+			"accepted probe remote tip is incompatible: %w",
+			err,
 		)
 	}
 	return nil

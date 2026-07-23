@@ -217,6 +217,141 @@ func TestSupervisorRetriesUnavailableCorroborationThenRecovers(t *testing.T) {
 	}
 }
 
+func TestStartupCorroborationQuarantinesMalformedAcceptedProbe(t *testing.T) {
+	checkpoint := testChainPoint(10, 10, 0x10)
+	config := baseConfig()
+	config.Peers = append(
+		config.Peers,
+		testPeer("relay-c:3001", "operator-c"),
+	)
+	transport := &fakeTransport{
+		probe: func(
+			_ context.Context,
+			peer n2n.Peer,
+			_ pcommon.Point,
+		) (ProbeResult, error) {
+			address := "192.0.2.10:3001"
+			if peer.Operator == "operator-a" {
+				address = ""
+			}
+			return ProbeResult{
+				Accepted: true,
+				Tip: chainsync.Tip{
+					Point:       testPoint(12, 0x12),
+					BlockNumber: 12,
+				},
+				N2NVersion: 15,
+				Address:    address,
+			}, nil
+		},
+	}
+	observer := &fakeObserver{}
+	supervisor := newTestSupervisor(
+		t,
+		config,
+		&fakeCandidates{},
+		&fakeHandler{},
+		observer,
+		transport,
+	)
+	quarantined := make(map[string]struct{})
+	got, agreeing, err := supervisor.corroborate(
+		context.Background(),
+		[]n2n.ChainPoint{checkpoint},
+		quarantined,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !chainPointsEqual(got, checkpoint) ||
+		len(agreeing) != 2 ||
+		agreeing[0].Peer.Operator != "operator-b" ||
+		agreeing[1].Peer.Operator != "operator-c" {
+		t.Fatalf("checkpoint=%#v agreeing=%#v", got, agreeing)
+	}
+	if _, ok := quarantined["operator-a"]; !ok {
+		t.Fatalf("malformed accepted probe not quarantined: %#v", quarantined)
+	}
+	if !slices.ContainsFunc(
+		observer.observations,
+		func(observation Observation) bool {
+			return observation.Peer.Operator == "operator-a" &&
+				observation.Result == "quarantined" &&
+				strings.Contains(
+					observation.Reason,
+					"invalid_accepted_probe",
+				)
+		},
+	) {
+		t.Fatalf("observations=%#v", observer.observations)
+	}
+}
+
+func TestPeriodicCheckpointMalformedAcceptedProbeFailsClosed(t *testing.T) {
+	checkpoint := testChainPoint(10, 10, 0x10)
+	primary := actualPeer(
+		testPeer("relay-a:3001", "operator-a"),
+		"198.51.100.1:3001",
+		15,
+	)
+	transport := &fakeTransport{
+		probe: func(
+			context.Context,
+			n2n.Peer,
+			pcommon.Point,
+		) (ProbeResult, error) {
+			return ProbeResult{
+				Accepted: true,
+				Tip: chainsync.Tip{
+					Point:       testPoint(12, 0x12),
+					BlockNumber: 12,
+				},
+				N2NVersion: 0,
+				Address:    "198.51.100.2:3001",
+			}, nil
+		},
+	}
+	supervisor := newTestSupervisor(
+		t,
+		baseConfig(),
+		&fakeCandidates{},
+		&fakeHandler{},
+		&fakeObserver{},
+		transport,
+	)
+	quarantined := make(map[string]struct{})
+	attempt := &attemptHandler{
+		supervisor: supervisor,
+		evidence: SourceEvidence{
+			Primary: PeerEvidence{
+				Peer: primary,
+				Tip: chainsync.Tip{
+					Point:       testPoint(12, 0x12),
+					BlockNumber: 12,
+				},
+				N2NVersion: 15,
+			},
+		},
+		delegate:        &fakeHandler{},
+		committedBlocks: new(uint64),
+		quarantined:     quarantined,
+	}
+	err := attempt.confirmPublishedCheckpoint(
+		context.Background(),
+		checkpoint.Point,
+		checkpoint.BlockNumber,
+		checkpoint.IsByronEBB,
+		attempt.evidence.Primary.Tip,
+	)
+	if err == nil ||
+		!strings.Contains(err.Error(), "peer quarantine leaves 1") {
+		t.Fatalf("error=%v", err)
+	}
+	if _, ok := quarantined["operator-b"]; !ok {
+		t.Fatalf("malformed periodic probe not quarantined: %#v", quarantined)
+	}
+}
+
 func TestPartialByronBoundaryFallsBackFromSameSlotSuccessorToEBB(t *testing.T) {
 	ebb := n2n.NewByronEBBChainPoint(testPoint(21_600, 0xe0), 20_000)
 	successor := testChainPoint(21_600, 20_001, 0xe1)
@@ -1434,6 +1569,7 @@ func TestRollForwardCheckpointsExactPriorByronEBBTail(t *testing.T) {
 				Accepted:   true,
 				Tip:        cloneTip(tailTip),
 				N2NVersion: 15,
+				Address:    "198.51.100.2:3001",
 			}, nil
 		},
 	}
