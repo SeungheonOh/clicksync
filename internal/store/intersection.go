@@ -30,14 +30,15 @@ type intersectionEvent struct {
 // Origin or the exact partial-history boundary is appended as the terminal
 // candidate without scanning block history.
 func (d *DB) IntersectionCandidates(ctx context.Context) ([]n2n.ChainPoint, error) {
-	snapshot, err := d.CommittedSnapshot(ctx)
+	record, found, err := d.loadAuthoritativeManifest(ctx)
 	if err != nil {
 		return nil, err
 	}
-	identity, err := d.LoadManifestIdentity(ctx)
-	if err != nil {
-		return nil, err
+	if !found {
+		return nil, errors.New("dataset manifest is not initialized")
 	}
+	snapshot := record.Effective.EventSeq
+	identity := manifestIdentityFromRecord(record)
 	tip, err := d.committedTip(ctx, snapshot)
 	if err != nil {
 		return nil, err

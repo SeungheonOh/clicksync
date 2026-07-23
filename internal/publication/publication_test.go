@@ -69,6 +69,10 @@ func (backend *fakeBackend) CommittedSnapshot(context.Context) (uint64, error) {
 	backend.call("snapshot")
 	return backend.snapshot, nil
 }
+func (backend *fakeBackend) RawCommittedSnapshot(context.Context) (uint64, error) {
+	backend.call("snapshot")
+	return backend.snapshot, nil
+}
 func (backend *fakeBackend) CommittedTip(context.Context, uint64) (Point, error) {
 	if backend.tip == (Point{}) {
 		return Point{Origin: true}, nil
@@ -145,13 +149,6 @@ func (backend *fakeBackend) InsertMetadataBatch(context.Context, []Attempt) erro
 	backend.call("metadata")
 	return nil
 }
-func (backend *fakeBackend) InsertPeerObservations(
-	context.Context,
-	[]model.PeerObservation,
-) error {
-	backend.call("peer")
-	return nil
-}
 func (backend *fakeBackend) VerifyFactBatch(context.Context, []Attempt) error {
 	backend.call("verify")
 	return nil
@@ -209,6 +206,41 @@ func (backend *fakeBackend) RollbackCommitted(context.Context, RollbackCommit) (
 	backend.call("rollback_status")
 	return backend.rollbackStatus, backend.rollbackStatusError
 }
+func (backend *fakeBackend) ReserveRollbackManifest(
+	_ context.Context,
+	_ Lock,
+	commit RollbackCommit,
+	_ string,
+) (RollbackCommit, error) {
+	backend.call("rollback_reserve")
+	return commit, nil
+}
+func (backend *fakeBackend) MarkRollbackInvalidations(
+	_ context.Context,
+	_ Lock,
+	_ RollbackCommit,
+	_ string,
+) error {
+	backend.call("rollback_invalidations_manifest")
+	return nil
+}
+func (backend *fakeBackend) FinalizeRollbackManifest(
+	_ context.Context,
+	_ Lock,
+	commit RollbackCommit,
+	build string,
+) error {
+	backend.call("manifest")
+	backend.manifestUpdates = append(backend.manifestUpdates, ManifestUpdate{
+		EventSeq:    commit.EventSeq,
+		Tip:         commit.To,
+		Kind:        ManifestRollback,
+		WriterID:    commit.WriterID,
+		WriterBuild: build,
+		UpdatedAt:   commit.RecordedAt,
+	})
+	return nil
+}
 func (backend *fakeBackend) PersistManifest(_ context.Context, _ Lock, update ManifestUpdate) error {
 	backend.call("manifest")
 	backend.manifestUpdates = append(backend.manifestUpdates, update)
@@ -227,13 +259,13 @@ func TestPublishExactFactOrderAndFreshRetry(t *testing.T) {
 		}
 		return nil
 	})
-	if _, err := coordinator.Publish(context.Background(), validBlock(), validSource(), nil); err == nil {
+	if _, err := coordinator.Publish(context.Background(), validBlock(), validSource()); err == nil {
 		t.Fatal("expected injected crash")
 	}
 	if backend.adoptions != 0 {
 		t.Fatal("incomplete facts became adopted")
 	}
-	publicationID, err := coordinator.Publish(context.Background(), validBlock(), validSource(), nil)
+	publicationID, err := coordinator.Publish(context.Background(), validBlock(), validSource())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -282,7 +314,6 @@ func TestCrashAtEveryPreCommitBoundaryNeverAdopts(t *testing.T) {
 				context.Background(),
 				validBlock(),
 				validSource(),
-				nil,
 			); err == nil {
 				t.Fatal("expected injected failure")
 			}
@@ -317,7 +348,7 @@ func TestPublishBatchUsesOneTableCallAndResolvesEarlierStagedOutput(t *testing.T
 		t.Fatalf("batch result = %+v", result)
 	}
 	want := []string{
-		"peer", "snapshot", "resolve", "datums",
+		"snapshot", "resolve", "datums",
 		"blocks", "transactions", "inputs", "outputs", "datum_bodies",
 		"datum_observations", "withdrawals", "redeemers", "metadata", "verify",
 		"adoption", "manifest",
@@ -828,7 +859,6 @@ func TestSyntheticGenesisRequiresPinnedOfficialSource(t *testing.T) {
 		context.Background(),
 		block,
 		OfficialMainnetGenesisSource(),
-		nil,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -838,7 +868,6 @@ func TestSyntheticGenesisRequiresPinnedOfficialSource(t *testing.T) {
 		context.Background(),
 		block,
 		badSource,
-		nil,
 	); err == nil {
 		t.Fatal("synthetic genesis accepted fabricated peer provenance")
 	}
@@ -856,7 +885,7 @@ func TestLostAdoptionResponseAndPostCommitFaultAreTyped(t *testing.T) {
 		&fakeLock{held: true},
 		nil,
 	)
-	if _, err := coordinator.Publish(context.Background(), validBlock(), validSource(), nil); err != nil {
+	if _, err := coordinator.Publish(context.Background(), validBlock(), validSource()); err != nil {
 		t.Fatalf("read-back-proven adoption failed: %v", err)
 	}
 	backend = &fakeBackend{}
@@ -872,7 +901,7 @@ func TestLostAdoptionResponseAndPostCommitFaultAreTyped(t *testing.T) {
 			return nil
 		},
 	)
-	_, err := coordinator.Publish(context.Background(), validBlock(), validSource(), nil)
+	_, err := coordinator.Publish(context.Background(), validBlock(), validSource())
 	var committed *CommittedError
 	if !errors.As(err, &committed) {
 		t.Fatalf("post-commit fault = %T %v, want CommittedError", err, err)
@@ -894,7 +923,7 @@ func TestIndeterminateAdoptionIsFatal(t *testing.T) {
 		&fakeLock{held: true},
 		nil,
 	)
-	_, err := coordinator.Publish(context.Background(), validBlock(), validSource(), nil)
+	_, err := coordinator.Publish(context.Background(), validBlock(), validSource())
 	var indeterminate *IndeterminateCommitError
 	if !errors.As(err, &indeterminate) {
 		t.Fatalf("error = %T %v, want IndeterminateCommitError", err, err)
@@ -916,7 +945,7 @@ func TestLostFlockAfterAuthoritativeHeadersSkipsManifest(t *testing.T) {
 			return nil
 		},
 	)
-	_, err := coordinator.Publish(context.Background(), validBlock(), validSource(), nil)
+	_, err := coordinator.Publish(context.Background(), validBlock(), validSource())
 	var committed *CommittedError
 	if !errors.As(err, &committed) ||
 		adoptionBackend.adoptions != 1 ||
@@ -952,6 +981,10 @@ func TestLostFlockAfterAuthoritativeHeadersSkipsManifest(t *testing.T) {
 	)
 	err = coordinator.Rollback(context.Background(), RollbackRequest{
 		To:                    Point{Origin: true},
+		CheckID:               rollbackCheckPointer(0x31),
+		AgreementGroup:        rollbackCheckPointer(0x32),
+		CheckAttempt:          1,
+		CheckedEventSeq:       1,
 		MaximumDepth:          2,
 		RequiredCorroboration: 2,
 		Observers: []RollbackObserver{
@@ -996,6 +1029,10 @@ func TestHeaderlessRollbackIsInertAndOperatorsMustBeIndependent(t *testing.T) {
 	)
 	request := RollbackRequest{
 		To:                    Point{Origin: true},
+		CheckID:               rollbackCheckPointer(0x41),
+		AgreementGroup:        rollbackCheckPointer(0x42),
+		CheckAttempt:          1,
+		CheckedEventSeq:       1,
 		MaximumDepth:          2,
 		RequiredCorroboration: 2,
 		Observers: []RollbackObserver{
@@ -1021,6 +1058,39 @@ func TestHeaderlessRollbackIsInertAndOperatorsMustBeIndependent(t *testing.T) {
 	}
 }
 
+func TestRollbackRejectsSingleCorroboratorBeforeAllocation(t *testing.T) {
+	backend := &fakeBackend{}
+	allocator := &fakeAllocator{}
+	coordinator := newFakeCoordinator(
+		t,
+		backend,
+		allocator,
+		&fakeLock{held: true},
+		nil,
+	)
+	err := coordinator.Rollback(context.Background(), RollbackRequest{
+		To:                    Point{Origin: true},
+		MaximumDepth:          1,
+		RequiredCorroboration: 1,
+		Observers: []RollbackObserver{{
+			Peer:     "relay-a",
+			Operator: "operator-a",
+		}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "at least two") {
+		t.Fatalf("rollback error = %v", err)
+	}
+	if allocator.event != 0 ||
+		allocator.publication != 0 ||
+		len(backend.calls) != 0 {
+		t.Fatalf(
+			"invalid rollback allocated/mutated: allocator=%+v calls=%v",
+			allocator,
+			backend.calls,
+		)
+	}
+}
+
 func TestNoOpRollbackCommitsOnlyAtAuthoritativeTip(t *testing.T) {
 	partialTip := Point{
 		Slot:        10,
@@ -1030,6 +1100,10 @@ func TestNoOpRollbackCommitsOnlyAtAuthoritativeTip(t *testing.T) {
 	request := func(to Point) RollbackRequest {
 		return RollbackRequest{
 			To:                    to,
+			CheckID:               rollbackCheckPointer(0x51),
+			AgreementGroup:        rollbackCheckPointer(0x52),
+			CheckAttempt:          1,
+			CheckedEventSeq:       4,
 			MaximumDepth:          2,
 			RequiredCorroboration: 2,
 			Observers: []RollbackObserver{
@@ -1542,3 +1616,11 @@ func TestSpendRedeemerResolvesPaymentScriptCredential(t *testing.T) {
 }
 
 func pointer64(value uint64) *uint64 { return &value }
+
+func rollbackCheckPointer(value byte) *[16]byte {
+	var ret [16]byte
+	for index := range ret {
+		ret[index] = value
+	}
+	return &ret
+}

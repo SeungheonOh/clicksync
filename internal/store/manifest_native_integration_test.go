@@ -84,6 +84,36 @@ func TestNativeManifestDDLConstraintsAndDuplicateIntegrity(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	latest, found, err := db.loadLatestManifestRecord(ctx)
+	if err != nil || !found {
+		t.Fatalf("load manifest before invalid append found=%t err=%v", found, err)
+	}
+	var rowsBefore uint64
+	if err := db.conn.QueryRow(
+		ctx,
+		`SELECT count() FROM clicksync.dataset_manifest`,
+	).Scan(&rowsBefore); err != nil {
+		t.Fatal(err)
+	}
+	invalid := latest
+	invalid.Revision++
+	invalid.PreviousRowDigest = &latest.RowDigest
+	invalid.TransitionKind = "trust_agreed"
+	invalid.CorroborationConfirmed = 1
+	invalid.EvidenceCount = 0
+	if err := db.appendManifestRecord(ctx, invalid); err == nil {
+		t.Fatal("semantic invalid manifest append was accepted")
+	}
+	var rowsAfter uint64
+	if err := db.conn.QueryRow(
+		ctx,
+		`SELECT count() FROM clicksync.dataset_manifest`,
+	).Scan(&rowsAfter); err != nil {
+		t.Fatal(err)
+	}
+	if rowsAfter != rowsBefore {
+		t.Fatalf("invalid append prepared/inserted rows: before=%d after=%d", rowsBefore, rowsAfter)
+	}
 
 	// Nullable point constraints must reject a tuple with an event but no
 	// origin discriminator, rather than letting SQL NULL make CHECK unknown.
@@ -124,7 +154,7 @@ FROM
 		t.Fatal("native manifest accepted a partial last-agreed event-point")
 	}
 
-	latest, found, err := db.loadLatestManifestRecord(ctx)
+	latest, found, err = db.loadLatestManifestRecord(ctx)
 	if err != nil || !found {
 		t.Fatalf("read native manifest head: found=%t err=%v", found, err)
 	}

@@ -103,7 +103,7 @@ func run(args []string) error {
 		if err := db.Ping(ctx); err != nil {
 			return err
 		}
-		identity, found, err := db.LoadManifestIdentityIfExists(ctx)
+		status, found, err := db.DatasetStatus(ctx)
 		if err != nil {
 			return err
 		}
@@ -112,30 +112,7 @@ func run(args []string) error {
 				"initialized": false,
 			})
 		}
-		snapshot, err := db.CommittedSnapshot(ctx)
-		if err != nil {
-			return err
-		}
-		tip, err := db.CommittedTip(ctx, snapshot)
-		if err != nil {
-			return err
-		}
-		tipJSON := map[string]any{"origin": tip.Origin}
-		if !tip.Origin {
-			tipJSON["slot"] = tip.Slot
-			tipJSON["hash"] = fmt.Sprintf("%x", tip.Hash)
-			tipJSON["block_number"] = tip.BlockNumber
-			tipJSON["is_byron_ebb"] = tip.IsByronEBB
-		}
-		return json.NewEncoder(os.Stdout).Encode(map[string]any{
-			"initialized":         true,
-			"dataset_id":          fmt.Sprintf("%x", identity.DatasetID),
-			"network_name":        identity.NetworkName,
-			"network_magic":       identity.NetworkMagic,
-			"complete_history":    identity.CompleteHistory,
-			"committed_event_seq": snapshot,
-			"tip":                 tipJSON,
-		})
+		return json.NewEncoder(os.Stdout).Encode(status)
 	case "writer":
 		cfg, err := config.DatabaseFromEnv()
 		if err != nil {
@@ -160,6 +137,7 @@ func run(args []string) error {
 				"dataset_id":     fmt.Sprintf("%x", audit.DatasetID),
 				"revision":       audit.Revision,
 				"owner_id":       fmt.Sprintf("%x", audit.OwnerID),
+				"build_id":       audit.BuildID,
 				"state":          audit.State,
 				"heartbeat_at":   audit.HeartbeatAt,
 				"released_at":    audit.ReleasedAt,

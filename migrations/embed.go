@@ -18,6 +18,12 @@ var Initial string
 //go:embed schema_contract.txt
 var ContractDescriptor string
 
+// ContractFixture is the disposable SQL proof for header-authorized rollback
+// membership semantics.
+//
+//go:embed contract_fixture.sql
+var ContractFixture string
+
 // ContractHash is persisted as immutable manifest identity. A changed
 // descriptor is a different dataset contract, not a compatibility version.
 var ContractHash = sha256.Sum256([]byte(ContractDescriptor))

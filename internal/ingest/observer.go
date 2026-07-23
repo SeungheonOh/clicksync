@@ -1,13 +1,14 @@
 package ingest
 
 import (
+	"bytes"
 	"context"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/blinklabs-io/gouroboros/protocol/chainsync"
+	pcommon "github.com/blinklabs-io/gouroboros/protocol/common"
 
 	"clicksync/internal/model"
 	"clicksync/internal/n2n"
@@ -37,10 +38,10 @@ func (observer *Observer) Observe(
 	ctx context.Context,
 	input syncer.Observation,
 ) error {
-	id, err := randomID()
-	if err != nil {
+	if err := validateObservationCheck(input.Check, input.Checkpoint, input.CheckpointBlockNumber); err != nil {
 		return err
 	}
+	var err error
 	var tipHash model.Hash32
 	if len(input.Tip.Point.Hash) != 0 {
 		tipHash, err = requiredHash32(input.Tip.Point.Hash, "observed tip")
@@ -59,8 +60,8 @@ func (observer *Observer) Observe(
 		}
 	}
 	row := model.PeerObservation{
-		ID:                 id,
 		Kind:               input.Kind,
+		ProofMethod:        input.ProofMethod,
 		PeerHost:           input.Peer.Host,
 		PeerAddress:        input.Peer.Address,
 		Operator:           input.Peer.Operator,
@@ -70,11 +71,15 @@ func (observer *Observer) Observe(
 		TipHash:            tipHash,
 		TipBlockNumber:     input.Tip.BlockNumber,
 		SelectedBodySource: input.SelectedBodySource,
-		PointVerified:      input.Result == "agreed",
-		Result:             input.Result,
-		Reason:             input.Reason,
-		ObservedAt:         input.ObservedAt.UTC(),
+		BodyHashVerified: input.Result == "agreed" &&
+			input.ProofMethod == syncer.ObservationProofFollowBlockFetch,
+		PointVerified: input.Result == "agreed" &&
+			input.ProofMethod != syncer.ObservationProofNone,
+		Result:     input.Result,
+		Reason:     input.Reason,
+		ObservedAt: input.ObservedAt.UTC(),
 	}
+	applyObservationCheck(&row, input.Check)
 	if len(input.Checkpoint.Hash) != 0 {
 		checkpointHash, err := requiredHash32(input.Checkpoint.Hash, "checkpoint")
 		if err != nil {
@@ -93,17 +98,28 @@ func (observer *Observer) Observe(
 	} else if input.CheckpointIsByronEBB != nil {
 		return errors.New("Origin checkpoint unexpectedly has Byron EBB classification")
 	}
+	if err := finalizeObservationIdentity(&row); err != nil {
+		return err
+	}
 	return observer.sink.InsertPeerObservations(ctx, []model.PeerObservation{row})
 }
 
 func BoundaryObservations(
 	bootstrap n2n.BoundaryBootstrap,
 	networkMagic uint32,
+	check syncer.CheckIdentity,
 ) ([]model.PeerObservation, error) {
 	if networkMagic != n2n.MainnetNetworkMagic {
 		return nil, fmt.Errorf("boundary observation network magic %d is not pinned mainnet", networkMagic)
 	}
 	checkpoint := bootstrap.ChainPoint
+	if err := validateObservationCheck(
+		check,
+		checkpoint.Point,
+		checkpoint.BlockNumber,
+	); err != nil {
+		return nil, err
+	}
 	checkpointHash, err := requiredHash32(checkpoint.Point.Hash, "boundary checkpoint")
 	if err != nil {
 		return nil, err
@@ -121,10 +137,6 @@ func BoundaryObservations(
 		} else if evidence.Status == n2n.BoundaryAccepted {
 			return nil, errors.New("accepted boundary evidence omitted peer tip")
 		}
-		id, err := randomID()
-		if err != nil {
-			return nil, err
-		}
 		slot := checkpoint.Point.Slot
 		number := checkpoint.BlockNumber
 		isByronEBB := checkpoint.IsByronEBB
@@ -140,9 +152,13 @@ func BoundaryObservations(
 		default:
 			return nil, fmt.Errorf("unknown boundary evidence status %q", evidence.Status)
 		}
-		ret = append(ret, model.PeerObservation{
-			ID:                    id,
+		proofMethod := syncer.ObservationProofChainSyncSingleton
+		if evidence.Status == n2n.BoundaryAccepted {
+			proofMethod = syncer.ObservationProofBoundarySingletonFetch
+		}
+		row := model.PeerObservation{
 			Kind:                  "checkpoint",
+			ProofMethod:           proofMethod,
 			PeerHost:              evidence.Peer.Host,
 			PeerAddress:           evidence.Peer.Address,
 			Operator:              evidence.Peer.Operator,
@@ -163,9 +179,61 @@ func BoundaryObservations(
 			Result:           result,
 			Reason:           evidence.Failure,
 			ObservedAt:       timeFromTip(tip),
-		})
+		}
+		applyObservationCheck(&row, check)
+		if err := finalizeObservationIdentity(&row); err != nil {
+			return nil, err
+		}
+		ret = append(ret, row)
 	}
 	return ret, nil
+}
+
+func validateObservationCheck(
+	check syncer.CheckIdentity,
+	checkpoint pcommon.Point,
+	blockNumber uint64,
+) error {
+	if check.ID == ([16]byte{}) ||
+		check.AgreementGroup == ([16]byte{}) ||
+		check.Attempt == 0 ||
+		check.Required < 2 {
+		return errors.New("peer observation omitted check/group/attempt/threshold identity")
+	}
+	if check.CheckedPoint.BlockNumber != blockNumber ||
+		check.CheckedPoint.Point.Slot != checkpoint.Slot ||
+		!bytes.Equal(check.CheckedPoint.Point.Hash, checkpoint.Hash) {
+		return errors.New("peer observation checkpoint differs from exact checked event-point")
+	}
+	return nil
+}
+
+func applyObservationCheck(
+	row *model.PeerObservation,
+	check syncer.CheckIdentity,
+) {
+	row.CheckID = check.ID
+	row.AgreementGroup = check.AgreementGroup
+	row.CheckAttempt = check.Attempt
+	row.CorroborationRequired = check.Required
+	row.CheckedEventSeq = check.CheckedEventSeq
+	point := check.CheckedPoint
+	if len(point.Point.Hash) == 0 {
+		row.CheckedPointOrigin = true
+		return
+	}
+	slot := point.Point.Slot
+	hash := model.Hash32{}
+	copy(hash[:], point.Point.Hash)
+	number := point.BlockNumber
+	row.CheckedPointSlot = &slot
+	row.CheckedPointHash = &hash
+	row.CheckedBlockNumber = &number
+	row.CheckedPointIsByronEBB = point.IsByronEBB
+}
+
+func finalizeObservationIdentity(row *model.PeerObservation) error {
+	return model.FinalizePeerObservationIdentity(row)
 }
 
 func requiredHash32(value []byte, label string) (model.Hash32, error) {
@@ -182,14 +250,6 @@ func requiredHash32(value []byte, label string) (model.Hash32, error) {
 
 func tipHash(tip chainsync.Tip) (model.Hash32, error) {
 	return requiredHash32(tip.Point.Hash, "observed tip")
-}
-
-func randomID() ([16]byte, error) {
-	var ret [16]byte
-	if _, err := rand.Read(ret[:]); err != nil {
-		return ret, fmt.Errorf("generate observation ID: %w", err)
-	}
-	return ret, nil
 }
 
 // ChainSync tips carry no wall-clock observation timestamp. Boundary rows are

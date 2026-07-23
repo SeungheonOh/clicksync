@@ -29,6 +29,28 @@ type Observer interface {
 	Observe(context.Context, Observation) error
 }
 
+type TrustController interface {
+	BeginCheck(context.Context, *n2n.ChainPoint, int, time.Time) (CheckIdentity, error)
+	FinalizeCheck(context.Context, CheckIdentity, bool, string, time.Time) (TrustResolution, error)
+}
+
+type CheckIdentity struct {
+	ID              [16]byte
+	AgreementGroup  [16]byte
+	Attempt         uint32
+	Required        uint16
+	CheckedEventSeq uint64
+	CheckedPoint    n2n.ChainPoint
+	Physical        bool
+}
+
+type TrustResolution struct {
+	Status    string
+	Confirmed uint16
+	Required  uint16
+	Servable  bool
+}
+
 type Handler interface {
 	Reconcile(context.Context, n2n.ChainPoint, SourceEvidence) (CommitOutcome, error)
 	RollForward(context.Context, lcommon.Block, chainsync.Tip, SourceEvidence) (CommitOutcome, error)
@@ -59,16 +81,19 @@ type PeerEvidence struct {
 	Peer       n2n.Peer
 	Tip        chainsync.Tip
 	N2NVersion uint16
+	Check      CheckIdentity
 }
 
 type SourceEvidence struct {
 	Primary           PeerEvidence
 	Checkpoint        n2n.ChainPoint
 	CheckpointMembers []PeerEvidence
+	Check             CheckIdentity
 }
 
 type RollbackEvidence struct {
 	Source        SourceEvidence
+	Check         CheckIdentity
 	Target        n2n.ChainPoint
 	BranchTip     chainsync.Tip
 	Confirmations []RollbackConfirmation
@@ -204,7 +229,9 @@ func (err *CheckpointCorroborationUnavailableError) Unwrap() error {
 }
 
 type Observation struct {
+	Check                 CheckIdentity
 	Kind                  string
+	ProofMethod           string
 	Peer                  n2n.Peer
 	Checkpoint            pcommon.Point
 	CheckpointBlockNumber uint64
@@ -217,6 +244,14 @@ type Observation struct {
 	ObservedAt            time.Time
 }
 
+const (
+	ObservationProofNone                     = "none"
+	ObservationProofChainSyncSingleton       = "chain_sync_singleton"
+	ObservationProofBoundarySingletonFetch   = "boundary_singleton_block_fetch"
+	ObservationProofFollowBlockFetch         = "follow_block_fetch"
+	ObservationProofPairedChainSyncSingleton = "paired_chain_sync_singleton"
+)
+
 type Config struct {
 	Peers                 []n2n.Peer
 	Corroboration         int
@@ -227,6 +262,7 @@ type Config struct {
 	CheckpointEveryBlocks uint64
 	FinalizeTimeout       time.Duration
 	ShutdownBudget        *ShutdownBudget
+	Trust                 TrustController
 }
 
 type Supervisor struct {
@@ -237,6 +273,7 @@ type Supervisor struct {
 	transport  Transport
 	wait       func(context.Context, time.Duration) error
 	now        func() time.Time
+	trust      TrustController
 }
 
 func New(
@@ -269,6 +306,7 @@ func New(
 		transport:  transport,
 		wait:       waitContext,
 		now:        time.Now,
+		trust:      config.Trust,
 	}, nil
 }
 
@@ -329,7 +367,6 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		currentBackoff  = s.config.InitialBackoff
 		committedBlocks uint64
 		quarantined     = make(map[string]struct{})
-		rangeFailures   = make(rangeRetryState)
 	)
 	for {
 		if err := ctx.Err(); err != nil {
@@ -367,6 +404,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 				Primary:           primaryEvidence,
 				Checkpoint:        cloneChainPoint(checkpoint),
 				CheckpointMembers: cloneAgreement(agreeing),
+				Check:             cloneCheckIdentity(primaryEvidence.Check),
 			},
 			delegate:        s.handler,
 			committedBlocks: &committedBlocks,
@@ -394,9 +432,6 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
-		if attempt.committed {
-			rangeFailures.clear(primary.Operator)
-		}
 		var peerData *n2n.PeerDataViolation
 		if errors.As(err, &peerData) {
 			if observeErr := s.observeFollowFailure(
@@ -418,31 +453,20 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		}
 		var rangeUnavailable *n2n.RangeUnavailable
 		if errors.As(err, &rangeUnavailable) {
-			key := unavailableRangeKey(primary, rangeUnavailable)
-			repeated := rangeFailures.repeated(primary.Operator, key)
-			result := "unavailable"
-			reason := "range unavailable; reconnect and re-intersect once"
-			if repeated {
-				result = "quarantined"
-				reason = "exact source/range was unavailable after one reconnect"
-			}
 			if observeErr := s.observeFollowFailure(
 				ctx,
 				attempt,
 				primaryEvidence,
 				"range_unavailable",
-				result,
-				reason+": "+err.Error(),
+				"unavailable",
+				"range unavailable; rotate, reconnect, and re-intersect: "+err.Error(),
 			); observeErr != nil {
 				return observeErr
 			}
-			if repeated {
-				quarantined[primary.Operator] = struct{}{}
-				if err := s.requireRemainingOperators(quarantined); err != nil {
-					return fmt.Errorf("%w: %v", err, rangeUnavailable)
-				}
+			if waitErr := s.wait(ctx, currentBackoff); waitErr != nil {
+				return waitErr
 			}
-			currentBackoff = s.config.InitialBackoff
+			currentBackoff = nextBackoff(currentBackoff, s.config.MaxBackoff)
 			continue
 		}
 		var transportErr *TransportError
@@ -468,8 +492,14 @@ func (s *Supervisor) corroborate(
 	if err != nil {
 		return n2n.ChainPoint{}, nil, err
 	}
+	if s.trust != nil {
+		return s.corroborateTrusted(ctx, ordered, quarantined)
+	}
+	var check CheckIdentity
 	for _, checkpoint := range ordered {
 		byOperator := make(map[string]PeerEvidence, s.config.Corroboration)
+		forceDispute := false
+		disputeReason := ""
 		for _, peer := range s.config.Peers {
 			if _, excluded := quarantined[peer.Operator]; excluded {
 				continue
@@ -480,7 +510,9 @@ func (s *Supervisor) corroborate(
 				observedPeer.Address = result.Address
 			}
 			observation := Observation{
+				Check:                 cloneCheckIdentity(check),
 				Kind:                  "checkpoint",
+				ProofMethod:           ObservationProofChainSyncSingleton,
 				Peer:                  observedPeer,
 				Checkpoint:            checkpoint.Point,
 				CheckpointBlockNumber: checkpoint.BlockNumber,
@@ -499,12 +531,16 @@ func (s *Supervisor) corroborate(
 					observation.Reason = "peer_data_violation: " + probeErr.Error()
 					quarantined[peer.Operator] = struct{}{}
 					peerQuarantined = true
+					forceDispute = true
+					disputeReason = observation.Reason
 				case errors.As(probeErr, &transportError):
 					observation.Result = "unavailable"
 					observation.Reason = probeErr.Error()
 				default:
 					observation.Result = "unavailable"
 					observation.Reason = "terminal_probe_failure: " + probeErr.Error()
+					forceDispute = true
+					disputeReason = observation.Reason
 				}
 			case !result.Accepted:
 				observation.Kind = "disagreement"
@@ -512,6 +548,8 @@ func (s *Supervisor) corroborate(
 				observation.Reason = "exact checkpoint is not on selected peer chain"
 				observation.Tip = result.Tip
 				observation.N2NVersion = result.N2NVersion
+				forceDispute = true
+				disputeReason = observation.Reason
 			default:
 				observation.Tip = result.Tip
 				observation.N2NVersion = result.N2NVersion
@@ -525,6 +563,8 @@ func (s *Supervisor) corroborate(
 						validationErr.Error()
 					quarantined[peer.Operator] = struct{}{}
 					peerQuarantined = true
+					forceDispute = true
+					disputeReason = observation.Reason
 				} else {
 					observation.Result = "agreed"
 					acceptedPeer := peer
@@ -534,11 +574,22 @@ func (s *Supervisor) corroborate(
 							Peer:       acceptedPeer,
 							Tip:        cloneTip(result.Tip),
 							N2NVersion: result.N2NVersion,
+							Check:      cloneCheckIdentity(check),
 						}
 					}
 				}
 			}
 			if err := s.observer.Observe(ctx, observation); err != nil {
+				if s.trust != nil {
+					_, finalizeErr := s.trust.FinalizeCheck(
+						ctx,
+						check,
+						true,
+						"observation persistence failed: "+err.Error(),
+						s.now().UTC(),
+					)
+					err = errors.Join(err, finalizeErr)
+				}
 				return n2n.ChainPoint{}, nil, fmt.Errorf("record checkpoint observation: %w", err)
 			}
 			if probeErr != nil {
@@ -565,6 +616,31 @@ func (s *Supervisor) corroborate(
 				}
 			}
 		}
+		if s.trust != nil {
+			resolution, finalizeErr := s.trust.FinalizeCheck(
+				ctx,
+				check,
+				forceDispute,
+				disputeReason,
+				s.now().UTC(),
+			)
+			if finalizeErr != nil {
+				return n2n.ChainPoint{}, nil, fmt.Errorf(
+					"finalize exact manifest trust check: %w",
+					finalizeErr,
+				)
+			}
+			if resolution.Status != "agreed" {
+				return n2n.ChainPoint{}, nil, &CorroborationUnavailableError{
+					Err: fmt.Errorf(
+						"manifest trust check resolved %s with %d of %d operators",
+						resolution.Status,
+						resolution.Confirmed,
+						resolution.Required,
+					),
+				}
+			}
+		}
 		if len(byOperator) < s.config.Corroboration {
 			continue
 		}
@@ -582,6 +658,222 @@ func (s *Supervisor) corroborate(
 	}
 }
 
+func (s *Supervisor) corroborateTrusted(
+	ctx context.Context,
+	ordered []n2n.ChainPoint,
+	quarantined map[string]struct{},
+) (n2n.ChainPoint, []PeerEvidence, error) {
+	physicalRejected := false
+	for _, checkpoint := range ordered {
+		check, err := s.trust.BeginCheck(
+			ctx,
+			&checkpoint,
+			s.config.Corroboration,
+			s.now().UTC(),
+		)
+		if err != nil {
+			return n2n.ChainPoint{}, nil, fmt.Errorf(
+				"begin exact candidate manifest check: %w",
+				err,
+			)
+		}
+		byOperator := make(map[string]PeerEvidence, s.config.Corroboration)
+		probed := 0
+		rejected := 0
+		sawUnavailable := false
+		forceDispute := false
+		disputeReason := ""
+		for _, peer := range s.config.Peers {
+			if _, excluded := quarantined[peer.Operator]; excluded {
+				continue
+			}
+			probed++
+			result, probeErr := s.transport.Probe(ctx, peer, checkpoint.Point)
+			observedPeer := peer
+			if result.Address != "" {
+				observedPeer.Address = result.Address
+			}
+			observation := Observation{
+				Check:                 cloneCheckIdentity(check),
+				Kind:                  "checkpoint",
+				ProofMethod:           ObservationProofChainSyncSingleton,
+				Peer:                  observedPeer,
+				Checkpoint:            clonePoint(checkpoint.Point),
+				CheckpointBlockNumber: checkpoint.BlockNumber,
+				CheckpointIsByronEBB:  checkpointByronEBB(checkpoint),
+				Tip:                   cloneTip(result.Tip),
+				N2NVersion:            result.N2NVersion,
+				ObservedAt:            s.now().UTC(),
+			}
+			switch {
+			case probeErr != nil:
+				var peerData *n2n.PeerDataViolation
+				var transportError *TransportError
+				switch {
+				case errors.As(probeErr, &peerData):
+					observation.Kind = "disagreement"
+					observation.Result = "quarantined"
+					observation.Reason = "peer_data_violation: " + probeErr.Error()
+					quarantined[peer.Operator] = struct{}{}
+					forceDispute = true
+					disputeReason = observation.Reason
+				case errors.As(probeErr, &transportError):
+					observation.Result = "unavailable"
+					observation.Reason = probeErr.Error()
+					sawUnavailable = true
+				default:
+					observation.Result = "unavailable"
+					observation.Reason = "terminal_probe_failure: " + probeErr.Error()
+					forceDispute = true
+					disputeReason = observation.Reason
+				}
+			case !result.Accepted:
+				observation.Kind = "disagreement"
+				observation.Result = "disagreed"
+				observation.Reason = "exact candidate is not on selected peer chain"
+				rejected++
+			default:
+				if validationErr := validateAcceptedProbe(checkpoint, result); validationErr != nil {
+					observation.Kind = "disagreement"
+					observation.Result = "quarantined"
+					observation.Reason = "invalid_accepted_probe: " + validationErr.Error()
+					quarantined[peer.Operator] = struct{}{}
+					forceDispute = true
+					disputeReason = observation.Reason
+				} else {
+					observation.Result = "agreed"
+					observation.Reason = "exact candidate membership"
+					acceptedPeer := observedPeer
+					acceptedPeer.Address = result.Address
+					key := operatorKey(peer.Operator)
+					byOperator[key] = PeerEvidence{
+						Peer:       acceptedPeer,
+						Tip:        cloneTip(result.Tip),
+						N2NVersion: result.N2NVersion,
+						Check:      cloneCheckIdentity(check),
+					}
+				}
+			}
+			if observeErr := s.observer.Observe(ctx, observation); observeErr != nil {
+				_, finalizeErr := s.trust.FinalizeCheck(
+					ctx,
+					check,
+					true,
+					"observation persistence failed: "+observeErr.Error(),
+					s.now().UTC(),
+				)
+				return n2n.ChainPoint{}, nil, errors.Join(
+					fmt.Errorf("record exact candidate observation: %w", observeErr),
+					finalizeErr,
+				)
+			}
+		}
+		if forceDispute || (len(byOperator) > 0 && rejected > 0) {
+			if disputeReason == "" {
+				disputeReason = "independent operators conflict on exact candidate membership"
+			}
+			resolution, finalizeErr := s.trust.FinalizeCheck(
+				ctx,
+				check,
+				true,
+				disputeReason,
+				s.now().UTC(),
+			)
+			if finalizeErr != nil {
+				return n2n.ChainPoint{}, nil, finalizeErr
+			}
+			return n2n.ChainPoint{}, nil, &CorroborationUnavailableError{
+				Err: fmt.Errorf("exact candidate resolved %s", resolution.Status),
+			}
+		}
+		if len(byOperator) >= s.config.Corroboration {
+			if check.Physical {
+				resolution, finalizeErr := s.trust.FinalizeCheck(
+					ctx,
+					check,
+					false,
+					"",
+					s.now().UTC(),
+				)
+				if finalizeErr != nil {
+					return n2n.ChainPoint{}, nil, finalizeErr
+				}
+				if resolution.Status != "agreed" {
+					return n2n.ChainPoint{}, nil, &CorroborationUnavailableError{
+						Err: fmt.Errorf("physical candidate resolved %s", resolution.Status),
+					}
+				}
+			}
+			agreeing := make([]PeerEvidence, 0, len(byOperator))
+			for _, peer := range s.config.Peers {
+				if evidence, ok := byOperator[operatorKey(peer.Operator)]; ok {
+					agreeing = append(agreeing, evidence)
+				}
+			}
+			return checkpoint, agreeing, nil
+		}
+		if rejected == probed && probed > 0 {
+			// Keep checking/clamped and advance the same agreement group to
+			// an exact older candidate. Rejection by every operator is branch
+			// movement, not an inter-peer dispute.
+			if check.Physical {
+				physicalRejected = true
+			}
+			continue
+		}
+		if rejected == 0 && sawUnavailable {
+			if physicalRejected {
+				return n2n.ChainPoint{}, nil, &CorroborationUnavailableError{
+					Err: fmt.Errorf(
+						"physical head was unanimously rejected; older exact candidate remains checking with %d of %d operators available",
+						len(byOperator),
+						s.config.Corroboration,
+					),
+				}
+			}
+			resolution, finalizeErr := s.trust.FinalizeCheck(
+				ctx,
+				check,
+				false,
+				"",
+				s.now().UTC(),
+			)
+			if finalizeErr != nil {
+				return n2n.ChainPoint{}, nil, finalizeErr
+			}
+			return n2n.ChainPoint{}, nil, &CorroborationUnavailableError{
+				Err: fmt.Errorf(
+					"exact candidate unavailable with %d of %d operators (%s)",
+					len(byOperator),
+					s.config.Corroboration,
+					resolution.Status,
+				),
+			}
+		}
+		if physicalRejected {
+			return n2n.ChainPoint{}, nil, &CorroborationUnavailableError{
+				Err: fmt.Errorf(
+					"physical head was unanimously rejected; older exact candidate evidence remains checking: agreed=%d rejected=%d required=%d",
+					len(byOperator),
+					rejected,
+					s.config.Corroboration,
+				),
+			}
+		}
+		return n2n.ChainPoint{}, nil, &CorroborationUnavailableError{
+			Err: fmt.Errorf(
+				"exact candidate evidence incomplete: agreed=%d rejected=%d required=%d",
+				len(byOperator),
+				rejected,
+				s.config.Corroboration,
+			),
+		}
+	}
+	return n2n.ChainPoint{}, nil, &CorroborationUnavailableError{
+		Err: errors.New("no exact candidate corroborated by independent peers"),
+	}
+}
+
 func (s *Supervisor) observeFollowFailure(
 	ctx context.Context,
 	attempt *attemptHandler,
@@ -595,7 +887,9 @@ func (s *Supervisor) observeFollowFailure(
 		evidence = attempt.evidence.Primary
 	}
 	if err := s.observer.Observe(ctx, Observation{
-		Kind:                  "disagreement",
+		Check:                 cloneCheckIdentity(attempt.evidence.Check),
+		Kind:                  "source_change",
+		ProofMethod:           ObservationProofNone,
 		Peer:                  evidence.Peer,
 		Checkpoint:            clonePoint(attempt.evidence.Checkpoint.Point),
 		CheckpointBlockNumber: attempt.evidence.Checkpoint.BlockNumber,
@@ -629,29 +923,6 @@ func (s *Supervisor) requireRemainingOperators(
 		)
 	}
 	return nil
-}
-
-func unavailableRangeKey(peer n2n.Peer, value *n2n.RangeUnavailable) string {
-	return fmt.Sprintf(
-		"%s\x00%d:%x\x00%d:%x",
-		peer.Operator,
-		value.Start.Slot,
-		value.Start.Hash,
-		value.End.Slot,
-		value.End.Hash,
-	)
-}
-
-type rangeRetryState map[string]string
-
-func (state rangeRetryState) repeated(operator, key string) bool {
-	previous, found := state[operator]
-	state[operator] = key
-	return found && previous == key
-}
-
-func (state rangeRetryState) clear(operator string) {
-	delete(state, operator)
 }
 
 type attemptHandler struct {
@@ -688,32 +959,18 @@ func (h *attemptHandler) Reconcile(
 	}
 	// Probe and Follow are separate connections. Replace the primary's probe
 	// address/version with the actual Follow connection provenance before any
-	// publication callback or selected-source observation.
+	// publication callback.
 	h.evidence.Primary = PeerEvidence{
 		Peer:       peer,
 		Tip:        cloneTip(*peer.Tip),
 		N2NVersion: peer.N2NVersion,
+		Check:      cloneCheckIdentity(h.evidence.Check),
 	}
 	for index := range h.evidence.CheckpointMembers {
 		if h.evidence.CheckpointMembers[index].Peer.Operator == peer.Operator {
 			h.evidence.CheckpointMembers[index] = h.evidence.Primary
 			break
 		}
-	}
-	if err := h.supervisor.observer.Observe(ctx, Observation{
-		Kind:                  "source_change",
-		Peer:                  peer,
-		Checkpoint:            clonePoint(point.Point),
-		CheckpointBlockNumber: point.BlockNumber,
-		CheckpointIsByronEBB:  checkpointByronEBB(point),
-		Tip:                   cloneTip(h.evidence.Primary.Tip),
-		N2NVersion:            peer.N2NVersion,
-		SelectedBodySource:    true,
-		Result:                "agreed",
-		Reason:                h.sourceReason,
-		ObservedAt:            h.supervisor.now().UTC(),
-	}); err != nil {
-		return h.terminal(fmt.Errorf("record actual Follow source: %w", err))
 	}
 	h.started = true
 	outcome, err := h.delegate.Reconcile(
@@ -834,11 +1091,69 @@ func (h *attemptHandler) RollBackward(
 			err,
 		))
 	}
+	rollbackCheck := cloneCheckIdentity(h.evidence.Check)
+	if h.supervisor.trust != nil {
+		var err error
+		rollbackCheck, err = h.supervisor.trust.BeginCheck(
+			ctx,
+			&point,
+			h.supervisor.config.RollbackConfirmations,
+			h.supervisor.now().UTC(),
+		)
+		if err != nil {
+			return h.terminal(fmt.Errorf(
+				"begin exact rollback-target trust check: %w",
+				err,
+			))
+		}
+	}
+	resolveDispute := func(reason string, cause error) error {
+		if h.supervisor.trust != nil {
+			_, finalizeErr := h.supervisor.trust.FinalizeCheck(
+				ctx,
+				rollbackCheck,
+				true,
+				reason,
+				h.supervisor.now().UTC(),
+			)
+			if finalizeErr != nil {
+				cause = errors.Join(cause, fmt.Errorf(
+					"finalize disputed rollback-target check: %w",
+					finalizeErr,
+				))
+			}
+		}
+		return h.terminal(cause)
+	}
 	h.evidence.Primary.Tip = cloneTip(tip)
+	primaryMembership := clonePeerEvidence(h.evidence.Primary)
+	primaryMembership.Check = cloneCheckIdentity(rollbackCheck)
+	if h.supervisor.trust != nil {
+		if err := h.supervisor.observer.Observe(ctx, Observation{
+			Check:                 cloneCheckIdentity(rollbackCheck),
+			Kind:                  "rollback",
+			ProofMethod:           ObservationProofFollowBlockFetch,
+			Peer:                  primaryMembership.Peer,
+			Checkpoint:            clonePoint(point.Point),
+			CheckpointBlockNumber: point.BlockNumber,
+			CheckpointIsByronEBB:  checkpointByronEBB(point),
+			Tip:                   cloneTip(tip),
+			N2NVersion:            primaryMembership.N2NVersion,
+			SelectedBodySource:    true,
+			Result:                "agreed",
+			Reason:                "primary Follow session proved exact rollback target by BlockFetch",
+			ObservedAt:            h.supervisor.now().UTC(),
+		}); err != nil {
+			return resolveDispute(
+				"primary rollback-target observation persistence failed",
+				fmt.Errorf("record primary rollback-target observation: %w", err),
+			)
+		}
+	}
 	confirmed := []RollbackConfirmation{{
 		Target:     cloneChainPoint(point),
 		BranchTip:  cloneTip(tip),
-		Membership: clonePeerEvidence(h.evidence.Primary),
+		Membership: primaryMembership,
 		Method:     RollbackProofFollowBlockFetch,
 	}}
 	confirmedOperators := map[string]struct{}{
@@ -865,7 +1180,9 @@ func (h *attemptHandler) RollBackward(
 			observedPeer.Address = result.Address
 		}
 		observation := Observation{
+			Check:                 cloneCheckIdentity(rollbackCheck),
 			Kind:                  "rollback",
+			ProofMethod:           ObservationProofPairedChainSyncSingleton,
 			Peer:                  observedPeer,
 			Checkpoint:            clonePoint(point.Point),
 			CheckpointBlockNumber: point.BlockNumber,
@@ -875,6 +1192,7 @@ func (h *attemptHandler) RollBackward(
 			ObservedAt:            h.supervisor.now().UTC(),
 		}
 		quarantine := false
+		membershipRejected := false
 		terminalProbeErr := error(nil)
 		if err != nil {
 			var peerData *n2n.PeerDataViolation
@@ -902,13 +1220,13 @@ func (h *attemptHandler) RollBackward(
 				)
 			}
 		} else if !result.TargetAccepted {
-			observation.Result = "quarantined"
+			observation.Result = "disagreed"
 			observation.Reason = "peer rejected the exact rollback target"
-			quarantine = true
+			membershipRejected = true
 		} else if !result.BranchAccepted {
-			observation.Result = "quarantined"
+			observation.Result = "disagreed"
 			observation.Reason = "peer rejected the exact rollback branch tip"
-			quarantine = true
+			membershipRejected = true
 		} else if orderErr := validateRollbackProbeTip(
 			point,
 			tip,
@@ -929,6 +1247,7 @@ func (h *attemptHandler) RollBackward(
 					Peer:       observedPeer,
 					Tip:        cloneTip(result.Tip),
 					N2NVersion: result.N2NVersion,
+					Check:      cloneCheckIdentity(rollbackCheck),
 				},
 				Method: RollbackProofPairedSingleton,
 			})
@@ -937,7 +1256,10 @@ func (h *attemptHandler) RollBackward(
 			h.quarantineOperator(candidatePeer.Operator)
 		}
 		if observeErr := h.supervisor.observer.Observe(ctx, observation); observeErr != nil {
-			return fmt.Errorf("record rollback observation: %w", observeErr)
+			return resolveDispute(
+				"rollback-target observation persistence failed",
+				fmt.Errorf("record rollback-target observation: %w", observeErr),
+			)
 		}
 		if terminalProbeErr != nil {
 			if errors.Is(terminalProbeErr, context.Canceled) ||
@@ -946,7 +1268,19 @@ func (h *attemptHandler) RollBackward(
 			}
 			return h.terminal(terminalProbeErr)
 		}
+		if membershipRejected && h.supervisor.trust != nil {
+			return resolveDispute(
+				observation.Reason,
+				errors.New("rollback target or branch membership was rejected"),
+			)
+		}
 		if quarantine {
+			if h.supervisor.trust != nil {
+				return resolveDispute(
+					observation.Reason,
+					errors.New("rollback target or branch membership was rejected"),
+				)
+			}
 			if remainingErr := h.supervisor.requireRemainingOperators(
 				h.quarantined,
 			); remainingErr != nil {
@@ -956,6 +1290,7 @@ func (h *attemptHandler) RollBackward(
 		if confirmations >= h.supervisor.config.RollbackConfirmations {
 			outcome, err := h.delegate.RollBackward(ctx, point, tip, RollbackEvidence{
 				Source:        h.currentEvidence(),
+				Check:         cloneCheckIdentity(rollbackCheck),
 				Target:        cloneChainPoint(point),
 				BranchTip:     cloneTip(tip),
 				Confirmations: cloneRollbackConfirmations(confirmed),
@@ -1027,7 +1362,7 @@ func (h *attemptHandler) RollBackward(
 		))
 	}
 	return h.terminal(fmt.Errorf(
-		"rollback quarantined: got %d of %d required independent confirmations",
+		"rollback unconfirmed: got %d of %d required independent confirmations",
 		confirmations,
 		h.supervisor.config.RollbackConfirmations,
 	))
@@ -1039,12 +1374,62 @@ func (h *attemptHandler) confirmPublishedCheckpoint(
 	checkpointBlockNumber uint64,
 	checkpointIsByronEBB bool,
 	tip chainsync.Tip,
-) error {
+) (retErr error) {
+	var check CheckIdentity
+	forceDispute := false
+	disputeReason := ""
+	if h.supervisor.trust != nil {
+		expected := n2n.NewChainPoint(checkpoint, checkpointBlockNumber)
+		if checkpointIsByronEBB {
+			expected = n2n.NewByronEBBChainPoint(checkpoint, checkpointBlockNumber)
+		}
+		var err error
+		check, err = h.supervisor.trust.BeginCheck(
+			ctx,
+			&expected,
+			h.supervisor.config.Corroboration,
+			h.supervisor.now().UTC(),
+		)
+		if err != nil {
+			return fmt.Errorf("begin periodic manifest trust check: %w", err)
+		}
+		defer func() {
+			resolution, finalizeErr := h.supervisor.trust.FinalizeCheck(
+				ctx,
+				check,
+				forceDispute,
+				disputeReason,
+				h.supervisor.now().UTC(),
+			)
+			if finalizeErr != nil {
+				retErr = errors.Join(retErr, fmt.Errorf(
+					"finalize periodic manifest trust check: %w",
+					finalizeErr,
+				))
+				return
+			}
+			if retErr == nil && resolution.Status != "agreed" {
+				retErr = RetryableTransportError(
+					&CheckpointCorroborationUnavailableError{
+						Checkpoint: cloneChainPoint(check.CheckedPoint),
+						Confirmed:  int(resolution.Confirmed),
+						Required:   int(resolution.Required),
+						Err: fmt.Errorf(
+							"manifest trust check resolved %s",
+							resolution.Status,
+						),
+					},
+				)
+			}
+		}()
+	}
 	confirmedOperators := map[string]struct{}{
 		operatorKey(h.evidence.Primary.Peer.Operator): {},
 	}
 	if err := h.supervisor.observer.Observe(ctx, Observation{
+		Check:                 cloneCheckIdentity(check),
 		Kind:                  "checkpoint",
+		ProofMethod:           ObservationProofFollowBlockFetch,
 		Peer:                  h.evidence.Primary.Peer,
 		Checkpoint:            clonePoint(checkpoint),
 		CheckpointBlockNumber: checkpointBlockNumber,
@@ -1056,6 +1441,8 @@ func (h *attemptHandler) confirmPublishedCheckpoint(
 		Reason:                "periodic primary checkpoint",
 		ObservedAt:            h.supervisor.now().UTC(),
 	}); err != nil {
+		forceDispute = true
+		disputeReason = "primary observation persistence failed: " + err.Error()
 		return fmt.Errorf("record primary checkpoint: %w", err)
 	}
 	sawUnavailable := false
@@ -1073,7 +1460,9 @@ func (h *attemptHandler) confirmPublishedCheckpoint(
 			observedPeer.Address = result.Address
 		}
 		observation := Observation{
+			Check:                 cloneCheckIdentity(check),
 			Kind:                  "checkpoint",
+			ProofMethod:           ObservationProofChainSyncSingleton,
 			Peer:                  observedPeer,
 			Checkpoint:            clonePoint(checkpoint),
 			CheckpointBlockNumber: checkpointBlockNumber,
@@ -1100,6 +1489,8 @@ func (h *attemptHandler) confirmPublishedCheckpoint(
 				observation.Reason = "peer_data_violation: " +
 					probeErr.Error()
 				quarantine = true
+				forceDispute = true
+				disputeReason = observation.Reason
 			case errors.As(probeErr, &transportError):
 				observation.Result = "unavailable"
 				observation.Reason = probeErr.Error()
@@ -1115,15 +1506,18 @@ func (h *attemptHandler) confirmPublishedCheckpoint(
 			}
 		case !result.Accepted:
 			observation.Kind = "disagreement"
-			observation.Result = "quarantined"
+			observation.Result = "disagreed"
 			observation.Reason = "peer rejected committed checkpoint"
-			quarantine = true
+			forceDispute = true
+			disputeReason = observation.Reason
 		case result.Tip.BlockNumber < checkpointBlockNumber ||
 			result.Tip.Point.Slot < checkpoint.Slot:
 			observation.Kind = "disagreement"
 			observation.Result = "quarantined"
 			observation.Reason = "peer tip precedes committed checkpoint"
 			quarantine = true
+			forceDispute = true
+			disputeReason = observation.Reason
 		default:
 			typedCheckpoint := n2n.NewChainPoint(
 				checkpoint,
@@ -1144,6 +1538,8 @@ func (h *attemptHandler) confirmPublishedCheckpoint(
 				observation.Reason = "invalid_accepted_probe: " +
 					validationErr.Error()
 				quarantine = true
+				forceDispute = true
+				disputeReason = observation.Reason
 			} else {
 				observation.Result = "agreed"
 				observation.Reason = "periodic independent checkpoint"
@@ -1154,6 +1550,8 @@ func (h *attemptHandler) confirmPublishedCheckpoint(
 			h.quarantineOperator(candidatePeer.Operator)
 		}
 		if err := h.supervisor.observer.Observe(ctx, observation); err != nil {
+			forceDispute = true
+			disputeReason = "independent observation persistence failed: " + err.Error()
 			return fmt.Errorf("record independent checkpoint: %w", err)
 		}
 		if terminalProbeErr != nil {
@@ -1569,6 +1967,12 @@ func cloneAgreement(source []PeerEvidence) []PeerEvidence {
 
 func clonePeerEvidence(source PeerEvidence) PeerEvidence {
 	source.Tip = cloneTip(source.Tip)
+	source.Check = cloneCheckIdentity(source.Check)
+	return source
+}
+
+func cloneCheckIdentity(source CheckIdentity) CheckIdentity {
+	source.CheckedPoint = cloneChainPoint(source.CheckedPoint)
 	return source
 }
 
@@ -1591,6 +1995,7 @@ func cloneSourceEvidence(source SourceEvidence) SourceEvidence {
 	source.Checkpoint = cloneChainPoint(source.Checkpoint)
 	source.Primary.Tip = cloneTip(source.Primary.Tip)
 	source.CheckpointMembers = cloneAgreement(source.CheckpointMembers)
+	source.Check = cloneCheckIdentity(source.Check)
 	return source
 }
 

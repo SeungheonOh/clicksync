@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -151,6 +152,7 @@ func (handler *Handler) Reconcile(
 		target,
 		"reconcile selected corroborated intersection",
 		evidence.CheckpointMembers,
+		evidence.Check,
 	)
 	if err != nil {
 		return syncer.CommitOutcome{}, handler.failLocked(err)
@@ -280,6 +282,7 @@ func (handler *Handler) RollBackward(
 			durable,
 			"corroborated rollback target was staged only; reconnect from actual durable tip",
 			confirmations,
+			evidence.Check,
 		)
 		if requestErr != nil {
 			handler.failLocked(requestErr)
@@ -327,6 +330,7 @@ func (handler *Handler) RollBackward(
 		target,
 		"corroborated remote rollback",
 		confirmations,
+		evidence.Check,
 	)
 	if err != nil {
 		handler.failLocked(err)
@@ -393,6 +397,19 @@ func (handler *Handler) rollbackConfirmationEvidence(
 	branchTip chainsync.Tip,
 	evidence syncer.RollbackEvidence,
 ) ([]syncer.PeerEvidence, error) {
+	trusted := evidence.Check.ID != ([16]byte{}) ||
+		evidence.Check.AgreementGroup != ([16]byte{}) ||
+		evidence.Check.Attempt != 0
+	if trusted &&
+		(evidence.Check.ID == ([16]byte{}) ||
+			evidence.Check.AgreementGroup == ([16]byte{}) ||
+			evidence.Check.Attempt == 0 ||
+			int(evidence.Check.Required) != handler.config.RollbackCorroboration ||
+			!chainPointEqual(evidence.Check.CheckedPoint, target)) {
+		return nil, errors.New(
+			"rollback evidence omitted the exact target check/group/attempt/threshold",
+		)
+	}
 	if !samePublicationPoint(
 		publicationPoint(target),
 		publicationPoint(evidence.Target),
@@ -426,6 +443,11 @@ func (handler *Handler) rollbackConfirmationEvidence(
 		if member.Peer.Host == "" || member.Peer.Operator == "" {
 			return nil, errors.New(
 				"rollback confirmation has incomplete session identity",
+			)
+		}
+		if trusted && !checkIdentityEqual(member.Check, evidence.Check) {
+			return nil, errors.New(
+				"rollback confirmation is not bound to the exact target check",
 			)
 		}
 		if member.Peer.Operator == evidence.Source.Primary.Peer.Operator {
@@ -515,6 +537,7 @@ func (handler *Handler) rollbackRequest(
 	to publication.Point,
 	reason string,
 	evidence []syncer.PeerEvidence,
+	check syncer.CheckIdentity,
 ) (publication.RollbackRequest, error) {
 	operators := make(map[string]struct{}, len(evidence))
 	observers := make([]publication.RollbackObserver, 0, len(evidence))
@@ -522,13 +545,27 @@ func (handler *Handler) rollbackRequest(
 		if item.Peer.Host == "" || item.Peer.Operator == "" {
 			return publication.RollbackRequest{}, errors.New("rollback evidence has incomplete peer identity")
 		}
-		if _, duplicate := operators[item.Peer.Operator]; duplicate {
+		trusted := check.ID != ([16]byte{}) ||
+			check.AgreementGroup != ([16]byte{}) ||
+			check.Attempt != 0
+		if trusted && !checkIdentityEqual(item.Check, check) {
+			return publication.RollbackRequest{}, errors.New(
+				"rollback observer evidence crosses trust checks",
+			)
+		}
+		operator := strings.ToLower(strings.TrimSpace(item.Peer.Operator))
+		if operator == "" {
+			return publication.RollbackRequest{}, errors.New(
+				"rollback evidence has an empty normalized operator",
+			)
+		}
+		if _, duplicate := operators[operator]; duplicate {
 			continue
 		}
-		operators[item.Peer.Operator] = struct{}{}
+		operators[operator] = struct{}{}
 		observers = append(observers, publication.RollbackObserver{
 			Peer:     item.Peer.Host,
-			Operator: item.Peer.Operator,
+			Operator: operator,
 		})
 	}
 	if len(operators) < handler.config.RollbackCorroboration {
@@ -542,6 +579,10 @@ func (handler *Handler) rollbackRequest(
 		To:                    to,
 		Reason:                reason,
 		Observers:             observers,
+		CheckID:               cloneAgreementGroup(check.ID),
+		AgreementGroup:        cloneAgreementGroup(check.AgreementGroup),
+		CheckAttempt:          check.Attempt,
+		CheckedEventSeq:       check.CheckedEventSeq,
 		MaximumDepth:          handler.config.RollbackMaximumDepth,
 		RequiredCorroboration: handler.config.RollbackCorroboration,
 		RecordedAt:            handler.config.Now().UTC(),
@@ -812,7 +853,7 @@ func (handler *Handler) failLocked(err error) error {
 }
 
 func factRows(item publication.BatchItem) uint64 {
-	rows := uint64(1 + len(item.PeerObservations))
+	rows := uint64(1)
 	for _, transaction := range item.Block.Transactions {
 		rows += 1 +
 			uint64(len(transaction.Inputs)) +
@@ -851,6 +892,31 @@ func publicationPoint(point n2n.ChainPoint) publication.Point {
 		BlockNumber: point.BlockNumber,
 		IsByronEBB:  point.IsByronEBB,
 	}
+}
+
+func checkIdentityEqual(left, right syncer.CheckIdentity) bool {
+	return left.ID == right.ID &&
+		left.AgreementGroup == right.AgreementGroup &&
+		left.Attempt == right.Attempt &&
+		left.Required == right.Required &&
+		left.CheckedEventSeq == right.CheckedEventSeq &&
+		left.Physical == right.Physical &&
+		chainPointEqual(left.CheckedPoint, right.CheckedPoint)
+}
+
+func chainPointEqual(left, right n2n.ChainPoint) bool {
+	return left.BlockNumber == right.BlockNumber &&
+		left.IsByronEBB == right.IsByronEBB &&
+		left.Point.Slot == right.Point.Slot &&
+		bytes.Equal(left.Point.Hash, right.Point.Hash)
+}
+
+func cloneAgreementGroup(group [16]byte) *[16]byte {
+	if group == ([16]byte{}) {
+		return nil
+	}
+	ret := group
+	return &ret
 }
 
 func chainPointFromPublication(

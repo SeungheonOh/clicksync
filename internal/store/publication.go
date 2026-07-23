@@ -3,11 +3,10 @@ package store
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/blinklabs-io/gouroboros/ledger"
@@ -18,7 +17,7 @@ import (
 )
 
 func (d *DB) CommittedSnapshot(ctx context.Context) (uint64, error) {
-	record, found, err := d.loadLatestManifestRecord(ctx)
+	record, found, err := d.loadAuthoritativeManifest(ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -32,16 +31,71 @@ func (d *DB) CommittedSnapshot(ctx context.Context) (uint64, error) {
 // for publication verification and startup manifest reconciliation; query and
 // chain-sync readers must use the validated manifest effective snapshot.
 func (d *DB) RawCommittedSnapshot(ctx context.Context) (uint64, error) {
-	const query = `
-SELECT greatest(
-    (SELECT max(event_seq) FROM clicksync.chain_events WHERE event_kind = 'adoption'),
-    (SELECT max(event_seq) FROM clicksync.rollbacks)
-)`
-	var eventSeq uint64
-	if err := d.conn.QueryRow(ctx, query).Scan(&eventSeq); err != nil {
-		return 0, fmt.Errorf("read committed event: %w", err)
+	adoptionEvent, adoptionFound, err := d.latestPhysicalEvent(
+		ctx,
+		`SELECT event_seq
+FROM clicksync.chain_events
+PREWHERE event_kind = 'adoption'
+ORDER BY event_kind, event_seq DESC, publication_id
+LIMIT 1`,
+		"adoption",
+	)
+	if err != nil {
+		return 0, err
 	}
-	return eventSeq, nil
+	rollbackEvent, rollbackFound, err := d.latestPhysicalEvent(
+		ctx,
+		`SELECT event_seq
+FROM clicksync.rollbacks
+ORDER BY event_seq DESC, rollback_id
+LIMIT 1`,
+		"rollback",
+	)
+	if err != nil {
+		return 0, err
+	}
+	if !adoptionFound && !rollbackFound {
+		return 0, nil
+	}
+	if adoptionFound && rollbackFound && adoptionEvent == rollbackEvent {
+		return 0, errors.New(
+			"latest physical event has both adoption and rollback headers",
+		)
+	}
+	if rollbackFound && (!adoptionFound || rollbackEvent > adoptionEvent) {
+		if _, found, err := d.committedRollbackPoint(ctx, rollbackEvent); err != nil {
+			return 0, err
+		} else if !found {
+			return 0, errors.New("latest rollback event disappeared during bounded validation")
+		}
+		return rollbackEvent, nil
+	}
+	if _, found, err := d.committedAdoptionHeader(ctx, adoptionEvent); err != nil {
+		return 0, err
+	} else if !found {
+		return 0, errors.New("latest adoption event disappeared during bounded validation")
+	}
+	return adoptionEvent, nil
+}
+
+func (d *DB) latestPhysicalEvent(
+	ctx context.Context,
+	query string,
+	kind string,
+) (uint64, bool, error) {
+	rows, err := d.conn.Query(ctx, query)
+	if err != nil {
+		return 0, false, fmt.Errorf("read latest %s event: %w", kind, err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return 0, false, rows.Err()
+	}
+	var eventSeq uint64
+	if err := rows.Scan(&eventSeq); err != nil {
+		return 0, false, fmt.Errorf("scan latest %s event: %w", kind, err)
+	}
+	return eventSeq, true, nil
 }
 
 func (d *DB) ResolveOutputStates(
@@ -940,23 +994,32 @@ func (d *DB) InsertMetadataBatch(
 	return batch.Send()
 }
 
-func (d *DB) InsertPeerObservations(
+func (d *DB) insertPeerObservationRows(
 	ctx context.Context,
 	observations []model.PeerObservation,
 ) error {
 	if len(observations) == 0 {
 		return nil
 	}
-	ids := make([]uuid.UUID, 0, len(observations))
 	digests := make(map[uuid.UUID][32]byte, len(observations))
 	unique := make([]model.PeerObservation, 0, len(observations))
 	for _, observation := range observations {
-		id := uuid.UUID(observation.ID)
-		encoded, err := json.Marshal(observation)
-		if err != nil {
-			return fmt.Errorf("encode peer observation digest: %w", err)
+		if observation.ID == ([16]byte{}) ||
+			observation.EvidenceIdentity == (model.Hash32{}) ||
+			observation.CheckID == ([16]byte{}) ||
+			observation.AgreementGroup == ([16]byte{}) ||
+			observation.CheckAttempt == 0 ||
+			observation.CorroborationRequired < 2 ||
+			(observation.Kind == "source_change" && observation.EvidenceOrdinal != 0) ||
+			(observation.Kind != "source_change" && observation.EvidenceOrdinal == 0) ||
+			strings.TrimSpace(observation.Operator) == "" {
+			return errors.New("peer observation check/evidence identity is incomplete")
 		}
-		digest := sha256.Sum256(encoded)
+		id := uuid.UUID(observation.ID)
+		digest, err := model.PeerObservationDigest(observation)
+		if err != nil {
+			return err
+		}
 		if previous, duplicate := digests[id]; duplicate {
 			if previous != digest {
 				return fmt.Errorf("conflicting peer observations share ID %s", id)
@@ -964,40 +1027,60 @@ func (d *DB) InsertPeerObservations(
 			continue
 		}
 		digests[id] = digest
-		ids = append(ids, id)
 		unique = append(unique, observation)
 	}
+	existing := make(map[uuid.UUID]struct{}, len(unique))
 	const existingQuery = `
-SELECT observation_id, any(observation_digest), uniqExact(observation_digest)
+SELECT observation_digest
 FROM clicksync.peer_observations
-WHERE observation_id IN ?
-GROUP BY observation_id`
-	rows, err := d.conn.Query(ctx, existingQuery, ids)
-	if err != nil {
-		return fmt.Errorf("precheck peer observations: %w", err)
-	}
-	existing := make(map[uuid.UUID]struct{}, len(ids))
-	for rows.Next() {
-		var id uuid.UUID
-		var digest []byte
-		var variants uint64
-		if err := rows.Scan(&id, &digest, &variants); err != nil {
-			rows.Close()
-			return fmt.Errorf("scan peer observation precheck: %w", err)
+PREWHERE check_id = ?
+  AND evidence_ordinal = ?
+  AND observation_id = ?
+ORDER BY check_id, evidence_ordinal, observation_id
+LIMIT 9`
+	for _, observation := range unique {
+		id := uuid.UUID(observation.ID)
+		expected := digests[id]
+		rows, err := d.conn.Query(
+			ctx,
+			existingQuery,
+			uuid.UUID(observation.CheckID),
+			observation.EvidenceOrdinal,
+			id,
+		)
+		if err != nil {
+			return fmt.Errorf("precheck peer observation %s: %w", id, err)
 		}
-		expected, ok := digests[id]
-		if !ok || variants != 1 || !bytes.Equal(digest, expected[:]) {
-			rows.Close()
-			return fmt.Errorf("stored peer observation %s conflicts with replay", id)
+		rowCount := 0
+		for rows.Next() {
+			rowCount++
+			if rowCount > 8 {
+				rows.Close()
+				return fmt.Errorf(
+					"stored peer observation %s has at least nine physical rows",
+					id,
+				)
+			}
+			var digest []byte
+			if err := rows.Scan(&digest); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan peer observation precheck: %w", err)
+			}
+			if !bytes.Equal(digest, expected[:]) {
+				rows.Close()
+				return fmt.Errorf("stored peer observation %s conflicts with replay", id)
+			}
 		}
-		existing[id] = struct{}{}
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return fmt.Errorf("iterate peer observation precheck: %w", err)
-	}
-	if err := rows.Close(); err != nil {
-		return fmt.Errorf("close peer observation precheck: %w", err)
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("iterate peer observation precheck: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return fmt.Errorf("close peer observation precheck: %w", err)
+		}
+		if rowCount > 0 {
+			existing[id] = struct{}{}
+		}
 	}
 	missing := make([]model.PeerObservation, 0, len(unique))
 	for _, observation := range unique {
@@ -1010,11 +1093,16 @@ GROUP BY observation_id`
 	}
 	const query = `INSERT INTO clicksync.peer_observations
 (
-    observation_id, observation_digest, observation_kind, peer_host,
+    observation_id, observation_digest, evidence_identity, observation_kind, peer_host,
     peer_address, operator_label, n2n_version, network_magic,
     observed_tip_slot, observed_tip_hash,
     observed_tip_block_number, checkpoint_slot, checkpoint_hash,
-    checkpoint_block_number, checkpoint_is_byron_ebb, agreement_group, selected_body_source,
+    checkpoint_block_number, checkpoint_is_byron_ebb,
+    check_id, agreement_group, check_attempt, evidence_ordinal, proof_method,
+    corroboration_required,
+    checked_event_seq, checked_point_origin, checked_point_slot,
+    checked_point_hash, checked_point_block_number, checked_point_is_byron_ebb,
+    selected_body_source,
     body_hash_verified, point_verified, parent_verified, result, reason,
     observed_at
 )`
@@ -1024,13 +1112,10 @@ GROUP BY observation_id`
 	}
 	for _, observation := range missing {
 		observationDigest := digests[uuid.UUID(observation.ID)]
-		var agreement any
-		if observation.AgreementGroup != nil {
-			agreement = uuid.UUID(*observation.AgreementGroup)
-		}
 		if err := batch.Append(
 			uuid.UUID(observation.ID),
 			observationDigest[:],
+			bytesOf32(observation.EvidenceIdentity),
 			observation.Kind,
 			observation.PeerHost,
 			observation.PeerAddress,
@@ -1044,7 +1129,18 @@ GROUP BY observation_id`
 			nullableHash32(observation.CheckpointHash),
 			observation.CheckpointBlockNumber,
 			observation.CheckpointIsByronEBB,
-			agreement,
+			uuid.UUID(observation.CheckID),
+			uuid.UUID(observation.AgreementGroup),
+			observation.CheckAttempt,
+			observation.EvidenceOrdinal,
+			observation.ProofMethod,
+			observation.CorroborationRequired,
+			observation.CheckedEventSeq,
+			observation.CheckedPointOrigin,
+			observation.CheckedPointSlot,
+			nullableHash32(observation.CheckedPointHash),
+			observation.CheckedBlockNumber,
+			observation.CheckedPointIsByronEBB,
 			observation.SelectedBodySource,
 			observation.BodyHashVerified,
 			observation.PointVerified,
@@ -1541,6 +1637,13 @@ func (d *DB) InsertInvalidations(
 	if len(descendants) == 0 {
 		return errors.New("cannot insert empty rollback membership")
 	}
+	committed, err := d.invalidationsCommitted(ctx, commit, descendants)
+	if err != nil {
+		return err
+	}
+	if committed {
+		return nil
+	}
 	const query = `INSERT INTO clicksync.chain_events
 (
     event_seq, publication_id, event_kind, active, rollback_id, block_hash,
@@ -1568,20 +1671,141 @@ func (d *DB) InsertInvalidations(
 			return err
 		}
 	}
-	return batch.Send()
+	insertErr := batch.Send()
+	committed, verifyErr := d.invalidationsCommitted(ctx, commit, descendants)
+	if verifyErr != nil {
+		return errors.Join(insertErr, fmt.Errorf(
+			"verify uncertain rollback invalidations: %w",
+			verifyErr,
+		))
+	}
+	if committed {
+		return nil
+	}
+	if insertErr != nil {
+		return insertErr
+	}
+	return errors.New("rollback invalidations were not visible after successful insert")
+}
+
+func (d *DB) invalidationsCommitted(
+	ctx context.Context,
+	commit publication.RollbackCommit,
+	descendants []publication.Descendant,
+) (bool, error) {
+	expected := make(map[uint64]publication.Point, len(descendants))
+	for _, descendant := range descendants {
+		if descendant.PublicationID == 0 {
+			return false, errors.New("rollback descendant publication ID is zero")
+		}
+		if previous, exists := expected[descendant.PublicationID]; exists {
+			if previous != descendant.Point {
+				return false, errors.New("rollback descendant identity is conflicting")
+			}
+			return false, errors.New("rollback descendants contain a duplicate publication")
+		}
+		expected[descendant.PublicationID] = descendant.Point
+	}
+	const query = `
+SELECT
+    assumeNotNull(rollback_id),
+    publication_id,
+    block_hash,
+    slot,
+    block_number,
+    is_byron_ebb,
+    writer_id,
+    recorded_at
+FROM clicksync.chain_events
+PREWHERE event_kind = 'invalidation'
+  AND event_seq = ?
+ORDER BY event_kind, event_seq, publication_id, rollback_id
+LIMIT ?`
+	rows, err := d.conn.Query(
+		ctx,
+		query,
+		commit.EventSeq,
+		uint64(len(descendants))*8+1,
+	)
+	if err != nil {
+		return false, fmt.Errorf("query rollback invalidation readback: %w", err)
+	}
+	defer rows.Close()
+	seen := make(map[uint64]uint8, len(descendants))
+	for rows.Next() {
+		var (
+			rollbackID    uuid.UUID
+			publicationID uint64
+			hashBytes     []byte
+			slot          uint64
+			blockNumber   uint64
+			isByronEBB    bool
+			writer        uuid.UUID
+			recordedAt    time.Time
+		)
+		if err := rows.Scan(
+			&rollbackID,
+			&publicationID,
+			&hashBytes,
+			&slot,
+			&blockNumber,
+			&isByronEBB,
+			&writer,
+			&recordedAt,
+		); err != nil {
+			return false, fmt.Errorf("scan rollback invalidation readback: %w", err)
+		}
+		if rollbackID != uuid.UUID(commit.RollbackID) {
+			return false, errors.New(
+				"rollback invalidations contain a conflicting rollback identity",
+			)
+		}
+		expectedPoint, exists := expected[publicationID]
+		if !exists {
+			return false, errors.New("rollback invalidations contain an unexpected publication")
+		}
+		if seen[publicationID] == 8 {
+			return false, errors.New(
+				"rollback invalidation exceeds bounded identical replay duplicates",
+			)
+		}
+		seen[publicationID]++
+		if expectedPoint.Origin ||
+			slot != expectedPoint.Slot ||
+			blockNumber != expectedPoint.BlockNumber ||
+			isByronEBB != expectedPoint.IsByronEBB ||
+			!bytes.Equal(hashBytes, expectedPoint.Hash[:]) ||
+			writer != uuid.UUID(commit.WriterID) ||
+			!recordedAt.Equal(commit.RecordedAt) {
+			return false, errors.New("rollback invalidation row differs from reserved commit")
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("iterate rollback invalidation readback: %w", err)
+	}
+	return len(seen) == len(expected), nil
 }
 
 func (d *DB) InsertRollbackHeader(
 	ctx context.Context,
 	commit publication.RollbackCommit,
 ) error {
+	if commit.CheckID == nil || commit.AgreementGroup == nil ||
+		*commit.CheckID == ([16]byte{}) ||
+		*commit.AgreementGroup == ([16]byte{}) ||
+		commit.CheckAttempt == 0 {
+		return errors.New("rollback header lacks exact trust check identity")
+	}
 	const query = `INSERT INTO clicksync.rollbacks
 (
     rollback_id, event_seq, rollback_to_origin, rollback_to_slot,
     rollback_to_hash, rollback_to_block_number, rollback_to_is_byron_ebb,
-    old_tip_slot, old_tip_hash, old_tip_block_number, old_tip_is_byron_ebb, depth,
+    old_tip_slot, old_tip_hash, old_tip_block_number, old_tip_is_byron_ebb,
+    old_tip_event_seq, depth,
     reason, observed_peers, observed_operators, corroboration_required,
-    agreement_group, writer_id, recorded_at
+    check_id, agreement_group, check_attempt, checked_event_seq,
+    evidence_count, evidence_digest,
+    writer_id, recorded_at
 )`
 	var toSlot, toHash, toNumber any
 	if !commit.To.Origin {
@@ -1615,12 +1839,18 @@ func (d *DB) InsertRollbackHeader(
 		oldHash,
 		oldNumber,
 		commit.OldTip.IsByronEBB,
+		commit.OldEventSeq,
 		commit.Depth,
 		commit.Reason,
 		commit.ObservedPeers,
 		commit.ObservedOperators,
 		commit.CorroborationRequired,
+		uuid.UUID(*commit.CheckID),
 		agreement,
+		commit.CheckAttempt,
+		commit.CheckedEventSeq,
+		commit.EvidenceCount,
+		bytesOf32(commit.EvidenceDigest),
 		uuid.UUID(commit.WriterID),
 		commit.RecordedAt,
 	); err != nil {
@@ -1636,23 +1866,35 @@ func (d *DB) RollbackCommitted(
 ) (bool, error) {
 	const query = `
 SELECT
+    rollback_id,
     rollback_to_origin, rollback_to_slot, rollback_to_hash, rollback_to_block_number,
     rollback_to_is_byron_ebb, old_tip_slot, old_tip_hash, old_tip_block_number,
-    old_tip_is_byron_ebb, depth, reason,
+    old_tip_is_byron_ebb, old_tip_event_seq, depth, reason,
     observed_peers, observed_operators, corroboration_required,
-    agreement_group, writer_id, recorded_at
+    check_id, agreement_group, check_attempt, checked_event_seq,
+    evidence_count, evidence_digest,
+    writer_id, recorded_at
 FROM clicksync.rollbacks
-WHERE rollback_id = ?
-  AND event_seq = ?`
-	rows, err := d.conn.Query(ctx, query, uuid.UUID(commit.RollbackID), commit.EventSeq)
+PREWHERE event_seq = ?
+ORDER BY event_seq, rollback_id
+LIMIT 9`
+	rows, err := d.conn.Query(ctx, query, commit.EventSeq)
 	if err != nil {
 		return false, fmt.Errorf("query rollback commit: %w", err)
 	}
 	defer rows.Close()
 	found := false
+	rowCount := 0
 	for rows.Next() {
+		rowCount++
+		if rowCount > 8 {
+			return false, errors.New(
+				"rollback header exceeds bounded identical replay duplicates",
+			)
+		}
 		found = true
 		var (
+			rollbackID            uuid.UUID
 			toOrigin              bool
 			toSlot                *uint64
 			toHashBytes           []byte
@@ -1662,16 +1904,23 @@ WHERE rollback_id = ?
 			oldHashBytes          []byte
 			oldNumber             *uint64
 			oldIsByronEBB         bool
+			oldEventSeq           uint64
 			depth                 uint32
 			reason                string
 			peers                 []string
 			operators             []string
 			corroborationRequired uint16
+			checkID               uuid.UUID
 			agreement             *uuid.UUID
+			checkAttempt          uint32
+			checkedEventSeq       uint64
+			evidenceCount         uint32
+			evidenceDigest        []byte
 			writer                uuid.UUID
 			recordedAt            time.Time
 		)
 		if err := rows.Scan(
+			&rollbackID,
 			&toOrigin,
 			&toSlot,
 			&toHashBytes,
@@ -1681,37 +1930,50 @@ WHERE rollback_id = ?
 			&oldHashBytes,
 			&oldNumber,
 			&oldIsByronEBB,
+			&oldEventSeq,
 			&depth,
 			&reason,
 			&peers,
 			&operators,
 			&corroborationRequired,
+			&checkID,
 			&agreement,
+			&checkAttempt,
+			&checkedEventSeq,
+			&evidenceCount,
+			&evidenceDigest,
 			&writer,
 			&recordedAt,
 		); err != nil {
 			return false, fmt.Errorf("scan rollback commit: %w", err)
 		}
-		if !rollbackRowMatches(
-			commit,
-			toOrigin,
-			toSlot,
-			toHashBytes,
-			toNumber,
-			toIsByronEBB,
-			oldSlot,
-			oldHashBytes,
-			oldNumber,
-			oldIsByronEBB,
-			depth,
-			reason,
-			peers,
-			operators,
-			corroborationRequired,
-			agreement,
-			writer,
-			recordedAt,
-		) {
+		if rollbackID != uuid.UUID(commit.RollbackID) ||
+			!rollbackRowMatches(
+				commit,
+				toOrigin,
+				toSlot,
+				toHashBytes,
+				toNumber,
+				toIsByronEBB,
+				oldSlot,
+				oldHashBytes,
+				oldNumber,
+				oldIsByronEBB,
+				oldEventSeq,
+				depth,
+				reason,
+				peers,
+				operators,
+				corroborationRequired,
+				checkID,
+				agreement,
+				checkAttempt,
+				checkedEventSeq,
+				evidenceCount,
+				evidenceDigest,
+				writer,
+				recordedAt,
+			) {
 			return false, errors.New("rollback identity has conflicting committed rows")
 		}
 	}
@@ -1732,12 +1994,18 @@ func rollbackRowMatches(
 	oldHashBytes []byte,
 	oldNumber *uint64,
 	oldIsByronEBB bool,
+	oldEventSeq uint64,
 	depth uint32,
 	reason string,
 	peers []string,
 	operators []string,
 	corroborationRequired uint16,
+	checkID uuid.UUID,
 	agreement *uuid.UUID,
+	checkAttempt uint32,
+	checkedEventSeq uint64,
+	evidenceCount uint32,
+	evidenceDigest []byte,
 	writer uuid.UUID,
 	recordedAt time.Time,
 ) bool {
@@ -1747,6 +2015,13 @@ func rollbackRowMatches(
 		!equalStrings(peers, commit.ObservedPeers) ||
 		!equalStrings(operators, commit.ObservedOperators) ||
 		corroborationRequired != commit.CorroborationRequired ||
+		oldEventSeq != commit.OldEventSeq ||
+		commit.CheckID == nil ||
+		checkID != uuid.UUID(*commit.CheckID) ||
+		checkAttempt != commit.CheckAttempt ||
+		checkedEventSeq != commit.CheckedEventSeq ||
+		evidenceCount != commit.EvidenceCount ||
+		!bytes.Equal(evidenceDigest, commit.EvidenceDigest[:]) ||
 		writer != uuid.UUID(commit.WriterID) ||
 		!recordedAt.Equal(commit.RecordedAt) {
 		return false

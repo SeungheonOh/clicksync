@@ -94,12 +94,8 @@ func TestSupervisorCorroboratesOlderStableCheckpointBeforeFollow(t *testing.T) {
 	}) {
 		t.Fatal("newest-point disagreement was not persisted")
 	}
-	if !slices.ContainsFunc(observer.observations, func(value Observation) bool {
-		return value.Kind == "source_change" &&
-			value.Peer.Address == "198.51.100.7:3001" &&
-			value.N2NVersion == 14
-	}) {
-		t.Fatal("actual Follow source/version/address was not persisted")
+	if got := observationsOfKind(observer.observations, "source_change"); len(got) != 0 {
+		t.Fatalf("successful Follow emitted diagnostic source-change rows: %#v", got)
 	}
 	if candidates.calls != 1 {
 		t.Fatalf("candidate loads = %d, want 1", candidates.calls)
@@ -552,12 +548,8 @@ func TestSupervisorRetriesTransportIndefinitelyThenRecovers(t *testing.T) {
 		t.Fatalf("candidate reloads = %d, want 4", candidates.calls)
 	}
 	sourceSelections := observationsOfKind(observer.observations, "source_change")
-	if len(sourceSelections) != 4 ||
-		sourceSelections[0].Reason != "initial selection" ||
-		sourceSelections[1].Reason != "peer rotation" ||
-		sourceSelections[2].Reason != "peer rotation" ||
-		sourceSelections[3].Reason != "peer rotation" {
-		t.Fatalf("source selections = %#v", sourceSelections)
+	if len(sourceSelections) != 0 {
+		t.Fatalf("successful reconnects emitted diagnostic source-change rows: %#v", sourceSelections)
 	}
 }
 
@@ -651,7 +643,7 @@ func TestPeerDataViolationPersistsExactSourceAndQuarantinesOperator(t *testing.T
 	violations := slices.DeleteFunc(
 		slices.Clone(observer.observations),
 		func(value Observation) bool {
-			return value.Kind != "disagreement" ||
+			return value.Kind != "source_change" ||
 				!strings.HasPrefix(value.Reason, "peer_data_violation:")
 		},
 	)
@@ -728,7 +720,7 @@ func TestPeerDataQuarantineRotatesOnlyWhenCorroborationRemains(t *testing.T) {
 	}
 }
 
-func TestRepeatedExactRangeUnavailableQuarantinesSource(t *testing.T) {
+func TestPersistentExactRangeUnavailableRetriesUntilContextCancellation(t *testing.T) {
 	checkpoint := testPoint(10, 0x10)
 	start := testPoint(11, 0x11)
 	end := testPoint(20, 0x20)
@@ -761,54 +753,53 @@ func TestRepeatedExactRangeUnavailableQuarantinesSource(t *testing.T) {
 		observer,
 		transport,
 	)
-	err := supervisor.Run(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "quarantine leaves 1 independent operators") {
+	ctx, cancel := context.WithCancel(context.Background())
+	var waits []time.Duration
+	supervisor.wait = func(ctx context.Context, duration time.Duration) error {
+		waits = append(waits, duration)
+		if len(waits) == 6 {
+			cancel()
+		}
+		return ctx.Err()
+	}
+	err := supervisor.Run(ctx)
+	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v", err)
 	}
 	if got := peerHosts(transport.follows); !slices.Equal(
 		got,
-		[]string{"relay-a:3001", "relay-b:3001", "relay-a:3001"},
+		[]string{
+			"relay-a:3001", "relay-b:3001", "relay-a:3001",
+			"relay-b:3001", "relay-a:3001", "relay-b:3001",
+		},
 	) {
 		t.Fatalf("range retry rotation = %#v", got)
 	}
 	observations := slices.DeleteFunc(
 		slices.Clone(observer.observations),
 		func(value Observation) bool {
-			return value.Kind != "disagreement" ||
+			return value.Kind != "source_change" ||
 				!strings.HasPrefix(value.Reason, "range_unavailable:")
 		},
 	)
-	if len(observations) != 3 ||
-		observations[0].Result != "unavailable" ||
-		observations[1].Result != "unavailable" ||
-		observations[2].Result != "quarantined" {
+	if len(observations) != 6 {
 		t.Fatalf("range observations = %#v", observations)
 	}
-}
-
-func TestRangeRetryStateIsBoundedPerOperatorAndClearsOnProgress(t *testing.T) {
-	state := make(rangeRetryState)
-	for index := 0; index < 10_000; index++ {
-		key := fmt.Sprintf("range-%d", index)
-		if state.repeated("operator-a", key) {
-			t.Fatalf("new range %q was classified as repeated", key)
+	for _, observation := range observations {
+		if observation.Result != "unavailable" ||
+			observation.ProofMethod != ObservationProofNone {
+			t.Fatalf("range observation became authoritative/quarantined: %#v", observation)
 		}
 	}
-	if len(state) != 1 {
-		t.Fatalf("range retry entries = %d, want one per operator", len(state))
-	}
-	if !state.repeated("operator-a", "range-9999") {
-		t.Fatal("exact current range retry was not recognized")
-	}
-	if state.repeated("operator-b", "range-1") {
-		t.Fatal("first range for independent operator was repeated")
-	}
-	if len(state) != 2 {
-		t.Fatalf("range retry entries = %d, want two operators", len(state))
-	}
-	state.clear("operator-a")
-	if state.repeated("operator-a", "range-9999") {
-		t.Fatal("successful progress did not clear exact retry state")
+	if !slices.Equal(waits, []time.Duration{
+		time.Millisecond,
+		2 * time.Millisecond,
+		4 * time.Millisecond,
+		4 * time.Millisecond,
+		4 * time.Millisecond,
+		4 * time.Millisecond,
+	}) {
+		t.Fatalf("range backoffs = %#v", waits)
 	}
 }
 
@@ -1072,7 +1063,7 @@ func TestRollbackCommonBranchTipCannotConfirmUnrelatedTarget(t *testing.T) {
 	}
 	if len(transport.rollbackProbes) != 1 ||
 		len(observer.observations) != 1 ||
-		observer.observations[0].Result != "quarantined" ||
+		observer.observations[0].Result != "disagreed" ||
 		!strings.Contains(
 			observer.observations[0].Reason,
 			"exact rollback target",
@@ -1083,8 +1074,8 @@ func TestRollbackCommonBranchTipCannotConfirmUnrelatedTarget(t *testing.T) {
 			observer.observations,
 		)
 	}
-	if _, ok := quarantined["operator-b"]; !ok {
-		t.Fatalf("disagreeing operator not quarantined: %#v", quarantined)
+	if _, ok := quarantined["operator-b"]; ok {
+		t.Fatalf("negative membership permanently quarantined operator: %#v", quarantined)
 	}
 }
 
@@ -1452,14 +1443,14 @@ func TestRollbackDisagreementQuarantinesBeforeHandlerCommit(t *testing.T) {
 		primary,
 	)
 	if err == nil ||
-		!strings.Contains(err.Error(), "peer quarantine leaves 1") {
+		!strings.Contains(err.Error(), "rollback unconfirmed: got 1 of 2") {
 		t.Fatalf("error = %v", err)
 	}
 	if delegateCalls != 0 {
 		t.Fatalf("rollback handler called %d times before confirmation", delegateCalls)
 	}
 	if len(observer.observations) != 1 ||
-		observer.observations[0].Result != "quarantined" {
+		observer.observations[0].Result != "disagreed" {
 		t.Fatalf("rollback observations = %#v", observer.observations)
 	}
 }
@@ -1909,7 +1900,7 @@ func TestPeriodicCheckpointDisagreementStopsAfterCommittedAdoption(t *testing.T)
 	}
 	if !slices.ContainsFunc(observer.observations, func(value Observation) bool {
 		return value.Kind == "disagreement" &&
-			value.Result == "quarantined" &&
+			value.Result == "disagreed" &&
 			pointsEqual(value.Checkpoint, testPoint(11, 0x11))
 	}) {
 		t.Fatalf("observations = %#v", observer.observations)
@@ -2076,7 +2067,7 @@ func TestDuplicateOperatorCannotSatisfyRollbackCorroboration(t *testing.T) {
 		primary,
 	)
 	if err == nil ||
-		!strings.Contains(err.Error(), "peer quarantine leaves 2") {
+		!strings.Contains(err.Error(), "rollback unconfirmed: got 2 of 3") {
 		t.Fatalf("error = %v", err)
 	}
 	if delegateCalls != 0 {
@@ -2469,6 +2460,272 @@ func TestCanceledAttemptFinalizerUsesSharedShutdownBudget(t *testing.T) {
 	if !errors.Is(auditCtx.Err(), context.DeadlineExceeded) {
 		t.Fatalf("audit context remained live after finalizer: %v", auditCtx.Err())
 	}
+}
+
+func TestTrustedRollbackUsesDedicatedExactTargetCheck(t *testing.T) {
+	for _, target := range []n2n.ChainPoint{
+		testChainPoint(8, 8, 0x08),
+		testChainPoint(10, 10, 0x10), // depth-zero is still a distinct check.
+	} {
+		t.Run(fmt.Sprintf("target-%d", target.BlockNumber), func(t *testing.T) {
+			primary := actualPeer(
+				testPeer("relay-a:3001", "operator-a"),
+				"198.51.100.1:3001",
+				15,
+			)
+			branchTip := chainsync.Tip{
+				Point:       testPoint(12, 0x12),
+				BlockNumber: 12,
+			}
+			rollbackCheck := CheckIdentity{
+				ID:              testCheckID(0x91),
+				AgreementGroup:  testCheckID(0x92),
+				Attempt:         2,
+				Required:        2,
+				CheckedEventSeq: 8,
+				CheckedPoint:    cloneChainPoint(target),
+			}
+			trust := &fakeTrustController{
+				begin: func(
+					_ context.Context,
+					expected *n2n.ChainPoint,
+					required int,
+					_ time.Time,
+				) (CheckIdentity, error) {
+					if expected == nil ||
+						!chainPointsEqual(*expected, target) ||
+						required != 2 {
+						t.Fatalf("rollback BeginCheck expected=%+v required=%d", expected, required)
+					}
+					return cloneCheckIdentity(rollbackCheck), nil
+				},
+			}
+			var delegated RollbackEvidence
+			delegate := &fakeHandler{
+				rollBackward: func(
+					_ context.Context,
+					_ n2n.ChainPoint,
+					_ chainsync.Tip,
+					evidence RollbackEvidence,
+				) (CommitOutcome, error) {
+					delegated = evidence
+					return CommitOutcome{Committed: true}, nil
+				},
+			}
+			observer := &fakeObserver{}
+			transport := &fakeTransport{
+				rollbackProbe: func(
+					_ context.Context,
+					_ n2n.Peer,
+					gotTarget pcommon.Point,
+					gotBranch pcommon.Point,
+				) (RollbackProbeResult, error) {
+					if !pointsEqual(gotTarget, target.Point) ||
+						!pointsEqual(gotBranch, branchTip.Point) {
+						t.Fatalf("probe target=%+v branch=%+v", gotTarget, gotBranch)
+					}
+					return RollbackProbeResult{
+						TargetAccepted: true,
+						BranchAccepted: true,
+						Tip:            branchTip,
+						N2NVersion:     15,
+						Address:        "198.51.100.2:3001",
+					}, nil
+				},
+			}
+			config := baseConfig()
+			config.Trust = trust
+			supervisor := newTestSupervisor(
+				t,
+				config,
+				&fakeCandidates{},
+				delegate,
+				observer,
+				transport,
+			)
+			prior := CheckIdentity{
+				ID:             testCheckID(0x81),
+				AgreementGroup: testCheckID(0x82),
+				Attempt:        1,
+				Required:       2,
+				CheckedPoint:   testChainPoint(10, 10, 0x10),
+			}
+			attempt := &attemptHandler{
+				supervisor: supervisor,
+				evidence: SourceEvidence{
+					Primary: PeerEvidence{
+						Peer:       primary,
+						N2NVersion: 15,
+						Check:      prior,
+					},
+					Check: prior,
+				},
+				delegate:        delegate,
+				committedBlocks: new(uint64),
+			}
+			if err := attempt.RollBackward(
+				context.Background(),
+				target,
+				branchTip,
+				primary,
+			); err != nil {
+				t.Fatal(err)
+			}
+			if trust.beginCalls != 1 || len(trust.finalizeCalls) != 0 {
+				t.Fatalf("trust calls begin=%d finalize=%d", trust.beginCalls, len(trust.finalizeCalls))
+			}
+			if !checkIdentityEqualForTest(delegated.Check, rollbackCheck) ||
+				len(delegated.Confirmations) != 2 {
+				t.Fatalf("delegated evidence=%+v", delegated)
+			}
+			for _, confirmation := range delegated.Confirmations {
+				if !checkIdentityEqualForTest(
+					confirmation.Membership.Check,
+					rollbackCheck,
+				) {
+					t.Fatalf("confirmation crossed checks: %+v", confirmation)
+				}
+			}
+			if len(observer.observations) != 2 ||
+				!observer.observations[0].SelectedBodySource {
+				t.Fatalf("rollback observations=%+v", observer.observations)
+			}
+			for _, observation := range observer.observations {
+				if !chainPointsEqual(observation.Check.CheckedPoint, target) {
+					t.Fatalf("observation reused intersection check: %+v", observation.Check)
+				}
+			}
+		})
+	}
+}
+
+func TestRejectedPhysicalOlderUnavailableOrExhaustedRemainsChecking(t *testing.T) {
+	physical := testChainPoint(10, 10, 0x10)
+	older := testChainPoint(9, 9, 0x09)
+	for _, test := range []struct {
+		name       string
+		candidates []n2n.ChainPoint
+	}{
+		{name: "older_unavailable", candidates: []n2n.ChainPoint{physical, older}},
+		{name: "exhausted", candidates: []n2n.ChainPoint{physical}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			group := testCheckID(0xa1)
+			trust := &fakeTrustController{}
+			trust.begin = func(
+				_ context.Context,
+				expected *n2n.ChainPoint,
+				required int,
+				_ time.Time,
+			) (CheckIdentity, error) {
+				attempt := uint32(trust.beginCalls)
+				return CheckIdentity{
+					ID:              testCheckID(byte(0xa1 + attempt)),
+					AgreementGroup:  group,
+					Attempt:         attempt,
+					Required:        uint16(required),
+					CheckedEventSeq: uint64(11 - attempt),
+					CheckedPoint:    cloneChainPoint(*expected),
+					Physical:        attempt == 1,
+				}, nil
+			}
+			transport := &fakeTransport{
+				probe: func(
+					_ context.Context,
+					_ n2n.Peer,
+					point pcommon.Point,
+				) (ProbeResult, error) {
+					if pointsEqual(point, physical.Point) {
+						return ProbeResult{
+							Accepted:   false,
+							Tip:        chainsync.Tip{Point: testPoint(12, 0x12), BlockNumber: 12},
+							N2NVersion: 15,
+							Address:    "198.51.100.4:3001",
+						}, nil
+					}
+					return ProbeResult{}, RetryableTransportError(errors.New("unavailable"))
+				},
+			}
+			config := baseConfig()
+			config.Trust = trust
+			supervisor := newTestSupervisor(
+				t,
+				config,
+				&fakeCandidates{},
+				&fakeHandler{},
+				&fakeObserver{},
+				transport,
+			)
+			if _, _, err := supervisor.corroborate(
+				context.Background(),
+				test.candidates,
+				map[string]struct{}{},
+			); err == nil {
+				t.Fatal("branch-search retry unexpectedly succeeded")
+			}
+			if len(trust.finalizeCalls) != 0 {
+				t.Fatalf("branch movement finalized trust: %+v", trust.finalizeCalls)
+			}
+		})
+	}
+}
+
+type fakeTrustFinalizeCall struct {
+	Check        CheckIdentity
+	ForceDispute bool
+	Reason       string
+}
+
+type fakeTrustController struct {
+	begin         func(context.Context, *n2n.ChainPoint, int, time.Time) (CheckIdentity, error)
+	beginCalls    int
+	finalizeCalls []fakeTrustFinalizeCall
+}
+
+func (trust *fakeTrustController) BeginCheck(
+	ctx context.Context,
+	point *n2n.ChainPoint,
+	required int,
+	at time.Time,
+) (CheckIdentity, error) {
+	trust.beginCalls++
+	if trust.begin == nil {
+		return CheckIdentity{}, errors.New("unexpected BeginCheck")
+	}
+	return trust.begin(ctx, point, required, at)
+}
+
+func (trust *fakeTrustController) FinalizeCheck(
+	_ context.Context,
+	check CheckIdentity,
+	force bool,
+	reason string,
+	_ time.Time,
+) (TrustResolution, error) {
+	trust.finalizeCalls = append(trust.finalizeCalls, fakeTrustFinalizeCall{
+		Check:        cloneCheckIdentity(check),
+		ForceDispute: force,
+		Reason:       reason,
+	})
+	return TrustResolution{Status: "disputed", Required: check.Required}, nil
+}
+
+func checkIdentityEqualForTest(left, right CheckIdentity) bool {
+	return left.ID == right.ID &&
+		left.AgreementGroup == right.AgreementGroup &&
+		left.Attempt == right.Attempt &&
+		left.Required == right.Required &&
+		left.CheckedEventSeq == right.CheckedEventSeq &&
+		left.Physical == right.Physical &&
+		chainPointsEqual(left.CheckedPoint, right.CheckedPoint)
+}
+
+func testCheckID(value byte) [16]byte {
+	var ret [16]byte
+	for index := range ret {
+		ret[index] = value
+	}
+	return ret
 }
 
 func newTestSupervisor(

@@ -14,12 +14,25 @@ import (
 
 	"clicksync/internal/config"
 	"clicksync/internal/genesis"
+	"clicksync/internal/model"
 	"clicksync/internal/n2n"
 	"clicksync/internal/publication"
 	"clicksync/internal/store"
 	"clicksync/internal/syncer"
 	"clicksync/internal/writerlock"
 )
+
+type authorityObservationSink struct {
+	db   *store.DB
+	lock publication.Lock
+}
+
+func (sink authorityObservationSink) InsertPeerObservations(
+	ctx context.Context,
+	observations []model.PeerObservation,
+) error {
+	return sink.db.InsertPeerObservations(ctx, sink.lock, observations)
+}
 
 const (
 	rollbackMaximumDepth = uint32(2160)
@@ -167,13 +180,57 @@ func RunSync(
 		)
 		auditActive = false
 	}()
+	trust := &trustController{
+		db:          db,
+		lock:        lock,
+		writerID:    writerID,
+		writerBuild: buildID,
+	}
 	if bootstrap != nil {
-		observations, err := BoundaryObservations(*bootstrap, cfg.NetworkMagic)
+		check, err := trust.BeginCheck(
+			ctx,
+			&bootstrap.ChainPoint,
+			cfg.Corroboration,
+			time.Now().UTC(),
+		)
+		if err != nil {
+			return fmt.Errorf("begin boundary bootstrap trust check: %w", err)
+		}
+		observations, err := BoundaryObservations(
+			*bootstrap,
+			cfg.NetworkMagic,
+			check,
+		)
 		if err != nil {
 			return err
 		}
-		if err := db.InsertPeerObservations(ctx, observations); err != nil {
+		if err := db.InsertPeerObservations(ctx, lock, observations); err != nil {
+			_, _ = trust.FinalizeCheck(
+				ctx,
+				check,
+				true,
+				"boundary observation persistence failed: "+err.Error(),
+				time.Now().UTC(),
+			)
 			return fmt.Errorf("persist boundary bootstrap evidence: %w", err)
+		}
+		resolution, err := trust.FinalizeCheck(
+			ctx,
+			check,
+			false,
+			"",
+			time.Now().UTC(),
+		)
+		if err != nil {
+			return fmt.Errorf("finalize boundary bootstrap trust: %w", err)
+		}
+		if resolution.Status != "agreed" || !resolution.Servable {
+			return fmt.Errorf(
+				"boundary bootstrap resolved %s with %d of %d operators",
+				resolution.Status,
+				resolution.Confirmed,
+				resolution.Required,
+			)
 		}
 	}
 	allocator, err := db.NewAllocator(ctx)
@@ -206,7 +263,10 @@ func RunSync(
 			return err
 		}
 	}
-	observer, err := NewObserver(db, cfg.NetworkMagic)
+	observer, err := NewObserver(
+		authorityObservationSink{db: db, lock: lock},
+		cfg.NetworkMagic,
+	)
 	if err != nil {
 		return err
 	}
@@ -239,6 +299,7 @@ func RunSync(
 		CheckpointEveryBlocks: checkpointEveryBlocks,
 		FinalizeTimeout:       shutdownTimeout,
 		ShutdownBudget:        shutdownBudget,
+		Trust:                 trust,
 	}, db, handler, observer, transport)
 	if err != nil {
 		return err
@@ -401,9 +462,9 @@ func retryableBoundaryBootstrap(
 		}
 		switch evidence.Status {
 		case n2n.BoundaryAccepted:
-		case n2n.BoundaryUnavailable:
+		case n2n.BoundaryUnavailable, n2n.BoundaryRejected:
 			sawUnavailable = true
-		case n2n.BoundaryRejected, n2n.BoundaryPeerData:
+		case n2n.BoundaryPeerData:
 			quarantined[operator] = struct{}{}
 			sawQuarantine = true
 		default:

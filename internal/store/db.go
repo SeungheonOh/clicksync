@@ -17,6 +17,7 @@ import (
 type DB struct {
 	conn       clickhouse.Conn
 	manifestMu sync.Mutex
+	evidenceMu sync.Mutex
 }
 
 func Open(cfg config.Config) (*DB, error) {

@@ -32,6 +32,7 @@ type WriterAuditStatus struct {
 	DatasetID     [16]byte
 	Revision      uint64
 	OwnerID       [16]byte
+	BuildID       string
 	State         string
 	HeartbeatAt   time.Time
 	ReleasedAt    *time.Time
@@ -50,7 +51,7 @@ func (d *DB) LatestWriterAudit(
 	}
 	const query = `
 SELECT
-    dataset_id, revision, owner_id, state, heartbeat_at, released_at, release_reason
+    dataset_id, revision, owner_id, build_id, state, heartbeat_at, released_at, release_reason
 FROM clicksync.writer_audit
 WHERE dataset_id = ?
   AND revision =
@@ -80,6 +81,7 @@ WHERE dataset_id = ?
 			&datasetID,
 			&status.Revision,
 			&ownerID,
+			&status.BuildID,
 			&status.State,
 			&status.HeartbeatAt,
 			&status.ReleasedAt,
@@ -123,6 +125,7 @@ func sameWriterAuditStatus(left, right WriterAuditStatus) bool {
 	if left.DatasetID != right.DatasetID ||
 		left.Revision != right.Revision ||
 		left.OwnerID != right.OwnerID ||
+		left.BuildID != right.BuildID ||
 		left.State != right.State ||
 		!left.HeartbeatAt.Equal(right.HeartbeatAt) ||
 		left.ReleaseReason != right.ReleaseReason {

@@ -43,9 +43,9 @@ func (e *PeerDataViolation) Unwrap() error {
 	return e.Err
 }
 
-// RangeUnavailable is a bounded ChainSync/BlockFetch race. The supervisor may
-// reconnect and re-intersect once for the exact source/range; repetition is a
-// peer-data violation and quarantines that operator.
+// RangeUnavailable is a ChainSync/BlockFetch availability race. The
+// supervisor rotates, reconnects, and re-intersects with capped backoff until
+// progress or context cancellation; repetition is not peer-data corruption.
 type RangeUnavailable struct {
 	Start pcommon.Point
 	End   pcommon.Point

@@ -213,27 +213,31 @@ func TestBoundaryBootstrapRetriesTransientAvailabilityThenSucceeds(t *testing.T)
 	}
 }
 
-func TestBoundaryBootstrapRejectionAndPeerDataAreTerminal(t *testing.T) {
+func TestBoundaryBootstrapRejectionRetriesButPeerDataQuarantines(t *testing.T) {
 	peers := []n2n.Peer{
 		{Host: "a", Operator: "operator-a"},
 		{Host: "b", Operator: "operator-b"},
 	}
-	for name, status := range map[string]n2n.BoundaryEvidenceStatus{
-		"configured point rejection": n2n.BoundaryRejected,
-		"peer data violation":        n2n.BoundaryPeerData,
+	for name, test := range map[string]struct {
+		status    n2n.BoundaryEvidenceStatus
+		retryable bool
+	}{
+		"configured point rejection": {status: n2n.BoundaryRejected, retryable: true},
+		"peer data violation":        {status: n2n.BoundaryPeerData},
 	} {
 		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
 			calls := 0
 			expectedErr := &n2n.BoundaryBootstrapError{
 				Required: 2,
 				Evidence: []n2n.BoundaryPeerEvidence{
 					{Peer: peers[0], Status: n2n.BoundaryAccepted},
-					{Peer: peers[1], Status: status},
+					{Peer: peers[1], Status: test.status},
 				},
 				Reason: name,
 			}
 			_, err := bootstrapBoundaryWithRetry(
-				context.Background(),
+				ctx,
 				peers,
 				2,
 				n2n.DialConfig{},
@@ -248,13 +252,21 @@ func TestBoundaryBootstrapRejectionAndPeerDataAreTerminal(t *testing.T) {
 					*slog.Logger,
 				) (n2n.BoundaryBootstrap, error) {
 					calls++
+					if test.retryable && calls == 4 {
+						cancel()
+					}
 					return n2n.BoundaryBootstrap{}, expectedErr
 				},
-				func(context.Context, time.Duration) error {
-					t.Fatal("terminal bootstrap entered backoff")
-					return nil
+				func(ctx context.Context, _ time.Duration) error {
+					return ctx.Err()
 				},
 			)
+			if test.retryable {
+				if !errors.Is(err, context.Canceled) || calls != 4 {
+					t.Fatalf("calls=%d error=%v", calls, err)
+				}
+				return
+			}
 			if !errors.Is(err, expectedErr) || calls != 1 {
 				t.Fatalf("calls=%d error=%v", calls, err)
 			}
@@ -425,14 +437,15 @@ func TestBoundaryBootstrapQuarantinesOneOperatorThenRemainingPeersRecover(t *tes
 	}
 }
 
-func TestBoundaryBootstrapQuarantineExhaustionIsTerminal(t *testing.T) {
+func TestBoundaryBootstrapRejectionAndUnavailabilityPersistUntilCancellation(t *testing.T) {
 	peers := []n2n.Peer{
 		{Host: "a:3001", Operator: "operator-a"},
 		{Host: "b:3001", Operator: "operator-b"},
 	}
 	calls := 0
+	ctx, cancel := context.WithCancel(context.Background())
 	_, err := bootstrapBoundaryWithRetry(
-		context.Background(),
+		ctx,
 		peers,
 		2,
 		n2n.DialConfig{},
@@ -447,6 +460,9 @@ func TestBoundaryBootstrapQuarantineExhaustionIsTerminal(t *testing.T) {
 			*slog.Logger,
 		) (n2n.BoundaryBootstrap, error) {
 			calls++
+			if calls == 4 {
+				cancel()
+			}
 			return n2n.BoundaryBootstrap{}, &n2n.BoundaryBootstrapError{
 				Required: 2,
 				Kind:     n2n.BoundaryInsufficient,
@@ -457,12 +473,11 @@ func TestBoundaryBootstrapQuarantineExhaustionIsTerminal(t *testing.T) {
 				Reason: "one rejection exhausts threshold",
 			}
 		},
-		func(context.Context, time.Duration) error {
-			t.Fatal("exhausted quarantine entered backoff")
-			return nil
+		func(ctx context.Context, _ time.Duration) error {
+			return ctx.Err()
 		},
 	)
-	if err == nil || calls != 1 {
+	if !errors.Is(err, context.Canceled) || calls != 4 {
 		t.Fatalf("calls=%d error=%v", calls, err)
 	}
 }

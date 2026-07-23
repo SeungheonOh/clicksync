@@ -105,9 +105,8 @@ const (
 )
 
 type BatchItem struct {
-	Block            model.Block
-	Source           Source
-	PeerObservations []model.PeerObservation
+	Block  model.Block
+	Source Source
 }
 
 type Batch struct {
@@ -150,7 +149,10 @@ type RollbackRequest struct {
 	To                    Point
 	Reason                string
 	Observers             []RollbackObserver
+	CheckID               *[16]byte
 	AgreementGroup        *[16]byte
+	CheckAttempt          uint32
+	CheckedEventSeq       uint64
 	MaximumDepth          uint32
 	RequiredCorroboration int
 	RecordedAt            time.Time
@@ -166,12 +168,18 @@ type RollbackCommit struct {
 	EventSeq              uint64
 	To                    Point
 	OldTip                Point
+	OldEventSeq           uint64
 	Depth                 uint32
 	Reason                string
 	ObservedPeers         []string
 	ObservedOperators     []string
 	CorroborationRequired uint16
+	CheckID               *[16]byte
 	AgreementGroup        *[16]byte
+	CheckAttempt          uint32
+	CheckedEventSeq       uint64
+	EvidenceCount         uint32
+	EvidenceDigest        model.Hash32
 	WriterID              [16]byte
 	RecordedAt            time.Time
 }
@@ -189,17 +197,19 @@ type Backend interface {
 	BatchBackend
 
 	CommittedSnapshot(context.Context) (uint64, error)
+	RawCommittedSnapshot(context.Context) (uint64, error)
 	CommittedTip(context.Context, uint64) (Point, error)
 	GenesisState(context.Context) (bool, bool, error)
 	ResolveOutputStates(context.Context, uint64, []OutputRef) (map[OutputRef]OutputResolution, error)
 	ExistingDatumBodies(context.Context, []model.Hash32) (map[model.Hash32][]byte, error)
 
-	InsertPeerObservations(context.Context, []model.PeerObservation) error
-
 	ActiveDescendants(context.Context, uint64, Point, uint32) ([]Descendant, error)
 	InsertInvalidations(context.Context, RollbackCommit, []Descendant) error
 	InsertRollbackHeader(context.Context, RollbackCommit) error
 	RollbackCommitted(context.Context, RollbackCommit) (bool, error)
+	ReserveRollbackManifest(context.Context, Lock, RollbackCommit, string) (RollbackCommit, error)
+	MarkRollbackInvalidations(context.Context, Lock, RollbackCommit, string) error
+	FinalizeRollbackManifest(context.Context, Lock, RollbackCommit, string) error
 
 	PersistManifest(context.Context, Lock, ManifestUpdate) error
 }
@@ -311,13 +321,11 @@ func (coordinator *Coordinator) Publish(
 	ctx context.Context,
 	block model.Block,
 	source Source,
-	peerObservations []model.PeerObservation,
 ) (uint64, error) {
 	result, err := coordinator.PublishBatch(ctx, Batch{
 		Items: []BatchItem{{
-			Block:            block,
-			Source:           source,
-			PeerObservations: peerObservations,
+			Block:  block,
+			Source: source,
 		}},
 		FirstStagedAt: coordinator.config.Now().UTC(),
 	})
@@ -370,13 +378,8 @@ func (coordinator *Coordinator) PublishBatch(
 			MaxBatchBytes,
 		)
 	}
-	allObservations := make([]model.PeerObservation, 0)
 	for index, item := range input.Items {
-		if err := validateSource(
-			item.Source,
-			item.PeerObservations,
-			item.Block.Synthetic,
-		); err != nil {
+		if err := validateSource(item.Source, item.Block.Synthetic); err != nil {
 			return BatchResult{}, fmt.Errorf("validate source provenance for block %d: %w", index, err)
 		}
 		if err := validateBlock(item.Block); err != nil {
@@ -388,7 +391,6 @@ func (coordinator *Coordinator) PublishBatch(
 				return BatchResult{}, fmt.Errorf("block %d is not a contiguous successor: %w", index, err)
 			}
 		}
-		allObservations = append(allObservations, item.PeerObservations...)
 	}
 	startOrigin, seeded, err := coordinator.backend.GenesisState(ctx)
 	if err != nil {
@@ -402,9 +404,6 @@ func (coordinator *Coordinator) PublishBatch(
 		} else if startOrigin && !seeded {
 			return BatchResult{}, errors.New("normal chain publication is forbidden until the exact genesis bundle is complete")
 		}
-	}
-	if err := coordinator.backend.InsertPeerObservations(ctx, allObservations); err != nil {
-		return BatchResult{}, fmt.Errorf("persist sampled peer observations: %w", err)
 	}
 	snapshot, err := coordinator.backend.CommittedSnapshot(ctx)
 	if err != nil {
@@ -499,10 +498,6 @@ func (coordinator *Coordinator) PublishBatch(
 		}
 		totalRows += rows
 	}
-	if uint64(len(allObservations)) > MaxBatchRows-totalRows {
-		return BatchResult{}, fmt.Errorf("physical microbatch rows exceed %d", MaxBatchRows)
-	}
-
 	steps := []struct {
 		point FaultPoint
 		write func(context.Context, []Attempt) error
@@ -613,11 +608,18 @@ func (coordinator *Coordinator) Rollback(ctx context.Context, request RollbackRe
 	if request.MaximumDepth == 0 {
 		return errors.New("rollback maximum depth must be non-zero")
 	}
-	if request.RequiredCorroboration < 1 {
-		return errors.New("rollback corroboration must be positive")
+	if request.RequiredCorroboration < 2 {
+		return errors.New("rollback corroboration must require at least two operators")
 	}
 	if request.RequiredCorroboration > math.MaxUint16 {
 		return errors.New("rollback corroboration exceeds UInt16")
+	}
+	if request.CheckID == nil ||
+		request.AgreementGroup == nil ||
+		*request.CheckID == ([16]byte{}) ||
+		*request.AgreementGroup == ([16]byte{}) ||
+		request.CheckAttempt == 0 {
+		return errors.New("rollback request lacks exact trust check/group/attempt identity")
 	}
 	peers, operators, operatorCount, err := independentObservers(request.Observers)
 	if err != nil {
@@ -630,7 +632,7 @@ func (coordinator *Coordinator) Rollback(ctx context.Context, request RollbackRe
 			request.RequiredCorroboration,
 		)
 	}
-	snapshot, err := coordinator.backend.CommittedSnapshot(ctx)
+	snapshot, err := coordinator.backend.RawCommittedSnapshot(ctx)
 	if err != nil {
 		return fmt.Errorf("read rollback snapshot: %w", err)
 	}
@@ -674,26 +676,39 @@ func (coordinator *Coordinator) Rollback(ctx context.Context, request RollbackRe
 	if err != nil {
 		return err
 	}
-	recordedAt := request.RecordedAt.UTC()
+	recordedAt := request.RecordedAt.UTC().Truncate(time.Microsecond)
 	if recordedAt.IsZero() {
-		recordedAt = coordinator.config.Now().UTC()
+		recordedAt = coordinator.config.Now().UTC().Truncate(time.Microsecond)
 	}
 	commit := RollbackCommit{
 		RollbackID:            rollbackID,
 		EventSeq:              eventSeq,
 		To:                    request.To,
 		OldTip:                oldTip,
+		OldEventSeq:           snapshot,
 		Depth:                 uint32(len(descendants)),
 		Reason:                request.Reason,
 		ObservedPeers:         peers,
 		ObservedOperators:     operators,
 		CorroborationRequired: uint16(request.RequiredCorroboration),
+		CheckID:               request.CheckID,
 		AgreementGroup:        request.AgreementGroup,
+		CheckAttempt:          request.CheckAttempt,
+		CheckedEventSeq:       request.CheckedEventSeq,
 		WriterID:              coordinator.config.WriterID,
 		RecordedAt:            recordedAt,
 	}
 	if err := coordinator.assertWriter(); err != nil {
 		return err
+	}
+	commit, err = coordinator.backend.ReserveRollbackManifest(
+		ctx,
+		coordinator.lock,
+		commit,
+		coordinator.config.WriterBuild,
+	)
+	if err != nil {
+		return fmt.Errorf("reserve conservative rollback manifest: %w", err)
 	}
 	if len(descendants) > 0 {
 		if err := coordinator.backend.InsertInvalidations(ctx, commit, descendants); err != nil {
@@ -702,6 +717,14 @@ func (coordinator *Coordinator) Rollback(ctx context.Context, request RollbackRe
 		if err := coordinator.inject(AfterInvalidations); err != nil {
 			return err
 		}
+	}
+	if err := coordinator.backend.MarkRollbackInvalidations(
+		ctx,
+		coordinator.lock,
+		commit,
+		coordinator.config.WriterBuild,
+	); err != nil {
+		return fmt.Errorf("persist rollback invalidation stage: %w", err)
 	}
 	if err := coordinator.inject(BeforeRollbackHeader); err != nil {
 		return err
@@ -730,15 +753,12 @@ func (coordinator *Coordinator) Rollback(ctx context.Context, request RollbackRe
 			Err:      fmt.Errorf("writer flock lost before post-rollback manifest: %w", err),
 		}
 	}
-	update := ManifestUpdate{
-		EventSeq:    eventSeq,
-		Tip:         request.To,
-		Kind:        ManifestRollback,
-		WriterID:    coordinator.config.WriterID,
-		WriterBuild: coordinator.config.WriterBuild,
-		UpdatedAt:   coordinator.config.Now().UTC(),
-	}
-	if err := coordinator.backend.PersistManifest(ctx, coordinator.lock, update); err != nil {
+	if err := coordinator.backend.FinalizeRollbackManifest(
+		ctx,
+		coordinator.lock,
+		commit,
+		coordinator.config.WriterBuild,
+	); err != nil {
 		return &CommittedError{
 			EventSeq: eventSeq,
 			Err:      fmt.Errorf("persist post-rollback manifest: %w", err),

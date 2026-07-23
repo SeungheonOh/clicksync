@@ -47,6 +47,14 @@ CREATE TABLE IF NOT EXISTS clicksync.dataset_manifest
     trust_reason String,
     check_started_at Nullable(DateTime64(6, 'UTC')),
     check_completed_at Nullable(DateTime64(6, 'UTC')),
+    evidence_state Enum8('none' = 1, 'open' = 2, 'frozen' = 3),
+    evidence_count UInt32,
+    evidence_digest Nullable(FixedString(32)),
+    pending_evidence_observation_id Nullable(UUID),
+    pending_evidence_observation_digest Nullable(FixedString(32)),
+    pending_evidence_payload String,
+    pending_evidence_writer_id Nullable(UUID),
+    pending_evidence_reserved_at Nullable(DateTime64(6, 'UTC')),
     checked_event_seq Nullable(UInt64),
     checked_point_origin Nullable(Bool),
     checked_point_slot Nullable(UInt64),
@@ -60,6 +68,19 @@ CREATE TABLE IF NOT EXISTS clicksync.dataset_manifest
     last_agreed_point_block_number Nullable(UInt64),
     last_agreed_point_is_byron_ebb Nullable(Bool),
     last_agreed_at Nullable(DateTime64(6, 'UTC')),
+    last_agreed_check_id Nullable(UUID),
+    last_agreed_agreement_group Nullable(UUID),
+    last_agreed_check_attempt UInt32,
+    last_agreed_corroboration_required UInt16,
+    last_agreed_corroboration_confirmed UInt16,
+    last_agreed_checked_event_seq Nullable(UInt64),
+    last_agreed_checked_point_origin Nullable(Bool),
+    last_agreed_checked_point_slot Nullable(UInt64),
+    last_agreed_checked_point_hash Nullable(FixedString(32)),
+    last_agreed_checked_point_block_number Nullable(UInt64),
+    last_agreed_checked_point_is_byron_ebb Nullable(Bool),
+    last_agreed_evidence_count UInt32,
+    last_agreed_evidence_digest Nullable(FixedString(32)),
     servable_floor_event_seq UInt64,
     servable_floor_origin Bool,
     servable_floor_slot Nullable(UInt64),
@@ -99,6 +120,18 @@ CREATE TABLE IF NOT EXISTS clicksync.dataset_manifest
     pending_rollback_old_physical_hash Nullable(FixedString(32)),
     pending_rollback_old_physical_block_number Nullable(UInt64),
     pending_rollback_old_physical_is_byron_ebb Nullable(Bool),
+    pending_rollback_depth Nullable(UInt32),
+    pending_rollback_reason String,
+    pending_rollback_observed_peers Array(String),
+    pending_rollback_observed_operators Array(String),
+    pending_rollback_required Nullable(UInt16),
+    pending_rollback_check_id Nullable(UUID),
+    pending_rollback_agreement_group Nullable(UUID),
+    pending_rollback_check_attempt Nullable(UInt32),
+    pending_rollback_checked_event_seq Nullable(UInt64),
+    pending_rollback_evidence_count Nullable(UInt32),
+    pending_rollback_evidence_digest Nullable(FixedString(32)),
+    pending_rollback_writer_id Nullable(UUID),
     pending_rollback_started_at Nullable(DateTime64(6, 'UTC')),
     writer_id Nullable(UUID),
     writer_build String,
@@ -128,6 +161,46 @@ CREATE TABLE IF NOT EXISTS clicksync.dataset_manifest
                 isNotNull(last_agreed_event_seq) AND isNull(last_agreed_point_slot) AND isNull(last_agreed_point_hash) AND isNull(last_agreed_point_block_number) AND isNotNull(last_agreed_point_is_byron_ebb) AND NOT assumeNotNull(last_agreed_point_is_byron_ebb) AND isNotNull(last_agreed_at),
             isNotNull(last_agreed_event_seq) AND isNotNull(last_agreed_point_slot) AND isNotNull(last_agreed_point_hash) AND isNotNull(last_agreed_point_block_number) AND isNotNull(last_agreed_point_is_byron_ebb) AND isNotNull(last_agreed_at)
         ),
+    CONSTRAINT dataset_manifest_last_agreed_evidence CHECK
+        (
+            isNull(last_agreed_check_id)
+            AND isNull(last_agreed_agreement_group)
+            AND last_agreed_check_attempt = 0
+            AND last_agreed_corroboration_required = 0
+            AND last_agreed_corroboration_confirmed = 0
+            AND isNull(last_agreed_checked_event_seq)
+            AND isNull(last_agreed_checked_point_origin)
+            AND isNull(last_agreed_checked_point_slot)
+            AND isNull(last_agreed_checked_point_hash)
+            AND isNull(last_agreed_checked_point_block_number)
+            AND isNull(last_agreed_checked_point_is_byron_ebb)
+            AND last_agreed_evidence_count = 0
+            AND isNull(last_agreed_evidence_digest)
+            AND (
+                isNull(last_agreed_event_seq)
+                OR
+                (
+                    servable_floor_permanent
+                    AND servable_floor_origin
+                    AND assumeNotNull(last_agreed_event_seq) = servable_floor_event_seq
+                    AND assumeNotNull(last_agreed_point_origin)
+                )
+            )
+        )
+        OR
+        (
+            isNotNull(last_agreed_event_seq)
+            AND isNotNull(last_agreed_check_id)
+            AND isNotNull(last_agreed_agreement_group)
+            AND last_agreed_check_attempt > 0
+            AND last_agreed_corroboration_required >= 2
+            AND last_agreed_corroboration_confirmed >= last_agreed_corroboration_required
+            AND last_agreed_corroboration_confirmed <= last_agreed_evidence_count
+            AND isNotNull(last_agreed_checked_event_seq)
+            AND isNotNull(last_agreed_checked_point_origin)
+            AND isNotNull(last_agreed_checked_point_is_byron_ebb)
+            AND isNotNull(last_agreed_evidence_digest)
+        ),
     CONSTRAINT dataset_manifest_floor_point CHECK
         (servable_floor_origin AND isNull(servable_floor_slot) AND isNull(servable_floor_hash) AND isNull(servable_floor_block_number) AND NOT servable_floor_is_byron_ebb)
         OR
@@ -154,9 +227,21 @@ CREATE TABLE IF NOT EXISTS clicksync.dataset_manifest
                 AND isNull(pending_rollback_old_physical_origin)
                 AND isNull(pending_rollback_old_physical_slot)
                 AND isNull(pending_rollback_old_physical_hash)
-                AND isNull(pending_rollback_old_physical_block_number)
-                AND isNull(pending_rollback_old_physical_is_byron_ebb)
-                AND isNull(pending_rollback_started_at),
+            AND isNull(pending_rollback_old_physical_block_number)
+            AND isNull(pending_rollback_old_physical_is_byron_ebb)
+            AND isNull(pending_rollback_depth)
+            AND pending_rollback_reason = ''
+            AND empty(pending_rollback_observed_peers)
+            AND empty(pending_rollback_observed_operators)
+            AND isNull(pending_rollback_required)
+            AND isNull(pending_rollback_check_id)
+            AND isNull(pending_rollback_agreement_group)
+            AND isNull(pending_rollback_check_attempt)
+            AND isNull(pending_rollback_checked_event_seq)
+            AND isNull(pending_rollback_evidence_count)
+            AND isNull(pending_rollback_evidence_digest)
+            AND isNull(pending_rollback_writer_id)
+            AND isNull(pending_rollback_started_at),
             isNotNull(pending_rollback_id)
             AND isNotNull(pending_rollback_event_seq)
             AND isNotNull(pending_rollback_to_origin)
@@ -186,13 +271,67 @@ CREATE TABLE IF NOT EXISTS clicksync.dataset_manifest
                     AND isNotNull(pending_rollback_old_physical_block_number)
                     AND isNotNull(pending_rollback_old_physical_is_byron_ebb)
             )
+            AND isNotNull(pending_rollback_depth)
+            AND pending_rollback_reason != ''
+            AND evidence_state = 'frozen'
+            AND length(pending_rollback_observed_peers) = length(pending_rollback_observed_operators)
+            AND isNotNull(pending_rollback_required)
+            AND assumeNotNull(pending_rollback_required) >= 2
+            AND length(arrayDistinct(arrayMap(item -> lowerUTF8(trim(item)), pending_rollback_observed_operators))) >= assumeNotNull(pending_rollback_required)
+            AND isNotNull(pending_rollback_check_id)
+            AND isNotNull(pending_rollback_agreement_group)
+            AND isNotNull(pending_rollback_check_attempt)
+            AND assumeNotNull(pending_rollback_check_attempt) > 0
+            AND isNotNull(pending_rollback_checked_event_seq)
+            AND isNotNull(pending_rollback_evidence_count)
+            AND assumeNotNull(pending_rollback_evidence_count) = evidence_count
+            AND assumeNotNull(pending_rollback_evidence_count) >= assumeNotNull(pending_rollback_required)
+            AND isNotNull(pending_rollback_evidence_digest)
+            AND assumeNotNull(pending_rollback_evidence_digest) = assumeNotNull(evidence_digest)
+            AND isNotNull(pending_rollback_writer_id)
             AND isNotNull(pending_rollback_started_at)
         ),
     CONSTRAINT dataset_manifest_check_identity CHECK
         (trust_status != 'checking')
         OR
         (isNotNull(check_id) AND isNotNull(agreement_group) AND isNotNull(checked_event_seq) AND isNotNull(checked_point_origin) AND isNotNull(check_started_at)),
-    CONSTRAINT dataset_manifest_corroboration CHECK corroboration_confirmed <= corroboration_required,
+    CONSTRAINT dataset_manifest_evidence_state CHECK
+        (
+            evidence_state = 'none'
+            AND evidence_count = 0
+            AND isNull(evidence_digest)
+            AND isNull(pending_evidence_observation_id)
+            AND isNull(pending_evidence_observation_digest)
+            AND pending_evidence_payload = ''
+            AND isNull(pending_evidence_writer_id)
+            AND isNull(pending_evidence_reserved_at)
+        )
+        OR
+        (
+            evidence_state IN ('open', 'frozen')
+            AND isNotNull(check_id)
+            AND isNotNull(agreement_group)
+            AND isNotNull(evidence_digest)
+            AND (
+                (
+                    isNull(pending_evidence_observation_id)
+                    AND isNull(pending_evidence_observation_digest)
+                    AND pending_evidence_payload = ''
+                    AND isNull(pending_evidence_writer_id)
+                    AND isNull(pending_evidence_reserved_at)
+                )
+                OR
+                (
+                    evidence_state = 'open'
+                    AND isNotNull(pending_evidence_observation_id)
+                    AND isNotNull(pending_evidence_observation_digest)
+                    AND pending_evidence_payload != ''
+                    AND isNotNull(pending_evidence_writer_id)
+                    AND isNotNull(pending_evidence_reserved_at)
+                )
+            )
+        ),
+    CONSTRAINT dataset_manifest_corroboration CHECK corroboration_confirmed <= evidence_count,
     CONSTRAINT dataset_manifest_cadence CHECK checkpoint_interval = 512 AND primary_suffix <= 767,
     CONSTRAINT dataset_manifest_completeness CHECK complete_history = (start_kind = 'origin' AND genesis_seeded)
 )
@@ -280,12 +419,18 @@ CREATE TABLE IF NOT EXISTS clicksync.rollbacks
     old_tip_hash Nullable(FixedString(32)),
     old_tip_block_number Nullable(UInt64),
     old_tip_is_byron_ebb Bool,
+    old_tip_event_seq UInt64,
     depth UInt32,
     reason String,
     observed_peers Array(String),
     observed_operators Array(String),
     corroboration_required UInt16,
+    check_id UUID,
     agreement_group Nullable(UUID),
+    check_attempt UInt32,
+    checked_event_seq UInt64,
+    evidence_count UInt32,
+    evidence_digest FixedString(32),
     writer_id UUID,
     recorded_at DateTime64(6, 'UTC'),
     PROJECTION rollbacks_by_id
@@ -301,6 +446,13 @@ CREATE TABLE IF NOT EXISTS clicksync.rollbacks
         (isNull(old_tip_slot) AND isNull(old_tip_hash) AND isNull(old_tip_block_number) AND NOT old_tip_is_byron_ebb)
         OR
         (isNotNull(old_tip_slot) AND isNotNull(old_tip_hash) AND isNotNull(old_tip_block_number)),
+    CONSTRAINT rollbacks_check_identity CHECK
+        check_id != toUUID('00000000-0000-0000-0000-000000000000')
+        AND isNotNull(agreement_group)
+        AND assumeNotNull(agreement_group) != toUUID('00000000-0000-0000-0000-000000000000')
+        AND check_attempt > 0
+        AND corroboration_required >= 2
+        AND evidence_count >= corroboration_required,
     CONSTRAINT rollbacks_peers CHECK
         length(observed_peers) = length(observed_operators)
         AND length(observed_peers) > 0
@@ -544,6 +696,7 @@ CREATE TABLE IF NOT EXISTS clicksync.peer_observations
 (
     observation_id UUID,
     observation_digest FixedString(32),
+    evidence_identity FixedString(32),
     observation_kind Enum8(
         'checkpoint' = 1,
         'source_change' = 2,
@@ -553,6 +706,7 @@ CREATE TABLE IF NOT EXISTS clicksync.peer_observations
     peer_host String,
     peer_address String,
     operator_label String,
+    operator_key String MATERIALIZED lowerUTF8(trim(operator_label)),
     n2n_version UInt16,
     network_magic UInt32,
     observed_tip_slot UInt64,
@@ -562,7 +716,24 @@ CREATE TABLE IF NOT EXISTS clicksync.peer_observations
     checkpoint_hash Nullable(FixedString(32)),
     checkpoint_block_number Nullable(UInt64),
     checkpoint_is_byron_ebb Nullable(Bool),
-    agreement_group Nullable(UUID),
+    check_id UUID,
+    agreement_group UUID,
+    check_attempt UInt32,
+    evidence_ordinal UInt32,
+    proof_method Enum8(
+        'none' = 1,
+        'chain_sync_singleton' = 2,
+        'boundary_singleton_block_fetch' = 3,
+        'follow_block_fetch' = 4,
+        'paired_chain_sync_singleton' = 5
+    ),
+    corroboration_required UInt16,
+    checked_event_seq UInt64,
+    checked_point_origin Bool,
+    checked_point_slot Nullable(UInt64),
+    checked_point_hash Nullable(FixedString(32)),
+    checked_point_block_number Nullable(UInt64),
+    checked_point_is_byron_ebb Bool,
     selected_body_source Bool,
     body_hash_verified Bool,
     point_verified Bool,
@@ -570,14 +741,106 @@ CREATE TABLE IF NOT EXISTS clicksync.peer_observations
     result Enum8('agreed' = 1, 'disagreed' = 2, 'unavailable' = 3, 'quarantined' = 4),
     reason String,
     observed_at DateTime64(6, 'UTC'),
+    PROJECTION peer_observations_by_logical_id
+    (
+        SELECT check_id, observation_id, evidence_ordinal, observation_digest, _part_offset
+        ORDER BY (check_id, observation_id, evidence_ordinal)
+    ),
     CONSTRAINT peer_observations_checkpoint CHECK
         (isNull(checkpoint_slot) AND isNull(checkpoint_hash) AND isNull(checkpoint_block_number) AND isNull(checkpoint_is_byron_ebb))
         OR
-        (isNotNull(checkpoint_slot) AND isNotNull(checkpoint_hash) AND isNotNull(checkpoint_block_number) AND isNotNull(checkpoint_is_byron_ebb))
+        (isNotNull(checkpoint_slot) AND isNotNull(checkpoint_hash) AND isNotNull(checkpoint_block_number) AND isNotNull(checkpoint_is_byron_ebb)),
+    CONSTRAINT peer_observations_check_identity CHECK
+        check_id != toUUID('00000000-0000-0000-0000-000000000000')
+        AND agreement_group != toUUID('00000000-0000-0000-0000-000000000000')
+        AND check_attempt > 0
+        AND corroboration_required >= 2
+        AND operator_key != ''
+        AND multiIf(
+            observation_kind = 'source_change', evidence_ordinal = 0,
+            evidence_ordinal > 0
+        )
+        AND multiIf(
+            observation_kind = 'source_change',
+                proof_method = 'none'
+                AND result IN ('unavailable', 'quarantined'),
+            observation_kind = 'checkpoint',
+                multiIf(
+                    proof_method = 'chain_sync_singleton', true,
+                    proof_method = 'boundary_singleton_block_fetch',
+                        result = 'agreed' AND body_hash_verified,
+                    proof_method = 'follow_block_fetch',
+                        result = 'agreed'
+                        AND selected_body_source
+                        AND body_hash_verified,
+                    false
+                ),
+            observation_kind = 'disagreement',
+                proof_method = 'chain_sync_singleton'
+                AND result != 'agreed',
+            observation_kind = 'rollback',
+                multiIf(
+                    proof_method = 'paired_chain_sync_singleton', true,
+                    proof_method = 'follow_block_fetch',
+                        result = 'agreed'
+                        AND selected_body_source
+                        AND body_hash_verified,
+                    false
+                ),
+            false
+        ),
+    CONSTRAINT peer_observations_proof_flags CHECK
+        multiIf(
+            proof_method = 'none',
+                NOT selected_body_source
+                AND NOT body_hash_verified
+                AND NOT point_verified
+                AND NOT parent_verified,
+            proof_method IN ('chain_sync_singleton', 'paired_chain_sync_singleton'),
+                multiIf(
+                    result = 'agreed',
+                        NOT selected_body_source
+                        AND NOT body_hash_verified
+                        AND point_verified
+                        AND NOT parent_verified,
+                    NOT selected_body_source
+                    AND NOT body_hash_verified
+                    AND NOT point_verified
+                    AND NOT parent_verified
+                ),
+            proof_method = 'boundary_singleton_block_fetch',
+                result = 'agreed'
+                AND body_hash_verified
+                AND point_verified
+                AND NOT parent_verified,
+            proof_method = 'follow_block_fetch',
+                result = 'agreed'
+                AND selected_body_source
+                AND body_hash_verified
+                AND point_verified
+                AND NOT parent_verified,
+            false
+        )
+        AND NOT (observation_kind = 'disagreement' AND result = 'agreed'),
+    CONSTRAINT peer_observations_checked_point CHECK
+        (
+            checked_point_origin
+            AND isNull(checked_point_slot)
+            AND isNull(checked_point_hash)
+            AND isNull(checked_point_block_number)
+            AND NOT checked_point_is_byron_ebb
+        )
+        OR
+        (
+            NOT checked_point_origin
+            AND isNotNull(checked_point_slot)
+            AND isNotNull(checked_point_hash)
+            AND isNotNull(checked_point_block_number)
+        )
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(observed_at)
-ORDER BY (observed_tip_hash, observed_at, peer_host, observation_id);
+ORDER BY (check_id, evidence_ordinal, observation_id);
 
 CREATE TABLE IF NOT EXISTS clicksync.writer_audit
 (

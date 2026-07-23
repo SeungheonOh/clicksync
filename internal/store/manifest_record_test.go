@@ -1,6 +1,8 @@
 package store
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -8,6 +10,69 @@ import (
 	"clicksync/internal/publication"
 	"clicksync/migrations"
 )
+
+func TestStableAuthoritativeLoaderRetriesTornRevisionAndDigest(t *testing.T) {
+	first := manifestRecord{Revision: 10, RowDigest: manifestHash(0x10)}
+	second := manifestRecord{Revision: 11, RowDigest: manifestHash(0x11)}
+	corrupt := errors.New("transient validation mismatch")
+	sequence := []manifestRecord{first, second, second, second}
+	loadCalls := 0
+	record, found, err := loadStableAuthoritativeManifest(
+		context.Background(),
+		func(context.Context) (manifestRecord, bool, error) {
+			if loadCalls >= len(sequence) {
+				t.Fatal("authoritative loader exceeded deterministic retry sequence")
+			}
+			value := sequence[loadCalls]
+			loadCalls++
+			return value, true, nil
+		},
+		func(_ context.Context, value manifestRecord) error {
+			if value.Revision == first.Revision {
+				return corrupt
+			}
+			return nil
+		},
+	)
+	if err != nil || !found || record != second || loadCalls != 4 {
+		t.Fatalf("record=%+v found=%t calls=%d err=%v", record, found, loadCalls, err)
+	}
+
+	sameRevisionNewDigest := second
+	sameRevisionNewDigest.RowDigest = manifestHash(0x12)
+	sequence = []manifestRecord{
+		second,
+		sameRevisionNewDigest,
+		sameRevisionNewDigest,
+		sameRevisionNewDigest,
+	}
+	loadCalls = 0
+	record, found, err = loadStableAuthoritativeManifest(
+		context.Background(),
+		func(context.Context) (manifestRecord, bool, error) {
+			value := sequence[loadCalls]
+			loadCalls++
+			return value, true, nil
+		},
+		func(context.Context, manifestRecord) error { return nil },
+	)
+	if err != nil || !found || record != sameRevisionNewDigest || loadCalls != 4 {
+		t.Fatalf("digest retry record=%+v found=%t calls=%d err=%v", record, found, loadCalls, err)
+	}
+
+	loadCalls = 0
+	_, _, err = loadStableAuthoritativeManifest(
+		context.Background(),
+		func(context.Context) (manifestRecord, bool, error) {
+			loadCalls++
+			return first, true, nil
+		},
+		func(context.Context, manifestRecord) error { return corrupt },
+	)
+	if !errors.Is(err, corrupt) || loadCalls != 2 {
+		t.Fatalf("stable corruption calls=%d err=%v", loadCalls, err)
+	}
+}
 
 func TestValidateBoundedManifestRows(t *testing.T) {
 	first := validManifestRecord(t)
@@ -122,6 +187,39 @@ func TestValidateBoundedManifestRowsFreshAndInitialHistory(t *testing.T) {
 func TestApplyPhysicalManifestUpdateCountsRemoteBlocksNotEventSpace(t *testing.T) {
 	record := validManifestRecord(t)
 	record.VisibilityGeneration = 7
+	orphan := record
+	orphan.TrustStatus = "unavailable"
+	orphan.TrustReason = "bootstrap threshold unavailable"
+	orphan.LastAgreed = nil
+	orphan.LastAgreedAt = nil
+	orphan.LastAgreedEvidence = nil
+	orphan.Servable = false
+	orphan.Effective = orphan.ServableFloor
+	if err := finalizeManifestRecord(&orphan); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyManifestRecord(orphan); err != nil {
+		t.Fatalf("pre-anchor bootstrap fixture is invalid: %v", err)
+	}
+	orphanBefore := orphan
+	if err := applyPhysicalManifestUpdate(
+		&orphan,
+		publication.ManifestUpdate{
+			EventSeq:    50,
+			Tip:         manifestTestPoint(101),
+			Kind:        publication.ManifestAdoption,
+			WriterID:    manifestID(0x70),
+			WriterBuild: "orphan-adoption",
+		},
+		1,
+		false,
+	); err == nil {
+		t.Fatal("remote physical advance without a sampled/genesis anchor was accepted")
+	}
+	if orphan != orphanBefore {
+		t.Fatal("rejected pre-anchor remote advance mutated the manifest")
+	}
+
 	update := publication.ManifestUpdate{
 		EventSeq:        50, // reserved event gaps are intentionally irrelevant
 		Tip:             manifestTestPoint(101),
@@ -141,6 +239,31 @@ func TestApplyPhysicalManifestUpdateCountsRemoteBlocksNotEventSpace(t *testing.T
 	}
 	if record.Physical.EventSeq != 50 || record.Effective != record.Physical {
 		t.Fatalf("ordinary physical/effective heads = %+v / %+v", record.Physical, record.Effective)
+	}
+	if record.TrustBasis != "primary_only" ||
+		record.LastAgreed == nil ||
+		record.LastAgreedEvidence == nil ||
+		record.LastAgreed.EventSeq != 0 {
+		t.Fatalf("primary-only suffix lost its sampled anchor: %+v", record)
+	}
+	if err := finalizeManifestRecord(&record); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyManifestRecord(record); err != nil {
+		t.Fatalf("primary-only physical suffix was rejected: %v", err)
+	}
+
+	unavailable := validManifestRecord(t)
+	unavailable.TrustStatus = "unavailable"
+	unavailable.TrustReason = "peer checks temporarily unavailable"
+	if err := applyPhysicalManifestUpdate(&unavailable, update, 1, false); err != nil {
+		t.Fatalf("remote advance with sampled evidence anchor was rejected: %v", err)
+	}
+	if err := finalizeManifestRecord(&unavailable); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyManifestRecord(unavailable); err != nil {
+		t.Fatalf("unavailable primary-only state with sampled anchor was rejected: %v", err)
 	}
 
 	genesis := validManifestRecord(t)
@@ -225,8 +348,98 @@ func TestApplyPhysicalManifestUpdateCountsRemoteBlocksNotEventSpace(t *testing.T
 	}
 }
 
+func TestOfficialGenesisPermanentFloorUsesPhysicalSyntheticEvent(t *testing.T) {
+	record := validManifestRecord(t)
+	at := record.UpdatedAt.Add(time.Second)
+	physicalGenesis := manifestHead{
+		EventSeq: 1,
+		Point:    publication.Point{Origin: true},
+	}
+	record.Start = publication.Point{Origin: true}
+	record.GenesisSeeded = true
+	record.CompleteHistory = true
+	record.TrustStatus = "agreed"
+	record.TrustBasis = "official_genesis"
+	record.CheckID = nil
+	record.AgreementGroup = nil
+	record.CheckAttempt = 0
+	record.CorroborationRequired = 0
+	record.CorroborationConfirmed = 0
+	record.TrustReason = "official genesis distribution verified exactly"
+	record.CheckStartedAt = nil
+	record.CheckCompletedAt = nil
+	record.EvidenceState = "none"
+	record.EvidenceCount = 0
+	record.EvidenceDigest = nil
+	record.PendingEvidenceWrite = nil
+	record.Checked = nil
+	record.LastAgreed = &physicalGenesis
+	record.LastAgreedAt = &at
+	record.LastAgreedEvidence = nil
+	record.ServableFloor = physicalGenesis
+	record.ServableFloorPermanent = true
+	record.Physical = physicalGenesis
+	record.Effective = physicalGenesis
+	record.Servable = true
+	record.PrimarySuffix = 0
+	record.UpdatedAt = at
+	if err := finalizeManifestRecord(&record); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyManifestRecord(record); err != nil {
+		t.Fatalf("physical synthetic genesis floor was rejected: %v", err)
+	}
+
+	genesisSuffix := record
+	if err := applyPhysicalManifestUpdate(
+		&genesisSuffix,
+		publication.ManifestUpdate{
+			EventSeq:    2,
+			Tip:         manifestTestPoint(1),
+			Kind:        publication.ManifestAdoption,
+			WriterID:    manifestID(0x44),
+			WriterBuild: "genesis-suffix",
+		},
+		1,
+		false,
+	); err != nil {
+		t.Fatalf("remote advance with permanent genesis anchor was rejected: %v", err)
+	}
+	if err := finalizeManifestRecord(&genesisSuffix); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyManifestRecord(genesisSuffix); err != nil {
+		t.Fatalf("primary-only state with permanent genesis anchor was rejected: %v", err)
+	}
+
+	eventZeroFloor := record
+	eventZeroFloor.ServableFloor.EventSeq = 0
+	if err := finalizeManifestRecord(&eventZeroFloor); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyManifestRecord(eventZeroFloor); err == nil {
+		t.Fatal("event-zero genesis floor was accepted after physical synthetic genesis")
+	}
+}
+
 func TestManifestTrustStateInvariants(t *testing.T) {
 	record := validManifestRecord(t)
+	record.TrustStatus = "unavailable"
+	record.TrustBasis = "primary_only"
+	record.PrimarySuffix = 1
+	record.LastAgreed = nil
+	record.LastAgreedAt = nil
+	record.LastAgreedEvidence = nil
+	record.Servable = false
+	record.Effective = record.ServableFloor
+	if err := finalizeManifestRecord(&record); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyManifestRecord(record); err == nil {
+		t.Fatal("unavailable primary-only state without an authority anchor was accepted")
+	}
+
+	record = validManifestRecord(t)
 	record.TrustStatus = "checking"
 	if err := finalizeManifestRecord(&record); err != nil {
 		t.Fatal(err)
@@ -310,6 +523,7 @@ func validManifestRecord(t *testing.T) manifestRecord {
 	writer := manifestID(0x33)
 	checkID := manifestID(0x31)
 	groupID := manifestID(0x32)
+	evidenceDigest := manifestHash(0x34)
 	started := at.Add(-time.Second)
 	record := manifestRecord{
 		ManifestKey:            manifestKey,
@@ -336,9 +550,22 @@ func validManifestRecord(t *testing.T) manifestRecord {
 		TrustReason:            "bootstrap boundary agreed",
 		CheckStartedAt:         &started,
 		CheckCompletedAt:       &at,
+		EvidenceState:          "frozen",
+		EvidenceCount:          2,
+		EvidenceDigest:         &evidenceDigest,
 		Checked:                &boundary,
 		LastAgreed:             &boundary,
 		LastAgreedAt:           &at,
+		LastAgreedEvidence: &manifestEvidenceReference{
+			CheckID:   checkID,
+			Group:     groupID,
+			Attempt:   1,
+			Required:  2,
+			Confirmed: 2,
+			Checked:   boundary,
+			Count:     2,
+			Digest:    evidenceDigest,
+		},
 		ServableFloor:          boundary,
 		ServableFloorPermanent: false,
 		Physical:               boundary,

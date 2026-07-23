@@ -2,10 +2,10 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/google/uuid"
@@ -178,6 +178,7 @@ func (d *DB) InitializeManifest(
 		TrustMode:              "peer_observed_structurally_verified",
 		TrustStatus:            trustStatus,
 		TrustBasis:             trustBasis,
+		EvidenceState:          "none",
 		CheckpointInterval:     manifestCheckpointBlocks,
 		TrustReason:            trustReason,
 		ServableFloor:          manifestHead{Point: seed.Start},
@@ -265,6 +266,53 @@ func (d *DB) LoadOrCreateManifest(
 	if reconciledAt.IsZero() {
 		reconciledAt = time.Now().UTC()
 	}
+	if err := d.RecoverPendingEvidenceWrite(
+		ctx,
+		lock,
+		seed.WriterID,
+		seed.WriterBuild,
+	); err != nil {
+		return ManifestIdentity{}, fmt.Errorf(
+			"recover pending evidence write before rollback/reconciliation: %w",
+			err,
+		)
+	}
+	latest, found, err := d.loadLatestManifestRecord(ctx)
+	if err != nil {
+		return ManifestIdentity{}, err
+	}
+	if !found {
+		return ManifestIdentity{}, errors.New("dataset manifest disappeared during startup")
+	}
+	if err := d.validateManifestEvidenceCommitment(ctx, latest); err != nil {
+		return ManifestIdentity{}, fmt.Errorf(
+			"validate durable evidence commitment before rollback recovery: %w",
+			err,
+		)
+	}
+	if err := d.RecoverPendingRollback(
+		ctx,
+		lock,
+		seed.WriterBuild,
+	); err != nil {
+		return ManifestIdentity{}, fmt.Errorf(
+			"recover pending rollback before ordinary reconciliation: %w",
+			err,
+		)
+	}
+	latest, found, err = d.loadLatestManifestRecord(ctx)
+	if err != nil {
+		return ManifestIdentity{}, err
+	}
+	if !found {
+		return ManifestIdentity{}, errors.New("dataset manifest disappeared after rollback recovery")
+	}
+	if err := d.validateManifestEvidenceCommitment(ctx, latest); err != nil {
+		return ManifestIdentity{}, fmt.Errorf(
+			"validate durable evidence commitment after rollback recovery: %w",
+			err,
+		)
+	}
 	if err := d.ReconcileManifest(
 		ctx,
 		lock,
@@ -326,14 +374,14 @@ func manifestStartMatches(
 }
 
 func (d *DB) LoadManifestIdentity(ctx context.Context) (ManifestIdentity, error) {
-	identity, found, err := d.LoadManifestIdentityIfExists(ctx)
+	record, found, err := d.loadAuthoritativeManifest(ctx)
 	if err != nil {
 		return ManifestIdentity{}, err
 	}
 	if !found {
 		return ManifestIdentity{}, errors.New("dataset manifest is not initialized")
 	}
-	return identity, nil
+	return manifestIdentityFromRecord(record), nil
 }
 
 // LoadManifestIdentityIfExists is the bootstrap-safe identity read. A fresh
@@ -665,7 +713,7 @@ GROUP BY publication_id`
 				!latest.Servable ||
 				!latest.ServableFloorPermanent ||
 				!latest.ServableFloor.Point.Origin ||
-				latest.ServableFloor.EventSeq != 0 ||
+				latest.ServableFloor != latest.Physical ||
 				latest.Effective != latest.Physical {
 				return false, errors.New(
 					"genesis-seeded manifest carries conflicting trust/visibility state",
@@ -690,12 +738,17 @@ GROUP BY publication_id`
 			next.TrustReason = "official genesis distribution verified exactly"
 			next.CheckStartedAt = nil
 			next.CheckCompletedAt = nil
+			next.EvidenceState = "none"
+			next.EvidenceCount = 0
+			next.EvidenceDigest = nil
+			next.PendingEvidenceWrite = nil
 			next.Checked = nil
 			agreed := next.Physical
 			next.LastAgreed = &agreed
 			agreedAt := manifestTime(now)
 			next.LastAgreedAt = &agreedAt
-			next.ServableFloor = manifestHead{Point: publication.Point{Origin: true}}
+			next.LastAgreedEvidence = nil
+			next.ServableFloor = next.Physical
 			next.ServableFloorPermanent = true
 			if next.Effective != next.Physical || !next.Servable {
 				next.VisibilityGeneration++
@@ -905,6 +958,11 @@ func (d *DB) PersistManifest(
 				if err != nil {
 					return err
 				}
+				if visibilityDiscontinuity {
+					return errors.New(
+						"ordinary manifest reconciliation cannot adopt a rollback header",
+					)
+				}
 			}
 			if err := applyPhysicalManifestUpdate(
 				next,
@@ -949,6 +1007,19 @@ func applyPhysicalManifestUpdate(
 	remoteAdoptions uint64,
 	visibilityDiscontinuity bool,
 ) error {
+	if remoteAdoptions > 0 {
+		sampledAnchor := next.LastAgreed != nil &&
+			next.LastAgreedEvidence != nil
+		genesisAnchor := next.LastAgreed != nil &&
+			next.ServableFloorPermanent &&
+			next.GenesisSeeded &&
+			next.ServableFloor.Point.Origin
+		if !sampledAnchor && !genesisAnchor {
+			return errors.New(
+				"remote physical advance requires a sampled or verified genesis anchor",
+			)
+		}
+	}
 	previous := next.Physical
 	next.Physical = manifestHead{EventSeq: update.EventSeq, Point: update.Tip}
 
@@ -968,6 +1039,10 @@ func applyPhysicalManifestUpdate(
 		)
 	}
 	next.PrimarySuffix += remoteAdoptions
+	if remoteAdoptions > 0 &&
+		(next.TrustStatus == "agreed" || next.TrustStatus == "unavailable") {
+		next.TrustBasis = "primary_only"
+	}
 
 	switch next.TrustStatus {
 	case "agreed":
@@ -995,18 +1070,11 @@ func applyPhysicalManifestUpdate(
 }
 
 func (d *DB) rawEventIsRollback(ctx context.Context, eventSeq uint64) (bool, error) {
-	var count uint64
-	if err := d.conn.QueryRow(
-		ctx,
-		`SELECT count() FROM clicksync.rollbacks WHERE event_seq = ?`,
-		eventSeq,
-	).Scan(&count); err != nil {
+	_, found, err := d.committedRollbackPoint(ctx, eventSeq)
+	if err != nil {
 		return false, fmt.Errorf("classify raw manifest reconciliation event: %w", err)
 	}
-	if count > 1 {
-		return false, errors.New("raw rollback event has duplicate physical headers")
-	}
-	return count == 1, nil
+	return found, nil
 }
 
 func manifestPointBefore(left, right publication.Point) bool {
@@ -1031,19 +1099,75 @@ func (d *DB) remoteAdoptionsBetween(
 		return 0, nil
 	}
 	const query = `
-SELECT uniqExact(tuple(events.event_seq, events.publication_id))
-FROM clicksync.chain_events AS events
-INNER JOIN clicksync.blocks AS blocks
-    ON blocks.publication_id = events.publication_id
-WHERE events.event_kind = 'adoption'
-  AND events.event_seq > ?
-  AND events.event_seq <= ?
-  AND NOT blocks.synthetic`
-	var count uint64
-	if err := d.conn.QueryRow(ctx, query, afterEvent, throughEvent).Scan(&count); err != nil {
-		return 0, fmt.Errorf("count remote adoptions for manifest reconciliation: %w", err)
+SELECT event_seq
+FROM clicksync.chain_events
+PREWHERE event_kind = 'adoption'
+  AND event_seq > ?
+  AND event_seq <= ?
+ORDER BY event_kind, event_seq, publication_id
+LIMIT ?`
+	const readLimit = manifestMaximumSuffix*manifestDuplicateLimit + 1
+	rows, err := d.conn.Query(ctx, query, afterEvent, throughEvent, readLimit)
+	if err != nil {
+		return 0, fmt.Errorf("read remote adoptions for manifest reconciliation: %w", err)
 	}
-	return count, nil
+	defer rows.Close()
+	eventCounts := make(map[uint64]uint8)
+	events := make([]uint64, 0, manifestMaximumSuffix)
+	rowCount := uint64(0)
+	for rows.Next() {
+		rowCount++
+		if rowCount == readLimit {
+			return 0, fmt.Errorf(
+				"reconciliation interval exceeds %d bounded adoption-header rows",
+				readLimit-1,
+			)
+		}
+		var eventSeq uint64
+		if err := rows.Scan(&eventSeq); err != nil {
+			return 0, fmt.Errorf("scan reconciliation adoption event: %w", err)
+		}
+		if eventCounts[eventSeq] == manifestDuplicateLimit {
+			return 0, fmt.Errorf(
+				"adoption event %d has at least nine physical headers",
+				eventSeq,
+			)
+		}
+		if eventCounts[eventSeq] == 0 {
+			if len(events) == int(manifestMaximumSuffix) {
+				return 0, fmt.Errorf(
+					"reconciliation interval exceeds %d adoption events",
+					manifestMaximumSuffix,
+				)
+			}
+			events = append(events, eventSeq)
+		}
+		eventCounts[eventSeq]++
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterate reconciliation adoption events: %w", err)
+	}
+	var remote uint64
+	for _, eventSeq := range events {
+		header, found, err := d.committedAdoptionHeader(ctx, eventSeq)
+		if err != nil {
+			return 0, err
+		}
+		if !found {
+			return 0, fmt.Errorf(
+				"reconciliation adoption event %d disappeared during exact validation",
+				eventSeq,
+			)
+		}
+		synthetic, err := d.validateAdoptedBlockIdentity(ctx, header)
+		if err != nil {
+			return 0, err
+		}
+		if !synthetic {
+			remote++
+		}
+	}
+	return remote, nil
 }
 
 func (d *DB) ReconcileManifest(
@@ -1053,6 +1177,27 @@ func (d *DB) ReconcileManifest(
 	writerBuild string,
 	now time.Time,
 ) error {
+	latest, found, err := d.loadLatestManifestRecord(ctx)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return errors.New("dataset manifest is not initialized")
+	}
+	if latest.PendingRollback != nil {
+		return errors.New(
+			"ordinary reconciliation cannot bypass specialized pending rollback recovery",
+		)
+	}
+	if err := d.rejectUnreservedRollbackArtifactsAfter(
+		ctx,
+		latest.Physical.EventSeq,
+	); err != nil {
+		return err
+	}
+	if err := d.validateCurrentPhysicalRollbackArtifacts(ctx, latest); err != nil {
+		return err
+	}
 	snapshot, err := d.RawCommittedSnapshot(ctx)
 	if err != nil {
 		return err
@@ -1082,105 +1227,379 @@ func (d *DB) committedTip(ctx context.Context, snapshot uint64) (publication.Poi
 	if snapshot == 0 {
 		return d.manifestStartPoint(ctx)
 	}
-	const rollbackQuery = `
-SELECT
-    any(rollback_to_origin),
-    any(rollback_to_slot),
-    any(rollback_to_hash),
-    any(rollback_to_block_number),
-    any(rollback_to_is_byron_ebb),
-    uniqExact(tuple(
-        rollback_to_origin,
-        rollback_to_slot,
-        rollback_to_hash,
-        rollback_to_block_number,
-        rollback_to_is_byron_ebb
-    ))
-FROM clicksync.rollbacks
-WHERE event_seq = ?
-HAVING count() > 0`
-	var (
-		origin     bool
-		slot       *uint64
-		hashBytes  []byte
-		number     *uint64
-		isByronEBB bool
-		variants   uint64
-	)
-	err := d.conn.QueryRow(ctx, rollbackQuery, snapshot).
-		Scan(&origin, &slot, &hashBytes, &number, &isByronEBB, &variants)
-	if err == nil {
-		if variants != 1 {
-			return publication.Point{}, errors.New("committed rollback header has conflicting targets")
-		}
-		if origin {
-			return publication.Point{Origin: true}, nil
-		}
-		if slot == nil || number == nil {
-			return publication.Point{}, errors.New("committed rollback target is incomplete")
-		}
-		hash, err := hash32(hashBytes)
-		if err != nil {
-			return publication.Point{}, err
-		}
-		return publication.Point{
-			Slot:        *slot,
-			Hash:        hash,
-			BlockNumber: *number,
-			IsByronEBB:  isByronEBB,
-		}, nil
+	rollbackPoint, rollbackFound, err := d.committedRollbackPoint(ctx, snapshot)
+	if err != nil {
+		return publication.Point{}, err
 	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return publication.Point{}, fmt.Errorf("read rollback commit tip: %w", err)
+	adoption, adoptionFound, err := d.committedAdoptionHeader(ctx, snapshot)
+	if err != nil {
+		return publication.Point{}, err
 	}
-	const adoptionQuery = `
-SELECT
-    any(publication_id),
-    any(slot),
-    any(block_hash),
-    any(block_number),
-    any(is_byron_ebb),
-    uniqExact(tuple(publication_id, slot, block_hash, block_number, is_byron_ebb))
-FROM clicksync.chain_events
-WHERE event_seq = ?
-  AND event_kind = 'adoption'
-HAVING count() > 0`
-	var publicationID, blockNumber uint64
-	if err := d.conn.QueryRow(ctx, adoptionQuery, snapshot).
-		Scan(
-			&publicationID,
-			&slot,
-			&hashBytes,
-			&blockNumber,
-			&isByronEBB,
-			&variants,
-		); err != nil {
-		return publication.Point{}, fmt.Errorf("read adoption commit tip: %w", err)
+	if rollbackFound && adoptionFound {
+		return publication.Point{}, errors.New(
+			"committed event has both rollback and adoption physical headers",
+		)
 	}
-	if variants != 1 || slot == nil {
-		return publication.Point{}, errors.New("committed adoption header is conflicting")
+	if rollbackFound {
+		return rollbackPoint, nil
 	}
-	var synthetic bool
-	if err := d.conn.QueryRow(
-		ctx,
-		`SELECT synthetic FROM clicksync.blocks WHERE publication_id = ? LIMIT 1`,
-		publicationID,
-	).Scan(&synthetic); err != nil {
-		return publication.Point{}, fmt.Errorf("read adopted block type: %w", err)
+	if !adoptionFound {
+		return publication.Point{}, fmt.Errorf(
+			"committed event %d has no adoption or rollback physical header",
+			snapshot,
+		)
+	}
+	synthetic, err := d.validateAdoptedBlockIdentity(ctx, adoption)
+	if err != nil {
+		return publication.Point{}, err
 	}
 	if synthetic {
 		return d.manifestStartPoint(ctx)
 	}
-	hash, err := hash32(hashBytes)
+	return publication.Point{
+		Slot:        adoption.Slot,
+		Hash:        adoption.Hash,
+		BlockNumber: adoption.BlockNumber,
+		IsByronEBB:  adoption.IsByronEBB,
+	}, nil
+}
+
+const physicalHeaderReadLimit = uint64(9)
+
+type rollbackPhysicalHeader struct {
+	RollbackID            uuid.UUID
+	EventSeq              uint64
+	ToOrigin              bool
+	ToSlot                *uint64
+	ToHash                []byte
+	ToBlockNumber         *uint64
+	ToIsByronEBB          bool
+	OldTipSlot            *uint64
+	OldTipHash            []byte
+	OldTipBlockNumber     *uint64
+	OldTipIsByronEBB      bool
+	OldTipEventSeq        uint64
+	Depth                 uint32
+	Reason                string
+	ObservedPeers         []string
+	ObservedOperators     []string
+	CorroborationRequired uint16
+	CheckID               uuid.UUID
+	AgreementGroup        *uuid.UUID
+	CheckAttempt          uint32
+	CheckedEventSeq       uint64
+	EvidenceCount         uint32
+	EvidenceDigest        []byte
+	WriterID              uuid.UUID
+	RecordedAt            time.Time
+}
+
+func sameRollbackPhysicalHeader(
+	left rollbackPhysicalHeader,
+	right rollbackPhysicalHeader,
+) bool {
+	if !left.RecordedAt.Equal(right.RecordedAt) {
+		return false
+	}
+	left.RecordedAt = time.Time{}
+	right.RecordedAt = time.Time{}
+	return reflect.DeepEqual(left, right)
+}
+
+func (d *DB) committedRollbackPoint(
+	ctx context.Context,
+	snapshot uint64,
+) (publication.Point, bool, error) {
+	const rollbackQuery = `
+SELECT
+    rollback_id, event_seq,
+    rollback_to_origin, rollback_to_slot, rollback_to_hash,
+    rollback_to_block_number, rollback_to_is_byron_ebb,
+    old_tip_slot, old_tip_hash, old_tip_block_number, old_tip_is_byron_ebb,
+    old_tip_event_seq, depth, reason, observed_peers, observed_operators,
+    corroboration_required, check_id, agreement_group, check_attempt,
+    checked_event_seq, evidence_count, evidence_digest, writer_id, recorded_at
+FROM clicksync.rollbacks
+PREWHERE event_seq = ?
+ORDER BY event_seq, rollback_id
+LIMIT 9`
+	rows, err := d.conn.Query(ctx, rollbackQuery, snapshot)
 	if err != nil {
-		return publication.Point{}, err
+		return publication.Point{}, false, fmt.Errorf("read rollback commit tip: %w", err)
+	}
+	defer rows.Close()
+	var first *rollbackPhysicalHeader
+	rowCount := uint64(0)
+	for rows.Next() {
+		rowCount++
+		if rowCount == physicalHeaderReadLimit {
+			return publication.Point{}, false, errors.New(
+				"committed rollback physical header has at least nine rows",
+			)
+		}
+		var row rollbackPhysicalHeader
+		if err := rows.Scan(
+			&row.RollbackID,
+			&row.EventSeq,
+			&row.ToOrigin,
+			&row.ToSlot,
+			&row.ToHash,
+			&row.ToBlockNumber,
+			&row.ToIsByronEBB,
+			&row.OldTipSlot,
+			&row.OldTipHash,
+			&row.OldTipBlockNumber,
+			&row.OldTipIsByronEBB,
+			&row.OldTipEventSeq,
+			&row.Depth,
+			&row.Reason,
+			&row.ObservedPeers,
+			&row.ObservedOperators,
+			&row.CorroborationRequired,
+			&row.CheckID,
+			&row.AgreementGroup,
+			&row.CheckAttempt,
+			&row.CheckedEventSeq,
+			&row.EvidenceCount,
+			&row.EvidenceDigest,
+			&row.WriterID,
+			&row.RecordedAt,
+		); err != nil {
+			return publication.Point{}, false, fmt.Errorf(
+				"scan rollback physical header: %w",
+				err,
+			)
+		}
+		if row.EventSeq != snapshot {
+			return publication.Point{}, false, errors.New(
+				"rollback physical header event differs from requested snapshot",
+			)
+		}
+		if first == nil {
+			copy := row
+			first = &copy
+		} else if !sameRollbackPhysicalHeader(*first, row) {
+			return publication.Point{}, false, errors.New(
+				"committed rollback physical headers conflict",
+			)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return publication.Point{}, false, fmt.Errorf(
+			"iterate rollback physical headers: %w",
+			err,
+		)
+	}
+	if first == nil {
+		return publication.Point{}, false, nil
+	}
+	if first.EvidenceCount < uint32(first.CorroborationRequired) ||
+		len(first.EvidenceDigest) != len(model.Hash32{}) {
+		return publication.Point{}, false, errors.New(
+			"committed rollback header lacks its frozen evidence commitment",
+		)
+	}
+	if first.ToOrigin {
+		if first.ToSlot != nil ||
+			len(first.ToHash) != 0 ||
+			first.ToBlockNumber != nil ||
+			first.ToIsByronEBB {
+			return publication.Point{}, false, errors.New(
+				"committed Origin rollback target has invalid shape",
+			)
+		}
+		return publication.Point{Origin: true}, true, nil
+	}
+	if first.ToSlot == nil || first.ToBlockNumber == nil {
+		return publication.Point{}, false, errors.New(
+			"committed rollback target is incomplete",
+		)
+	}
+	hash, err := hash32(first.ToHash)
+	if err != nil {
+		return publication.Point{}, false, err
 	}
 	return publication.Point{
-		Slot:        *slot,
+		Slot:        *first.ToSlot,
 		Hash:        hash,
-		BlockNumber: blockNumber,
-		IsByronEBB:  isByronEBB,
-	}, nil
+		BlockNumber: *first.ToBlockNumber,
+		IsByronEBB:  first.ToIsByronEBB,
+	}, true, nil
+}
+
+type adoptionPhysicalHeader struct {
+	EventSeq    uint64
+	Publication uint64
+	Active      bool
+	RollbackID  *uuid.UUID
+	Hash        model.Hash32
+	Slot        uint64
+	BlockNumber uint64
+	IsByronEBB  bool
+	WriterID    uuid.UUID
+	RecordedAt  time.Time
+}
+
+func sameAdoptionPhysicalHeader(
+	left adoptionPhysicalHeader,
+	right adoptionPhysicalHeader,
+) bool {
+	if !left.RecordedAt.Equal(right.RecordedAt) {
+		return false
+	}
+	left.RecordedAt = time.Time{}
+	right.RecordedAt = time.Time{}
+	return reflect.DeepEqual(left, right)
+}
+
+func (d *DB) committedAdoptionHeader(
+	ctx context.Context,
+	snapshot uint64,
+) (adoptionPhysicalHeader, bool, error) {
+	const adoptionQuery = `
+SELECT
+    event_seq, publication_id, active, rollback_id, block_hash, slot,
+    block_number, is_byron_ebb, writer_id, recorded_at
+FROM clicksync.chain_events
+PREWHERE event_kind = 'adoption'
+  AND event_seq = ?
+ORDER BY event_kind, event_seq, publication_id
+LIMIT 9`
+	rows, err := d.conn.Query(ctx, adoptionQuery, snapshot)
+	if err != nil {
+		return adoptionPhysicalHeader{}, false, fmt.Errorf(
+			"read adoption commit tip: %w",
+			err,
+		)
+	}
+	defer rows.Close()
+	var first *adoptionPhysicalHeader
+	rowCount := uint64(0)
+	for rows.Next() {
+		rowCount++
+		if rowCount == physicalHeaderReadLimit {
+			return adoptionPhysicalHeader{}, false, errors.New(
+				"committed adoption physical header has at least nine rows",
+			)
+		}
+		var (
+			row       adoptionPhysicalHeader
+			hashBytes []byte
+		)
+		if err := rows.Scan(
+			&row.EventSeq,
+			&row.Publication,
+			&row.Active,
+			&row.RollbackID,
+			&hashBytes,
+			&row.Slot,
+			&row.BlockNumber,
+			&row.IsByronEBB,
+			&row.WriterID,
+			&row.RecordedAt,
+		); err != nil {
+			return adoptionPhysicalHeader{}, false, fmt.Errorf(
+				"scan adoption physical header: %w",
+				err,
+			)
+		}
+		row.Hash, err = hash32(hashBytes)
+		if err != nil {
+			return adoptionPhysicalHeader{}, false, err
+		}
+		if row.EventSeq != snapshot || !row.Active || row.RollbackID != nil {
+			return adoptionPhysicalHeader{}, false, errors.New(
+				"adoption physical header has invalid event kind shape",
+			)
+		}
+		if first == nil {
+			copy := row
+			first = &copy
+		} else if !sameAdoptionPhysicalHeader(*first, row) {
+			return adoptionPhysicalHeader{}, false, errors.New(
+				"committed adoption physical headers conflict",
+			)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return adoptionPhysicalHeader{}, false, fmt.Errorf(
+			"iterate adoption physical headers: %w",
+			err,
+		)
+	}
+	if first == nil {
+		return adoptionPhysicalHeader{}, false, nil
+	}
+	return *first, true, nil
+}
+
+type adoptedBlockIdentity struct {
+	Publication uint64
+	Hash        model.Hash32
+	Slot        uint64
+	BlockNumber uint64
+	Synthetic   bool
+}
+
+func (d *DB) validateAdoptedBlockIdentity(
+	ctx context.Context,
+	adoption adoptionPhysicalHeader,
+) (bool, error) {
+	const query = `
+SELECT publication_id, block_hash, slot, block_number, synthetic
+FROM clicksync.blocks
+PREWHERE publication_id = ?
+ORDER BY publication_id, block_hash
+LIMIT 9`
+	rows, err := d.conn.Query(ctx, query, adoption.Publication)
+	if err != nil {
+		return false, fmt.Errorf("read adopted block identity: %w", err)
+	}
+	defer rows.Close()
+	var first *adoptedBlockIdentity
+	rowCount := uint64(0)
+	for rows.Next() {
+		rowCount++
+		if rowCount == physicalHeaderReadLimit {
+			return false, errors.New("adopted block identity has at least nine rows")
+		}
+		var (
+			row       adoptedBlockIdentity
+			hashBytes []byte
+		)
+		if err := rows.Scan(
+			&row.Publication,
+			&hashBytes,
+			&row.Slot,
+			&row.BlockNumber,
+			&row.Synthetic,
+		); err != nil {
+			return false, fmt.Errorf("scan adopted block identity: %w", err)
+		}
+		row.Hash, err = hash32(hashBytes)
+		if err != nil {
+			return false, err
+		}
+		if first == nil {
+			copy := row
+			first = &copy
+		} else if *first != row {
+			return false, errors.New("adopted publication has conflicting block identities")
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("iterate adopted block identities: %w", err)
+	}
+	if first == nil {
+		return false, errors.New("adoption physical header has no matching block identity")
+	}
+	if first.Publication != adoption.Publication ||
+		first.Hash != adoption.Hash ||
+		first.Slot != adoption.Slot ||
+		first.BlockNumber != adoption.BlockNumber {
+		return false, errors.New("adoption physical header differs from its exact block identity")
+	}
+	return first.Synthetic, nil
 }
 
 func (d *DB) manifestStartPoint(ctx context.Context) (publication.Point, error) {

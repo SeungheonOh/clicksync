@@ -59,15 +59,11 @@ func validateBlock(block model.Block) error {
 
 func validateSource(
 	source Source,
-	observations []model.PeerObservation,
 	synthetic bool,
 ) error {
 	if synthetic {
 		if source != OfficialMainnetGenesisSource() {
 			return errors.New("synthetic block source is not the pinned official mainnet genesis")
-		}
-		if len(observations) != 0 {
-			return errors.New("official genesis publication cannot carry peer observations")
 		}
 		return nil
 	}
@@ -79,52 +75,6 @@ func validateSource(
 	}
 	if source.NetworkMagic != 764824073 {
 		return fmt.Errorf("selected source network magic %d is not pinned mainnet", source.NetworkMagic)
-	}
-	for _, observation := range observations {
-		if observation.ID == ([16]byte{}) ||
-			observation.TipHash == (model.Hash32{}) ||
-			observation.ObservedAt.IsZero() {
-			return errors.New("peer observation identity, tip hash, and time are required")
-		}
-		switch observation.Kind {
-		case "checkpoint", "source_change", "rollback", "disagreement":
-		default:
-			return fmt.Errorf("unknown peer observation kind %q", observation.Kind)
-		}
-		switch observation.Result {
-		case "agreed", "disagreed", "unavailable", "quarantined":
-		default:
-			return fmt.Errorf("unknown peer observation result %q", observation.Result)
-		}
-		if observation.PeerHost == "" || observation.PeerAddress == "" || observation.Operator == "" {
-			return errors.New("peer observation provenance is incomplete")
-		}
-		if observation.NetworkMagic != source.NetworkMagic {
-			return errors.New("peer observation network magic disagrees with the selected source")
-		}
-		checkpointSet := observation.CheckpointSlot != nil ||
-			observation.CheckpointHash != nil ||
-			observation.CheckpointBlockNumber != nil ||
-			observation.CheckpointIsByronEBB != nil
-		if checkpointSet &&
-			(observation.CheckpointSlot == nil ||
-				observation.CheckpointHash == nil ||
-				observation.CheckpointBlockNumber == nil ||
-				observation.CheckpointIsByronEBB == nil) {
-			return errors.New("peer checkpoint point is partially populated")
-		}
-		if observation.N2NVersion < 7 || observation.N2NVersion > 15 {
-			return fmt.Errorf("peer observation negotiated unsupported N2N version %d", observation.N2NVersion)
-		}
-		if observation.SelectedBodySource {
-			if observation.PeerHost != source.PeerHost ||
-				observation.PeerAddress != source.PeerAddress ||
-				observation.Operator != source.Operator ||
-				observation.N2NVersion != source.N2NVersion ||
-				observation.Result != "agreed" {
-				return errors.New("selected peer observation disagrees with sampled source provenance")
-			}
-		}
 	}
 	return nil
 }

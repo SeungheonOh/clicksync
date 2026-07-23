@@ -22,6 +22,16 @@ func TestDatasetManifestIsAppendOnlyAndPKPruned(t *testing.T) {
 		"effective_event_seq UInt64",
 		"visibility_generation UInt64",
 		"pending_rollback_state Enum8",
+		"pending_rollback_check_id Nullable(UUID)",
+		"pending_rollback_check_attempt Nullable(UInt32)",
+		"pending_rollback_checked_event_seq Nullable(UInt64)",
+		"pending_rollback_evidence_count Nullable(UInt32)",
+		"pending_rollback_evidence_digest Nullable(FixedString(32))",
+		"evidence_state Enum8",
+		"evidence_count UInt32",
+		"pending_evidence_payload String",
+		"last_agreed_check_id Nullable(UUID)",
+		"last_agreed_evidence_digest Nullable(FixedString(32))",
 		"ENGINE = MergeTree",
 		"ORDER BY (manifest_key, revision)",
 		"SETTINGS index_granularity = 64",
@@ -37,6 +47,33 @@ func TestDatasetManifestIsAppendOnlyAndPKPruned(t *testing.T) {
 	} {
 		if strings.Contains(manifest, forbidden) {
 			t.Fatalf("dataset_manifest DDL retains forbidden %q", forbidden)
+		}
+	}
+}
+
+func TestTrustEvidenceAndRollbackCommitmentsAreInFreshSchema(t *testing.T) {
+	for _, required := range []string{
+		"evidence_ordinal UInt32",
+		"proof_method Enum8",
+		"peer_observations_by_logical_id",
+		"ORDER BY (check_id, evidence_ordinal, observation_id)",
+		"peer_observations_proof_flags",
+		"evidence_count UInt32",
+		"evidence_digest FixedString(32)",
+		"pending_rollback_evidence_count",
+		"pending_rollback_evidence_digest",
+	} {
+		if !strings.Contains(Initial, required) {
+			t.Fatalf("fresh schema lacks trust/rollback contract field %q", required)
+		}
+	}
+	for _, required := range []string{
+		"evidence_count",
+		"evidence_digest",
+		"unhex(repeat('22', 32))",
+	} {
+		if !strings.Contains(ContractFixture, required) {
+			t.Fatalf("contract fixture lacks rollback commitment %q", required)
 		}
 	}
 }

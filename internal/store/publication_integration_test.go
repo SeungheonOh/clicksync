@@ -13,6 +13,7 @@ import (
 	"clicksync/internal/config"
 	"clicksync/internal/model"
 	"clicksync/internal/publication"
+	"clicksync/internal/syncer"
 	"clicksync/internal/writerlock"
 )
 
@@ -297,30 +298,12 @@ func TestNativePublicationBinaryRoundTrip(t *testing.T) {
 			},
 		},
 	}
-	peerObservation := model.PeerObservation{
-		ID:               id16(0x71),
-		Kind:             "checkpoint",
-		PeerHost:         "relay-a",
-		PeerAddress:      "192.0.2.1:3001",
-		Operator:         "operator-a",
-		N2NVersion:       15,
-		NetworkMagic:     764824073,
-		TipSlot:          block.Slot,
-		TipHash:          block.Hash,
-		TipBlockNumber:   block.Number,
-		BodyHashVerified: true,
-		PointVerified:    true,
-		ParentVerified:   true,
-		Result:           "agreed",
-		ObservedAt:       now,
-	}
 	result, err := coordinator.PublishBatch(ctx, publication.Batch{
 		Items: []publication.BatchItem{
 			{Block: firstBlock, Source: sourceFixture()},
 			{
-				Block:            block,
-				Source:           sourceFixture(),
-				PeerObservations: []model.PeerObservation{peerObservation},
+				Block:  block,
+				Source: sourceFixture(),
 			},
 		},
 		FirstStagedAt: now,
@@ -343,7 +326,6 @@ func TestNativePublicationBinaryRoundTrip(t *testing.T) {
 		"withdrawals":          false,
 		"redeemers":            false,
 		"transaction_metadata": false,
-		"peer_observations":    false,
 		"chain_events":         false,
 	}
 	partTables := make([]string, 0, len(expectedSinglePart))
@@ -500,42 +482,65 @@ WHERE tx_hash = ?`, string(fourthTx[:])).Scan(&effectiveCollateralFee); err != n
 		descendants[0].Point != result.LastCommitted {
 		t.Fatalf("rollback descendants = %+v", descendants)
 	}
+	checkPoint := chainPointForTest(firstPoint)
+	rollbackCheck, err := db.BeginTrustCheck(
+		ctx,
+		lock,
+		&checkPoint,
+		2,
+		now.Add(2*time.Second),
+		writerID,
+		"integration",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rollbackEvidence := []model.PeerObservation{
+		trustObservationForTest(rollbackCheck, "relay-a", "operator-a", "agreed", now.Add(3*time.Second)),
+		trustObservationForTest(rollbackCheck, "relay-b", "operator-b", "agreed", now.Add(3*time.Second)),
+	}
+	if err := db.InsertPeerObservations(ctx, lock, rollbackEvidence); err != nil {
+		t.Fatal(err)
+	}
 	rollback := publication.RollbackCommit{
 		RollbackID:            id16(0x81),
 		EventSeq:              3,
 		To:                    firstPoint,
 		OldTip:                result.LastCommitted,
+		OldEventSeq:           2,
 		Depth:                 1,
 		Reason:                "integration rollback",
 		ObservedPeers:         []string{"relay-a", "relay-b"},
 		ObservedOperators:     []string{"operator-a", "operator-b"},
 		CorroborationRequired: 2,
+		CheckID:               copyIDPointer(rollbackCheck.ID),
+		AgreementGroup:        copyIDPointer(rollbackCheck.AgreementGroup),
+		CheckAttempt:          rollbackCheck.Attempt,
+		CheckedEventSeq:       rollbackCheck.CheckedEventSeq,
 		WriterID:              writerID,
-		RecordedAt:            now.Add(2 * time.Second),
+		RecordedAt:            now.Add(4 * time.Second),
 	}
-	if err := db.InsertInvalidations(ctx, rollback, descendants); err != nil {
+	rollback, err = db.ReserveRollbackManifest(ctx, lock, rollback, "integration")
+	if err != nil {
 		t.Fatal(err)
 	}
 	snapshot, err = db.CommittedSnapshot(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot != 2 {
-		t.Fatalf("headerless invalidation advanced committed snapshot to %d", snapshot)
+	if snapshot != 0 {
+		t.Fatalf("reserved rollback advanced effective snapshot to %d", snapshot)
 	}
-	activeBeforeHeader, err := db.activeCandidatePublications(
-		ctx,
-		snapshot,
-		[]uint64{result.PublicationIDs[1]},
-	)
-	if err != nil {
+	if err := db.InsertInvalidations(ctx, rollback, descendants); err != nil {
 		t.Fatal(err)
 	}
-	if len(activeBeforeHeader) != 1 ||
-		activeBeforeHeader[0] != result.PublicationIDs[1] {
-		t.Fatalf("headerless invalidation changed membership: %v", activeBeforeHeader)
+	if err := db.MarkRollbackInvalidations(ctx, lock, rollback, "integration"); err != nil {
+		t.Fatal(err)
 	}
 	if err := db.InsertRollbackHeader(ctx, rollback); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.FinalizeRollbackManifest(ctx, lock, rollback, "integration"); err != nil {
 		t.Fatal(err)
 	}
 	snapshot, err = db.RawCommittedSnapshot(ctx)
@@ -549,9 +554,9 @@ WHERE tx_hash = ?`, string(fourthTx[:])).Scan(&effectiveCollateralFee); err != n
 	if err != nil {
 		t.Fatal(err)
 	}
-	if effectiveBeforeReconcile != 2 {
+	if effectiveBeforeReconcile != 3 {
 		t.Fatalf(
-			"unreconciled rollback changed effective snapshot to %d",
+			"finalized rollback effective snapshot = %d",
 			effectiveBeforeReconcile,
 		)
 	}
@@ -605,7 +610,7 @@ WHERE tx_hash = ?`, string(fourthTx[:])).Scan(&effectiveCollateralFee); err != n
 	if _, err := db.ActiveDescendants(ctx, snapshot, result.LastCommitted, 10); err == nil {
 		t.Fatal("inactive descendant was accepted as a rollback target")
 	}
-	if err := db.ReconcileManifest(ctx, lock, writerID, "integration", now.Add(3*time.Second)); err != nil {
+	if err := db.ReconcileManifest(ctx, lock, writerID, "integration", now.Add(5*time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	candidates, err := db.IntersectionCandidates(ctx)
@@ -850,47 +855,8 @@ func TestNativeIntersectionCandidatesDenseGeometricAndByronBoundary(t *testing.T
 		t.Fatal(err)
 	}
 	agreeIntegrationBoundary(t, ctx, db, lock, now)
-	noOpRollback := publication.RollbackCommit{
-		RollbackID:            id16(0xa2),
-		EventSeq:              1,
-		To:                    boundary,
-		OldTip:                boundary,
-		Depth:                 0,
-		Reason:                "boundary corroboration",
-		ObservedPeers:         []string{"relay-a", "relay-b"},
-		ObservedOperators:     []string{"operator-a", "operator-b"},
-		CorroborationRequired: 2,
-		WriterID:              writerID,
-		RecordedAt:            now,
-	}
-	if err := db.InsertRollbackHeader(ctx, noOpRollback); err != nil {
-		t.Fatal(err)
-	}
-	if committed, err := db.RollbackCommitted(ctx, noOpRollback); err != nil {
-		t.Fatal(err)
-	} else if !committed {
-		t.Fatal("no-op rollback exact readback was not committed")
-	}
-	if snapshot, err := db.RawCommittedSnapshot(ctx); err != nil {
-		t.Fatal(err)
-	} else if snapshot != 1 {
-		t.Fatalf("raw no-op rollback snapshot = %d, want 1", snapshot)
-	}
-	if snapshot, err := db.CommittedSnapshot(ctx); err != nil {
-		t.Fatal(err)
-	} else if snapshot != 0 {
-		t.Fatalf("unreconciled effective snapshot = %d, want 0", snapshot)
-	}
 	restartSeed := seed
 	restartSeed.Start.BlockNumber = 0
-	restarted, err := db.LoadOrCreateManifest(ctx, lock, restartSeed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if restarted.DatasetID != identity.DatasetID ||
-		restarted.Start != boundary {
-		t.Fatalf("no-op restart identity changed: before=%+v after=%+v", identity, restarted)
-	}
 
 	attempts := make([]publication.Attempt, 33)
 	for index := range attempts {
@@ -913,10 +879,10 @@ func TestNativeIntersectionCandidatesDenseGeometricAndByronBoundary(t *testing.T
 	if err := db.InsertBlockBatch(ctx, attempts); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InsertAdoptionBatch(ctx, attempts, 2); err != nil {
+	if err := db.InsertAdoptionBatch(ctx, attempts, 1); err != nil {
 		t.Fatal(err)
 	}
-	restarted, err = db.LoadOrCreateManifest(ctx, lock, restartSeed)
+	restarted, err := db.LoadOrCreateManifest(ctx, lock, restartSeed)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -965,40 +931,47 @@ func agreeIntegrationBoundary(
 	at time.Time,
 ) {
 	t.Helper()
-	checkID := id16(0xe1)
-	groupID := id16(0xe2)
-	if err := db.transitionManifest(
+	record, found, err := db.loadLatestManifestRecord(ctx)
+	if err != nil || !found || record.WriterID == nil {
+		t.Fatalf("load integration manifest found=%t record=%+v err=%v", found, record, err)
+	}
+	point := chainPointForTest(record.Physical.Point)
+	writerID := *record.WriterID
+	check, err := db.BeginTrustCheck(
 		ctx,
 		lock,
-		"bootstrap_agreed",
+		&point,
+		2,
 		at,
-		func(latest manifestRecord) (bool, error) {
-			return latest.TrustStatus == "agreed" && latest.LastAgreed != nil, nil
-		},
-		func(next *manifestRecord) error {
-			next.TrustStatus = "agreed"
-			next.TrustBasis = "sampled_peer"
-			next.CheckID = &checkID
-			next.AgreementGroup = &groupID
-			next.CheckAttempt = 1
-			next.CorroborationRequired = 2
-			next.CorroborationConfirmed = 2
-			next.Disagreement = false
-			next.TrustReason = "publication integration bootstrap agreement"
-			started := manifestTime(at.Add(-time.Second))
-			completed := manifestTime(at)
-			next.CheckStartedAt = &started
-			next.CheckCompletedAt = &completed
-			checked := next.Physical
-			next.Checked = &checked
-			next.LastAgreed = &checked
-			next.LastAgreedAt = &completed
-			next.Effective = next.Physical
-			next.Servable = true
-			next.PrimarySuffix = 0
-			next.VisibilityGeneration++
-			return nil
-		},
+		writerID,
+		"publication-integration",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := []model.PeerObservation{
+		trustObservationForTest(check, "relay-a", "operator-a", "agreed", at.Add(time.Second)),
+		trustObservationForTest(check, "relay-b", "operator-b", "agreed", at.Add(time.Second)),
+	}
+	for index := range rows {
+		rows[index].Kind = "checkpoint"
+		rows[index].ProofMethod = syncer.ObservationProofChainSyncSingleton
+		if err := model.FinalizePeerObservationIdentity(&rows[index]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.InsertPeerObservations(ctx, lock, rows); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.FinalizeTrustCheck(
+		ctx,
+		lock,
+		check,
+		false,
+		"publication integration bootstrap agreement",
+		at.Add(2*time.Second),
+		writerID,
+		"publication-integration",
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -1059,5 +1032,10 @@ func id16(value byte) [16]byte {
 }
 
 func hash32Pointer(value model.Hash32) *model.Hash32 { return &value }
-func uint32Pointer(value uint32) *uint32             { return &value }
-func uint64Pointer(value uint64) *uint64             { return &value }
+
+func id16Pointer(value byte) *[16]byte {
+	ret := id16(value)
+	return &ret
+}
+func uint32Pointer(value uint32) *uint32 { return &value }
+func uint64Pointer(value uint64) *uint64 { return &value }

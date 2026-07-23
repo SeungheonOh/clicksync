@@ -36,6 +36,7 @@ func TestUniqueLatestWriterAuditNoRowsDuplicatesAndConflict(t *testing.T) {
 		DatasetID:     id16(0x21),
 		Revision:      3,
 		OwnerID:       id16(0x22),
+		BuildID:       "test-build",
 		State:         "released",
 		HeartbeatAt:   released,
 		ReleasedAt:    &released,

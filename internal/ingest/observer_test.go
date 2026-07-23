@@ -32,13 +32,24 @@ func TestObserverPersistsUnavailableProbeWithoutInventingTipProvenance(t *testin
 	}
 	isByronEBB := false
 	checkpointHash := adapterHash(0x10)
+	checkpoint := pcommon.NewPoint(10, checkpointHash.Bytes())
 	if err := observer.Observe(context.Background(), syncer.Observation{
-		Kind: "checkpoint",
+		Check: syncer.CheckIdentity{
+			ID:              observationID(0x31),
+			AgreementGroup:  observationID(0x32),
+			Attempt:         1,
+			Required:        2,
+			CheckedEventSeq: 7,
+			CheckedPoint:    n2n.NewChainPoint(checkpoint, 10),
+			Physical:        true,
+		},
+		Kind:        "checkpoint",
+		ProofMethod: syncer.ObservationProofChainSyncSingleton,
 		Peer: n2n.Peer{
 			Host:     "relay-a:3001",
 			Operator: "operator-a",
 		},
-		Checkpoint:            pcommon.NewPoint(10, checkpointHash.Bytes()),
+		Checkpoint:            checkpoint,
 		CheckpointBlockNumber: 10,
 		CheckpointIsByronEBB:  &isByronEBB,
 		Result:                "unavailable",
@@ -74,13 +85,24 @@ func TestObserverRequiresActualProvenanceForAgreement(t *testing.T) {
 		t.Fatal(err)
 	}
 	isByronEBB := false
+	checkpoint := pcommon.NewPoint(10, adapterHash(0x10).Bytes())
 	if err := observer.Observe(context.Background(), syncer.Observation{
-		Kind: "checkpoint",
+		Check: syncer.CheckIdentity{
+			ID:              observationID(0x41),
+			AgreementGroup:  observationID(0x42),
+			Attempt:         1,
+			Required:        2,
+			CheckedEventSeq: 8,
+			CheckedPoint:    n2n.NewChainPoint(checkpoint, 10),
+			Physical:        true,
+		},
+		Kind:        "checkpoint",
+		ProofMethod: syncer.ObservationProofChainSyncSingleton,
 		Peer: n2n.Peer{
 			Host:     "relay-a:3001",
 			Operator: "operator-a",
 		},
-		Checkpoint:            pcommon.NewPoint(10, adapterHash(0x10).Bytes()),
+		Checkpoint:            checkpoint,
 		CheckpointBlockNumber: 10,
 		CheckpointIsByronEBB:  &isByronEBB,
 		Result:                "agreed",
@@ -88,4 +110,12 @@ func TestObserverRequiresActualProvenanceForAgreement(t *testing.T) {
 	}); err == nil {
 		t.Fatal("agreed observation accepted without actual address/version/tip")
 	}
+}
+
+func observationID(value byte) [16]byte {
+	var ret [16]byte
+	for index := range ret {
+		ret[index] = value
+	}
+	return ret
 }

@@ -25,6 +25,12 @@ const (
 	manifestDuplicateLimit   = 8
 	manifestCheckpointBlocks = uint64(512)
 	manifestMaximumSuffix    = uint64(767)
+	boundedManifestHeadQuery = `
+SELECT *
+FROM clicksync.dataset_manifest
+PREWHERE manifest_key = 1
+ORDER BY revision DESC
+LIMIT 9`
 )
 
 type manifestHead struct {
@@ -33,12 +39,43 @@ type manifestHead struct {
 }
 
 type manifestPendingRollback struct {
-	State       string
-	ID          [16]byte
-	EventSeq    uint64
-	To          publication.Point
-	OldPhysical manifestHead
-	StartedAt   time.Time
+	State           string
+	ID              [16]byte
+	EventSeq        uint64
+	To              publication.Point
+	OldPhysical     manifestHead
+	Depth           uint32
+	Reason          string
+	Peers           []string
+	Operators       []string
+	Required        uint16
+	CheckID         [16]byte
+	Group           [16]byte
+	CheckAttempt    uint32
+	CheckedEventSeq uint64
+	EvidenceCount   uint32
+	EvidenceDigest  model.Hash32
+	WriterID        [16]byte
+	StartedAt       time.Time
+}
+
+type manifestPendingEvidenceWrite struct {
+	Observation model.PeerObservation
+	Digest      model.Hash32
+	Payload     string
+	WriterID    [16]byte
+	ReservedAt  time.Time
+}
+
+type manifestEvidenceReference struct {
+	CheckID   [16]byte
+	Group     [16]byte
+	Attempt   uint32
+	Required  uint16
+	Confirmed uint16
+	Checked   manifestHead
+	Count     uint32
+	Digest    model.Hash32
 }
 
 // manifestRecord is the complete authoritative dataset state. It deliberately
@@ -78,9 +115,14 @@ type manifestRecord struct {
 	TrustReason            string
 	CheckStartedAt         *time.Time
 	CheckCompletedAt       *time.Time
+	EvidenceState          string
+	EvidenceCount          uint32
+	EvidenceDigest         *model.Hash32
+	PendingEvidenceWrite   *manifestPendingEvidenceWrite
 	Checked                *manifestHead
 	LastAgreed             *manifestHead
 	LastAgreedAt           *time.Time
+	LastAgreedEvidence     *manifestEvidenceReference
 	ServableFloor          manifestHead
 	ServableFloorPermanent bool
 	Physical               manifestHead
@@ -135,20 +177,41 @@ type manifestDBRow struct {
 	TrustReason            string     `ch:"trust_reason"`
 	CheckStartedAt         *time.Time `ch:"check_started_at"`
 	CheckCompletedAt       *time.Time `ch:"check_completed_at"`
+	EvidenceState          string     `ch:"evidence_state"`
+	EvidenceCount          uint32     `ch:"evidence_count"`
+	EvidenceDigest         *string    `ch:"evidence_digest"`
+	PendingEvidenceID      *uuid.UUID `ch:"pending_evidence_observation_id"`
+	PendingEvidenceDigest  *string    `ch:"pending_evidence_observation_digest"`
+	PendingEvidencePayload string     `ch:"pending_evidence_payload"`
+	PendingEvidenceWriter  *uuid.UUID `ch:"pending_evidence_writer_id"`
+	PendingEvidenceAt      *time.Time `ch:"pending_evidence_reserved_at"`
 
-	CheckedEventSeq            *uint64    `ch:"checked_event_seq"`
-	CheckedPointOrigin         *bool      `ch:"checked_point_origin"`
-	CheckedPointSlot           *uint64    `ch:"checked_point_slot"`
-	CheckedPointHash           *string    `ch:"checked_point_hash"`
-	CheckedPointBlockNumber    *uint64    `ch:"checked_point_block_number"`
-	CheckedPointIsByronEBB     *bool      `ch:"checked_point_is_byron_ebb"`
-	LastAgreedEventSeq         *uint64    `ch:"last_agreed_event_seq"`
-	LastAgreedPointOrigin      *bool      `ch:"last_agreed_point_origin"`
-	LastAgreedPointSlot        *uint64    `ch:"last_agreed_point_slot"`
-	LastAgreedPointHash        *string    `ch:"last_agreed_point_hash"`
-	LastAgreedPointBlockNumber *uint64    `ch:"last_agreed_point_block_number"`
-	LastAgreedPointIsByronEBB  *bool      `ch:"last_agreed_point_is_byron_ebb"`
-	LastAgreedAt               *time.Time `ch:"last_agreed_at"`
+	CheckedEventSeq             *uint64    `ch:"checked_event_seq"`
+	CheckedPointOrigin          *bool      `ch:"checked_point_origin"`
+	CheckedPointSlot            *uint64    `ch:"checked_point_slot"`
+	CheckedPointHash            *string    `ch:"checked_point_hash"`
+	CheckedPointBlockNumber     *uint64    `ch:"checked_point_block_number"`
+	CheckedPointIsByronEBB      *bool      `ch:"checked_point_is_byron_ebb"`
+	LastAgreedEventSeq          *uint64    `ch:"last_agreed_event_seq"`
+	LastAgreedPointOrigin       *bool      `ch:"last_agreed_point_origin"`
+	LastAgreedPointSlot         *uint64    `ch:"last_agreed_point_slot"`
+	LastAgreedPointHash         *string    `ch:"last_agreed_point_hash"`
+	LastAgreedPointBlockNumber  *uint64    `ch:"last_agreed_point_block_number"`
+	LastAgreedPointIsByronEBB   *bool      `ch:"last_agreed_point_is_byron_ebb"`
+	LastAgreedAt                *time.Time `ch:"last_agreed_at"`
+	LastAgreedCheckID           *uuid.UUID `ch:"last_agreed_check_id"`
+	LastAgreedAgreementGroup    *uuid.UUID `ch:"last_agreed_agreement_group"`
+	LastAgreedCheckAttempt      uint32     `ch:"last_agreed_check_attempt"`
+	LastAgreedRequired          uint16     `ch:"last_agreed_corroboration_required"`
+	LastAgreedConfirmed         uint16     `ch:"last_agreed_corroboration_confirmed"`
+	LastAgreedCheckedEventSeq   *uint64    `ch:"last_agreed_checked_event_seq"`
+	LastAgreedCheckedOrigin     *bool      `ch:"last_agreed_checked_point_origin"`
+	LastAgreedCheckedSlot       *uint64    `ch:"last_agreed_checked_point_slot"`
+	LastAgreedCheckedHash       *string    `ch:"last_agreed_checked_point_hash"`
+	LastAgreedCheckedNumber     *uint64    `ch:"last_agreed_checked_point_block_number"`
+	LastAgreedCheckedIsByronEBB *bool      `ch:"last_agreed_checked_point_is_byron_ebb"`
+	LastAgreedEvidenceCount     uint32     `ch:"last_agreed_evidence_count"`
+	LastAgreedEvidenceDigest    *string    `ch:"last_agreed_evidence_digest"`
 
 	ServableFloorEventSeq    uint64  `ch:"servable_floor_event_seq"`
 	ServableFloorOrigin      bool    `ch:"servable_floor_origin"`
@@ -186,6 +249,18 @@ type manifestDBRow struct {
 	PendingRollbackOldPhysicalHash        *string    `ch:"pending_rollback_old_physical_hash"`
 	PendingRollbackOldPhysicalBlockNumber *uint64    `ch:"pending_rollback_old_physical_block_number"`
 	PendingRollbackOldPhysicalIsByronEBB  *bool      `ch:"pending_rollback_old_physical_is_byron_ebb"`
+	PendingRollbackDepth                  *uint32    `ch:"pending_rollback_depth"`
+	PendingRollbackReason                 string     `ch:"pending_rollback_reason"`
+	PendingRollbackObservedPeers          []string   `ch:"pending_rollback_observed_peers"`
+	PendingRollbackObservedOperators      []string   `ch:"pending_rollback_observed_operators"`
+	PendingRollbackRequired               *uint16    `ch:"pending_rollback_required"`
+	PendingRollbackCheckID                *uuid.UUID `ch:"pending_rollback_check_id"`
+	PendingRollbackAgreementGroup         *uuid.UUID `ch:"pending_rollback_agreement_group"`
+	PendingRollbackCheckAttempt           *uint32    `ch:"pending_rollback_check_attempt"`
+	PendingRollbackCheckedEventSeq        *uint64    `ch:"pending_rollback_checked_event_seq"`
+	PendingRollbackEvidenceCount          *uint32    `ch:"pending_rollback_evidence_count"`
+	PendingRollbackEvidenceDigest         *string    `ch:"pending_rollback_evidence_digest"`
+	PendingRollbackWriterID               *uuid.UUID `ch:"pending_rollback_writer_id"`
 	PendingRollbackStartedAt              *time.Time `ch:"pending_rollback_started_at"`
 
 	WriterID    *uuid.UUID `ch:"writer_id"`
@@ -265,6 +340,10 @@ func verifyManifestRecord(row manifestRecord) error {
 		"trust_agreed",
 		"trust_unavailable",
 		"trust_disputed",
+		"trust_superseded",
+		"evidence_write_reserved",
+		"evidence_write_committed",
+		"evidence_frozen",
 		"bootstrap_agreed",
 		"rollback_reserved",
 		"rollback_invalidations_written",
@@ -282,8 +361,8 @@ func verifyManifestRecord(row manifestRecord) error {
 	if row.PrimarySuffix > manifestMaximumSuffix {
 		return fmt.Errorf("manifest primary suffix %d exceeds %d", row.PrimarySuffix, manifestMaximumSuffix)
 	}
-	if row.CorroborationConfirmed > row.CorroborationRequired {
-		return errors.New("manifest confirmed corroboration exceeds required corroboration")
+	if uint32(row.CorroborationConfirmed) > row.EvidenceCount {
+		return errors.New("manifest confirmed corroboration exceeds committed evidence count")
 	}
 	if row.CompleteHistory != (row.Start.Origin && row.GenesisSeeded) {
 		return errors.New("manifest completeness does not match start/genesis state")
@@ -292,6 +371,14 @@ func verifyManifestRecord(row manifestRecord) error {
 	case "official_genesis", "sampled_peer", "partial_boundary", "primary_only":
 	default:
 		return fmt.Errorf("unknown manifest trust basis %q", row.TrustBasis)
+	}
+	if row.TrustBasis == "primary_only" &&
+		(row.PrimarySuffix == 0 ||
+			row.LastAgreed == nil ||
+			(row.LastAgreedEvidence == nil && !row.ServableFloorPermanent)) {
+		return errors.New(
+			"primary-only manifest lacks a sampled/genesis anchor and suffix",
+		)
 	}
 	switch row.TrustStatus {
 	case "agreed":
@@ -311,12 +398,14 @@ func verifyManifestRecord(row manifestRecord) error {
 				row.CorroborationConfirmed != 0 {
 				return errors.New("official genesis agreement carries peer-check state")
 			}
-		} else if row.CheckID == nil ||
-			row.CorroborationRequired < 2 ||
-			row.CorroborationConfirmed < row.CorroborationRequired ||
-			row.Checked == nil ||
-			row.LastAgreed == nil ||
-			*row.Checked != *row.LastAgreed {
+		} else if row.TrustBasis != "primary_only" &&
+			(row.TrustBasis != "sampled_peer" ||
+				row.CheckID == nil ||
+				row.CorroborationRequired < 2 ||
+				row.CorroborationConfirmed < row.CorroborationRequired ||
+				row.Checked == nil ||
+				row.LastAgreed == nil ||
+				!manifestAgreementEvidenceMatches(row)) {
 			return errors.New("peer-derived agreement lacks threshold check evidence")
 		}
 	case "unavailable":
@@ -372,8 +461,7 @@ func verifyManifestRecord(row manifestRecord) error {
 		return errors.New("manifest effective point is below its servable floor")
 	}
 	if row.ServableFloorPermanent &&
-		(!row.Start.Origin || !row.GenesisSeeded || !row.ServableFloor.Point.Origin ||
-			row.ServableFloor.EventSeq != 0) {
+		(!row.Start.Origin || !row.GenesisSeeded || !row.ServableFloor.Point.Origin) {
 		return errors.New("only verified official genesis can be a permanent floor")
 	}
 	if !row.Start.Origin &&
@@ -398,7 +486,11 @@ func verifyManifestRecord(row manifestRecord) error {
 			row.CorroborationRequired != 0 ||
 			row.CorroborationConfirmed != 0 ||
 			row.CheckStartedAt != nil ||
-			row.CheckCompletedAt != nil {
+			row.CheckCompletedAt != nil ||
+			row.EvidenceState != "none" ||
+			row.EvidenceCount != 0 ||
+			row.EvidenceDigest != nil ||
+			row.PendingEvidenceWrite != nil {
 			return errors.New("manifest without a check identity carries check state")
 		}
 	} else {
@@ -410,20 +502,101 @@ func verifyManifestRecord(row manifestRecord) error {
 			row.CheckStartedAt == nil {
 			return errors.New("manifest check state is incomplete")
 		}
+		if (row.EvidenceState != "open" && row.EvidenceState != "frozen") ||
+			row.EvidenceDigest == nil {
+			return errors.New("manifest peer check lacks durable evidence state/commitment")
+		}
 		if row.TrustStatus == "checking" {
 			if row.CheckCompletedAt != nil {
 				return errors.New("checking manifest already has a completion time")
 			}
 		} else if row.CheckCompletedAt == nil {
 			return errors.New("completed check state lacks a completion time")
+		} else if row.EvidenceState != "frozen" {
+			return errors.New("completed check evidence is not frozen")
+		}
+		if row.PendingEvidenceWrite != nil {
+			pending := row.PendingEvidenceWrite
+			if row.EvidenceState != "open" ||
+				pending.Observation.CheckID != *row.CheckID ||
+				pending.Observation.AgreementGroup != *row.AgreementGroup ||
+				pending.Observation.CheckAttempt != row.CheckAttempt ||
+				pending.Observation.EvidenceOrdinal != row.EvidenceCount+1 ||
+				pending.Observation.Kind == "source_change" ||
+				pending.WriterID == ([16]byte{}) {
+				return errors.New("pending evidence write differs from exact open check")
+			}
+			canonical, err := canonicalPendingEvidencePayload(pending.Observation)
+			if err != nil {
+				return err
+			}
+			digest, err := model.PeerObservationDigest(pending.Observation)
+			if err != nil {
+				return err
+			}
+			if canonical != pending.Payload ||
+				digest != pending.Digest {
+				return errors.New(
+					"pending evidence payload/digest is not canonical",
+				)
+			}
+			if err := model.VerifyPeerObservationIdentity(
+				pending.Observation,
+				pending.Digest[:],
+			); err != nil {
+				return fmt.Errorf("pending evidence identity is invalid: %w", err)
+			}
+			eligible, err := validateTrustEvidenceProvenance(
+				pending.Observation,
+				pendingEvidenceCheckedPoint(pending.Observation),
+			)
+			if err != nil {
+				return err
+			}
+			if !eligible ||
+				pending.Observation.CheckedEventSeq != row.Checked.EventSeq ||
+				pendingEvidenceCheckedPoint(pending.Observation) != row.Checked.Point ||
+				pending.Observation.CorroborationRequired != row.CorroborationRequired {
+				return errors.New(
+					"pending evidence payload is not eligible for the exact manifest check",
+				)
+			}
 		}
 	}
 	if row.LastAgreed == nil {
-		if row.LastAgreedAt != nil {
+		if row.LastAgreedAt != nil || row.LastAgreedEvidence != nil {
 			return errors.New("manifest last-agreed time lacks an event-point")
 		}
 	} else if row.LastAgreedAt == nil {
 		return errors.New("manifest last-agreed event-point lacks a time")
+	} else if row.LastAgreedEvidence == nil {
+		if !row.ServableFloorPermanent ||
+			!row.ServableFloor.Point.Origin ||
+			*row.LastAgreed != row.ServableFloor {
+			return errors.New(
+				"peer-derived last-agreed head lacks its immutable evidence reference",
+			)
+		}
+	} else {
+		reference := row.LastAgreedEvidence
+		if reference.CheckID == ([16]byte{}) ||
+			reference.Group == ([16]byte{}) ||
+			reference.Attempt == 0 ||
+			reference.Required < 2 ||
+			reference.Confirmed < reference.Required ||
+			uint32(reference.Confirmed) > reference.Count ||
+			reference.Digest == (model.Hash32{}) ||
+			reference.Checked.Point != row.LastAgreed.Point ||
+			reference.Checked.EventSeq > row.LastAgreed.EventSeq {
+			return errors.New("manifest last-agreed evidence reference is invalid")
+		}
+		if row.TrustStatus == "agreed" &&
+			row.TrustBasis != "official_genesis" &&
+			!currentEvidenceMatchesReference(row, *reference) {
+			return errors.New(
+				"agreed manifest current evidence differs from last-agreed authority",
+			)
+		}
 	}
 	for _, candidate := range []struct {
 		name  string
@@ -472,6 +645,23 @@ func verifyManifestRecord(row manifestRecord) error {
 	} else if row.PendingRollback.EventSeq <= row.Physical.EventSeq ||
 		row.PendingRollback.OldPhysical != row.Physical {
 		return errors.New("pending rollback reservation is not anchored to the physical head")
+	} else if row.PendingRollback.Reason == "" ||
+		row.PendingRollback.Required < 2 ||
+		row.PendingRollback.CheckID == ([16]byte{}) ||
+		row.PendingRollback.Group == ([16]byte{}) ||
+		row.PendingRollback.CheckAttempt == 0 ||
+		row.PendingRollback.EvidenceCount < uint32(row.PendingRollback.Required) ||
+		row.PendingRollback.EvidenceDigest == (model.Hash32{}) ||
+		row.PendingRollback.EvidenceCount != row.EvidenceCount ||
+		row.EvidenceDigest == nil ||
+		row.PendingRollback.EvidenceDigest != *row.EvidenceDigest ||
+		row.PendingRollback.WriterID == ([16]byte{}) ||
+		len(row.PendingRollback.Peers) != len(row.PendingRollback.Operators) ||
+		len(row.PendingRollback.Operators) < int(row.PendingRollback.Required) {
+		return errors.New("pending rollback corroboration reservation is incomplete")
+	} else if row.EvidenceState != "frozen" ||
+		row.PendingEvidenceWrite != nil {
+		return errors.New("pending rollback evidence is not durably frozen")
 	} else if err := validateManifestPoint(
 		"pending rollback target",
 		row.PendingRollback.To,
@@ -496,6 +686,55 @@ func verifyManifestRecord(row manifestRecord) error {
 	return nil
 }
 
+func pendingEvidenceCheckedPoint(
+	observation model.PeerObservation,
+) publication.Point {
+	if observation.CheckedPointOrigin {
+		return publication.Point{Origin: true}
+	}
+	if observation.CheckedPointSlot == nil ||
+		observation.CheckedPointHash == nil ||
+		observation.CheckedBlockNumber == nil {
+		return publication.Point{}
+	}
+	return publication.Point{
+		Slot:        *observation.CheckedPointSlot,
+		Hash:        *observation.CheckedPointHash,
+		BlockNumber: *observation.CheckedBlockNumber,
+		IsByronEBB:  observation.CheckedPointIsByronEBB,
+	}
+}
+
+func manifestAgreementEvidenceMatches(row manifestRecord) bool {
+	if row.Checked == nil || row.LastAgreed == nil {
+		return false
+	}
+	if *row.Checked == *row.LastAgreed {
+		return true
+	}
+	return row.Checked.Point == row.LastAgreed.Point &&
+		row.Checked.EventSeq < row.LastAgreed.EventSeq &&
+		row.LastAgreed.EventSeq <= row.Physical.EventSeq
+}
+
+func currentEvidenceMatchesReference(
+	row manifestRecord,
+	reference manifestEvidenceReference,
+) bool {
+	return row.CheckID != nil &&
+		row.AgreementGroup != nil &&
+		row.Checked != nil &&
+		row.EvidenceDigest != nil &&
+		*row.CheckID == reference.CheckID &&
+		*row.AgreementGroup == reference.Group &&
+		row.CheckAttempt == reference.Attempt &&
+		row.CorroborationRequired == reference.Required &&
+		row.CorroborationConfirmed == reference.Confirmed &&
+		*row.Checked == reference.Checked &&
+		row.EvidenceCount == reference.Count &&
+		*row.EvidenceDigest == reference.Digest
+}
+
 func validateManifestPoint(name string, point publication.Point) error {
 	if point.Origin {
 		if point.Hash != (model.Hash32{}) ||
@@ -518,6 +757,14 @@ func normalizeManifestTimes(row *manifestRecord) {
 	normalizeOptionalTime(&row.CheckStartedAt)
 	normalizeOptionalTime(&row.CheckCompletedAt)
 	normalizeOptionalTime(&row.LastAgreedAt)
+	if row.PendingEvidenceWrite != nil {
+		row.PendingEvidenceWrite.ReservedAt = manifestTime(
+			row.PendingEvidenceWrite.ReservedAt,
+		)
+		row.PendingEvidenceWrite.Observation.ObservedAt = manifestTime(
+			row.PendingEvidenceWrite.Observation.ObservedAt,
+		)
+	}
 	if row.PendingRollback != nil {
 		row.PendingRollback.StartedAt = manifestTime(row.PendingRollback.StartedAt)
 	}
@@ -538,13 +785,7 @@ func manifestTime(value time.Time) time.Time {
 func (d *DB) loadLatestManifestRecord(
 	ctx context.Context,
 ) (manifestRecord, bool, error) {
-	const query = `
-SELECT *
-FROM clicksync.dataset_manifest
-PREWHERE manifest_key = 1
-ORDER BY revision DESC
-LIMIT 9`
-	rows, err := d.conn.Query(ctx, query)
+	rows, err := d.conn.Query(ctx, boundedManifestHeadQuery)
 	if err != nil {
 		return manifestRecord{}, false, fmt.Errorf("query bounded manifest head: %w", err)
 	}
@@ -565,6 +806,73 @@ LIMIT 9`
 		return manifestRecord{}, false, fmt.Errorf("iterate bounded manifest head: %w", err)
 	}
 	return validateBoundedManifestRows(records)
+}
+
+func (d *DB) loadAuthoritativeManifest(
+	ctx context.Context,
+) (manifestRecord, bool, error) {
+	return loadStableAuthoritativeManifest(
+		ctx,
+		d.loadLatestManifestRecord,
+		d.validateAuthoritativeManifestSnapshot,
+	)
+}
+
+func loadStableAuthoritativeManifest(
+	ctx context.Context,
+	load func(context.Context) (manifestRecord, bool, error),
+	validate func(context.Context, manifestRecord) error,
+) (manifestRecord, bool, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return manifestRecord{}, false, err
+		}
+		record, found, err := load(ctx)
+		if err != nil || !found {
+			return record, found, err
+		}
+		validationErr := validate(ctx, record)
+		latest, stillFound, reloadErr := load(ctx)
+		if reloadErr != nil {
+			return manifestRecord{}, true, reloadErr
+		}
+		if !stillFound {
+			return manifestRecord{}, true, errors.New(
+				"dataset manifest disappeared during authoritative validation",
+			)
+		}
+		if latest.Revision != record.Revision ||
+			latest.RowDigest != record.RowDigest {
+			continue
+		}
+		if validationErr != nil {
+			return manifestRecord{}, true, validationErr
+		}
+		return record, true, nil
+	}
+}
+
+func (d *DB) validateAuthoritativeManifestSnapshot(
+	ctx context.Context,
+	record manifestRecord,
+) error {
+	if err := d.validateManifestEvidenceCommitment(ctx, record); err != nil {
+		return fmt.Errorf("validate authoritative evidence commitment: %w", err)
+	}
+	if err := d.validateCurrentPhysicalRollbackArtifacts(ctx, record); err != nil {
+		return fmt.Errorf("validate authoritative physical event: %w", err)
+	}
+	barrier := record.Physical.EventSeq
+	if pending := record.PendingRollback; pending != nil {
+		if err := d.validatePendingRollbackArtifacts(ctx, *pending); err != nil {
+			return fmt.Errorf("validate authoritative pending rollback: %w", err)
+		}
+		barrier = pending.EventSeq
+	}
+	if err := d.rejectUnreservedRollbackArtifactsAfter(ctx, barrier); err != nil {
+		return err
+	}
+	return nil
 }
 
 func validateBoundedManifestRows(
@@ -660,6 +968,9 @@ func (d *DB) appendManifestRecord(
 	}
 	if err := finalizeManifestRecord(&row); err != nil {
 		return err
+	}
+	if err := verifyManifestRecord(row); err != nil {
+		return fmt.Errorf("refuse invalid manifest append: %w", err)
 	}
 	raw, err := manifestDBRowFromRecord(row)
 	if err != nil {
@@ -890,6 +1201,47 @@ func hashPointer(value *string) (*model.Hash32, error) {
 	return &hash, nil
 }
 
+func canonicalPendingEvidencePayload(
+	observation model.PeerObservation,
+) (string, error) {
+	observation.ObservedAt = manifestTime(observation.ObservedAt)
+	encoded, err := json.Marshal(observation)
+	if err != nil {
+		return "", fmt.Errorf("encode pending evidence payload: %w", err)
+	}
+	return string(encoded), nil
+}
+
+func decodePendingEvidencePayload(
+	payload string,
+) (model.PeerObservation, error) {
+	decoder := json.NewDecoder(bytes.NewBufferString(payload))
+	decoder.DisallowUnknownFields()
+	var observation model.PeerObservation
+	if err := decoder.Decode(&observation); err != nil {
+		return model.PeerObservation{}, fmt.Errorf(
+			"decode pending evidence payload: %w",
+			err,
+		)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err == nil {
+		return model.PeerObservation{}, errors.New(
+			"pending evidence payload has trailing JSON",
+		)
+	}
+	canonical, err := canonicalPendingEvidencePayload(observation)
+	if err != nil {
+		return model.PeerObservation{}, err
+	}
+	if canonical != payload {
+		return model.PeerObservation{}, errors.New(
+			"pending evidence payload is not canonical JSON",
+		)
+	}
+	return observation, nil
+}
+
 func uuid16(value uuid.UUID) [16]byte {
 	var result [16]byte
 	copy(result[:], value[:])
@@ -923,6 +1275,23 @@ func manifestDBRowFromRecord(record manifestRecord) (manifestDBRow, error) {
 		optionalHeadDBValues(record.Checked)
 	agreedEvent, agreedOrigin, agreedSlot, agreedHash, agreedNumber, agreedEBB :=
 		optionalHeadDBValues(record.LastAgreed)
+	var (
+		lastEvidenceCheckedEvent  *uint64
+		lastEvidenceCheckedOrigin *bool
+		lastEvidenceCheckedSlot   *uint64
+		lastEvidenceCheckedHash   *string
+		lastEvidenceCheckedNumber *uint64
+		lastEvidenceCheckedEBB    *bool
+	)
+	if record.LastAgreedEvidence != nil {
+		checked := record.LastAgreedEvidence.Checked
+		lastEvidenceCheckedEvent,
+			lastEvidenceCheckedOrigin,
+			lastEvidenceCheckedSlot,
+			lastEvidenceCheckedHash,
+			lastEvidenceCheckedNumber,
+			lastEvidenceCheckedEBB = optionalHeadDBValues(&checked)
+	}
 	floorOrigin, floorSlot, floorHash, floorNumber, floorEBB :=
 		pointDBValues(record.ServableFloor.Point)
 	physicalOrigin, physicalSlot, physicalHash, physicalNumber, physicalEBB :=
@@ -931,84 +1300,117 @@ func manifestDBRowFromRecord(record manifestRecord) (manifestDBRow, error) {
 		pointDBValues(record.Effective.Point)
 
 	raw := manifestDBRow{
-		ManifestKey:                record.ManifestKey,
-		Revision:                   record.Revision,
-		TransitionID:               uuid.UUID(record.TransitionID),
-		TransitionKind:             record.TransitionKind,
-		RowDigest:                  string(record.RowDigest[:]),
-		DatasetID:                  uuid.UUID(record.DatasetID),
-		SchemaContractHash:         string(record.SchemaContractHash[:]),
-		NetworkMagic:               record.NetworkMagic,
-		NetworkName:                record.NetworkName,
-		ByronGenesisID:             string(record.ByronGenesisID[:]),
-		ByronGenesisJSONHash:       string(record.ByronGenesisJSONHash[:]),
-		ShelleyGenesisID:           string(record.ShelleyGenesisID[:]),
-		ShelleyGenesisJSONHash:     string(record.ShelleyGenesisJSONHash[:]),
-		StartKind:                  startKind,
-		StartSlot:                  startSlot,
-		StartHash:                  startHash,
-		StartBlockNumber:           startNumber,
-		StartIsByronEBB:            startEBB,
-		GenesisSeeded:              record.GenesisSeeded,
-		CompleteHistory:            record.CompleteHistory,
-		TrustMode:                  record.TrustMode,
-		TrustStatus:                record.TrustStatus,
-		TrustBasis:                 record.TrustBasis,
-		CheckID:                    uuidPointer(record.CheckID),
-		AgreementGroup:             uuidPointer(record.AgreementGroup),
-		CheckAttempt:               record.CheckAttempt,
-		CorroborationRequired:      record.CorroborationRequired,
-		CorroborationConfirmed:     record.CorroborationConfirmed,
-		CheckpointInterval:         record.CheckpointInterval,
-		PrimarySuffix:              record.PrimarySuffix,
-		Disagreement:               record.Disagreement,
-		TrustReason:                record.TrustReason,
-		CheckStartedAt:             record.CheckStartedAt,
-		CheckCompletedAt:           record.CheckCompletedAt,
-		CheckedEventSeq:            checkedEvent,
-		CheckedPointOrigin:         checkedOrigin,
-		CheckedPointSlot:           checkedSlot,
-		CheckedPointHash:           checkedHash,
-		CheckedPointBlockNumber:    checkedNumber,
-		CheckedPointIsByronEBB:     checkedEBB,
-		LastAgreedEventSeq:         agreedEvent,
-		LastAgreedPointOrigin:      agreedOrigin,
-		LastAgreedPointSlot:        agreedSlot,
-		LastAgreedPointHash:        agreedHash,
-		LastAgreedPointBlockNumber: agreedNumber,
-		LastAgreedPointIsByronEBB:  agreedEBB,
-		LastAgreedAt:               record.LastAgreedAt,
-		ServableFloorEventSeq:      record.ServableFloor.EventSeq,
-		ServableFloorOrigin:        floorOrigin,
-		ServableFloorSlot:          floorSlot,
-		ServableFloorHash:          floorHash,
-		ServableFloorBlockNumber:   floorNumber,
-		ServableFloorIsByronEBB:    floorEBB,
-		ServableFloorPermanent:     record.ServableFloorPermanent,
-		PhysicalEventSeq:           record.Physical.EventSeq,
-		PhysicalTipOrigin:          physicalOrigin,
-		PhysicalTipSlot:            physicalSlot,
-		PhysicalTipHash:            physicalHash,
-		PhysicalTipBlockNumber:     physicalNumber,
-		PhysicalTipIsByronEBB:      physicalEBB,
-		EffectiveEventSeq:          record.Effective.EventSeq,
-		EffectiveTipOrigin:         effectiveOrigin,
-		EffectiveTipSlot:           effectiveSlot,
-		EffectiveTipHash:           effectiveHash,
-		EffectiveTipBlockNumber:    effectiveNumber,
-		EffectiveTipIsByronEBB:     effectiveEBB,
-		Servable:                   record.Servable,
-		VisibilityGeneration:       record.VisibilityGeneration,
-		PendingRollbackState:       "none",
-		WriterID:                   uuidPointer(record.WriterID),
-		WriterBuild:                record.WriterBuild,
-		SourceBuild:                record.SourceBuild,
-		CreatedAt:                  record.CreatedAt,
-		UpdatedAt:                  record.UpdatedAt,
+		ManifestKey:                 record.ManifestKey,
+		Revision:                    record.Revision,
+		TransitionID:                uuid.UUID(record.TransitionID),
+		TransitionKind:              record.TransitionKind,
+		RowDigest:                   string(record.RowDigest[:]),
+		DatasetID:                   uuid.UUID(record.DatasetID),
+		SchemaContractHash:          string(record.SchemaContractHash[:]),
+		NetworkMagic:                record.NetworkMagic,
+		NetworkName:                 record.NetworkName,
+		ByronGenesisID:              string(record.ByronGenesisID[:]),
+		ByronGenesisJSONHash:        string(record.ByronGenesisJSONHash[:]),
+		ShelleyGenesisID:            string(record.ShelleyGenesisID[:]),
+		ShelleyGenesisJSONHash:      string(record.ShelleyGenesisJSONHash[:]),
+		StartKind:                   startKind,
+		StartSlot:                   startSlot,
+		StartHash:                   startHash,
+		StartBlockNumber:            startNumber,
+		StartIsByronEBB:             startEBB,
+		GenesisSeeded:               record.GenesisSeeded,
+		CompleteHistory:             record.CompleteHistory,
+		TrustMode:                   record.TrustMode,
+		TrustStatus:                 record.TrustStatus,
+		TrustBasis:                  record.TrustBasis,
+		CheckID:                     uuidPointer(record.CheckID),
+		AgreementGroup:              uuidPointer(record.AgreementGroup),
+		CheckAttempt:                record.CheckAttempt,
+		CorroborationRequired:       record.CorroborationRequired,
+		CorroborationConfirmed:      record.CorroborationConfirmed,
+		CheckpointInterval:          record.CheckpointInterval,
+		PrimarySuffix:               record.PrimarySuffix,
+		Disagreement:                record.Disagreement,
+		TrustReason:                 record.TrustReason,
+		CheckStartedAt:              record.CheckStartedAt,
+		CheckCompletedAt:            record.CheckCompletedAt,
+		EvidenceState:               record.EvidenceState,
+		EvidenceCount:               record.EvidenceCount,
+		CheckedEventSeq:             checkedEvent,
+		CheckedPointOrigin:          checkedOrigin,
+		CheckedPointSlot:            checkedSlot,
+		CheckedPointHash:            checkedHash,
+		CheckedPointBlockNumber:     checkedNumber,
+		CheckedPointIsByronEBB:      checkedEBB,
+		LastAgreedEventSeq:          agreedEvent,
+		LastAgreedPointOrigin:       agreedOrigin,
+		LastAgreedPointSlot:         agreedSlot,
+		LastAgreedPointHash:         agreedHash,
+		LastAgreedPointBlockNumber:  agreedNumber,
+		LastAgreedPointIsByronEBB:   agreedEBB,
+		LastAgreedAt:                record.LastAgreedAt,
+		LastAgreedCheckedEventSeq:   lastEvidenceCheckedEvent,
+		LastAgreedCheckedOrigin:     lastEvidenceCheckedOrigin,
+		LastAgreedCheckedSlot:       lastEvidenceCheckedSlot,
+		LastAgreedCheckedHash:       lastEvidenceCheckedHash,
+		LastAgreedCheckedNumber:     lastEvidenceCheckedNumber,
+		LastAgreedCheckedIsByronEBB: lastEvidenceCheckedEBB,
+		ServableFloorEventSeq:       record.ServableFloor.EventSeq,
+		ServableFloorOrigin:         floorOrigin,
+		ServableFloorSlot:           floorSlot,
+		ServableFloorHash:           floorHash,
+		ServableFloorBlockNumber:    floorNumber,
+		ServableFloorIsByronEBB:     floorEBB,
+		ServableFloorPermanent:      record.ServableFloorPermanent,
+		PhysicalEventSeq:            record.Physical.EventSeq,
+		PhysicalTipOrigin:           physicalOrigin,
+		PhysicalTipSlot:             physicalSlot,
+		PhysicalTipHash:             physicalHash,
+		PhysicalTipBlockNumber:      physicalNumber,
+		PhysicalTipIsByronEBB:       physicalEBB,
+		EffectiveEventSeq:           record.Effective.EventSeq,
+		EffectiveTipOrigin:          effectiveOrigin,
+		EffectiveTipSlot:            effectiveSlot,
+		EffectiveTipHash:            effectiveHash,
+		EffectiveTipBlockNumber:     effectiveNumber,
+		EffectiveTipIsByronEBB:      effectiveEBB,
+		Servable:                    record.Servable,
+		VisibilityGeneration:        record.VisibilityGeneration,
+		PendingRollbackState:        "none",
+		WriterID:                    uuidPointer(record.WriterID),
+		WriterBuild:                 record.WriterBuild,
+		SourceBuild:                 record.SourceBuild,
+		CreatedAt:                   record.CreatedAt,
+		UpdatedAt:                   record.UpdatedAt,
 	}
 	if record.PreviousRowDigest != nil {
 		value := string(record.PreviousRowDigest[:])
 		raw.PreviousRowDigest = &value
+	}
+	if record.EvidenceDigest != nil {
+		value := string(record.EvidenceDigest[:])
+		raw.EvidenceDigest = &value
+	}
+	if record.LastAgreedEvidence != nil {
+		reference := record.LastAgreedEvidence
+		raw.LastAgreedCheckID = uuidPointer(&reference.CheckID)
+		raw.LastAgreedAgreementGroup = uuidPointer(&reference.Group)
+		raw.LastAgreedCheckAttempt = reference.Attempt
+		raw.LastAgreedRequired = reference.Required
+		raw.LastAgreedConfirmed = reference.Confirmed
+		raw.LastAgreedEvidenceCount = reference.Count
+		value := string(reference.Digest[:])
+		raw.LastAgreedEvidenceDigest = &value
+	}
+	if record.PendingEvidenceWrite != nil {
+		pending := record.PendingEvidenceWrite
+		raw.PendingEvidenceID = uuidPointer(&pending.Observation.ID)
+		value := string(pending.Digest[:])
+		raw.PendingEvidenceDigest = &value
+		raw.PendingEvidencePayload = pending.Payload
+		raw.PendingEvidenceWriter = uuidPointer(&pending.WriterID)
+		reservedAt := pending.ReservedAt
+		raw.PendingEvidenceAt = &reservedAt
 	}
 	if record.PendingRollback != nil {
 		pending := record.PendingRollback
@@ -1031,6 +1433,24 @@ func manifestDBRowFromRecord(record manifestRecord) (manifestDBRow, error) {
 		raw.PendingRollbackOldPhysicalHash = oldHash
 		raw.PendingRollbackOldPhysicalBlockNumber = oldNumber
 		raw.PendingRollbackOldPhysicalIsByronEBB = &oldEBB
+		depth := pending.Depth
+		required := pending.Required
+		raw.PendingRollbackDepth = &depth
+		raw.PendingRollbackReason = pending.Reason
+		raw.PendingRollbackObservedPeers = append([]string(nil), pending.Peers...)
+		raw.PendingRollbackObservedOperators = append([]string(nil), pending.Operators...)
+		raw.PendingRollbackRequired = &required
+		raw.PendingRollbackCheckID = uuidPointer(&pending.CheckID)
+		raw.PendingRollbackAgreementGroup = uuidPointer(&pending.Group)
+		checkAttempt := pending.CheckAttempt
+		checkedEventSeq := pending.CheckedEventSeq
+		raw.PendingRollbackCheckAttempt = &checkAttempt
+		raw.PendingRollbackCheckedEventSeq = &checkedEventSeq
+		evidenceCount := pending.EvidenceCount
+		raw.PendingRollbackEvidenceCount = &evidenceCount
+		evidenceDigest := string(pending.EvidenceDigest[:])
+		raw.PendingRollbackEvidenceDigest = &evidenceDigest
+		raw.PendingRollbackWriterID = uuidPointer(&pending.WriterID)
 		started := pending.StartedAt
 		raw.PendingRollbackStartedAt = &started
 	}
@@ -1045,6 +1465,10 @@ func (raw manifestDBRow) manifestRecord() (manifestRecord, error) {
 	rowDigest, err := fixedHash(raw.RowDigest)
 	if err != nil {
 		return manifestRecord{}, fmt.Errorf("decode manifest row digest: %w", err)
+	}
+	evidenceDigest, err := hashPointer(raw.EvidenceDigest)
+	if err != nil {
+		return manifestRecord{}, fmt.Errorf("decode manifest evidence digest: %w", err)
 	}
 	contractHash, err := fixedHash(raw.SchemaContractHash)
 	if err != nil {
@@ -1101,6 +1525,27 @@ func (raw manifestDBRow) manifestRecord() (manifestRecord, error) {
 	)
 	if err != nil {
 		return manifestRecord{}, fmt.Errorf("decode last-agreed manifest point: %w", err)
+	}
+	lastAgreedChecked, err := optionalHeadFromDB(
+		raw.LastAgreedCheckedEventSeq,
+		raw.LastAgreedCheckedOrigin,
+		raw.LastAgreedCheckedSlot,
+		raw.LastAgreedCheckedHash,
+		raw.LastAgreedCheckedNumber,
+		raw.LastAgreedCheckedIsByronEBB,
+	)
+	if err != nil {
+		return manifestRecord{}, fmt.Errorf(
+			"decode last-agreed evidence checked point: %w",
+			err,
+		)
+	}
+	lastAgreedEvidenceDigest, err := hashPointer(raw.LastAgreedEvidenceDigest)
+	if err != nil {
+		return manifestRecord{}, fmt.Errorf(
+			"decode last-agreed evidence digest: %w",
+			err,
+		)
 	}
 	floorPoint, err := pointFromDB(
 		raw.ServableFloorOrigin,
@@ -1165,6 +1610,9 @@ func (raw manifestDBRow) manifestRecord() (manifestRecord, error) {
 		TrustReason:            raw.TrustReason,
 		CheckStartedAt:         raw.CheckStartedAt,
 		CheckCompletedAt:       raw.CheckCompletedAt,
+		EvidenceState:          raw.EvidenceState,
+		EvidenceCount:          raw.EvidenceCount,
+		EvidenceDigest:         evidenceDigest,
 		Checked:                checked,
 		LastAgreed:             lastAgreed,
 		LastAgreedAt:           raw.LastAgreedAt,
@@ -1180,6 +1628,90 @@ func (raw manifestDBRow) manifestRecord() (manifestRecord, error) {
 		CreatedAt:              raw.CreatedAt,
 		UpdatedAt:              raw.UpdatedAt,
 	}
+	if raw.LastAgreedCheckID == nil {
+		if raw.LastAgreedAgreementGroup != nil ||
+			raw.LastAgreedCheckAttempt != 0 ||
+			raw.LastAgreedRequired != 0 ||
+			raw.LastAgreedConfirmed != 0 ||
+			lastAgreedChecked != nil ||
+			raw.LastAgreedEvidenceCount != 0 ||
+			lastAgreedEvidenceDigest != nil {
+			return manifestRecord{}, errors.New(
+				"absent last-agreed evidence reference carries fields",
+			)
+		}
+	} else {
+		if raw.LastAgreedAgreementGroup == nil ||
+			lastAgreedChecked == nil ||
+			lastAgreedEvidenceDigest == nil {
+			return manifestRecord{}, errors.New(
+				"last-agreed evidence reference is incomplete",
+			)
+		}
+		record.LastAgreedEvidence = &manifestEvidenceReference{
+			CheckID:   uuid16(*raw.LastAgreedCheckID),
+			Group:     uuid16(*raw.LastAgreedAgreementGroup),
+			Attempt:   raw.LastAgreedCheckAttempt,
+			Required:  raw.LastAgreedRequired,
+			Confirmed: raw.LastAgreedConfirmed,
+			Checked:   *lastAgreedChecked,
+			Count:     raw.LastAgreedEvidenceCount,
+			Digest:    *lastAgreedEvidenceDigest,
+		}
+	}
+	if raw.PendingEvidenceID == nil {
+		if raw.PendingEvidenceDigest != nil ||
+			raw.PendingEvidencePayload != "" ||
+			raw.PendingEvidenceWriter != nil ||
+			raw.PendingEvidenceAt != nil {
+			return manifestRecord{}, errors.New(
+				"manifest absent pending evidence write carries payload fields",
+			)
+		}
+	} else {
+		if raw.PendingEvidenceDigest == nil ||
+			raw.PendingEvidencePayload == "" ||
+			raw.PendingEvidenceWriter == nil ||
+			raw.PendingEvidenceAt == nil {
+			return manifestRecord{}, errors.New(
+				"manifest pending evidence write is incomplete",
+			)
+		}
+		digest, err := fixedHash(*raw.PendingEvidenceDigest)
+		if err != nil {
+			return manifestRecord{}, fmt.Errorf(
+				"decode pending evidence digest: %w",
+				err,
+			)
+		}
+		observation, err := decodePendingEvidencePayload(
+			raw.PendingEvidencePayload,
+		)
+		if err != nil {
+			return manifestRecord{}, err
+		}
+		if observation.ID != uuid16(*raw.PendingEvidenceID) {
+			return manifestRecord{}, errors.New(
+				"pending evidence payload ID differs from manifest reservation",
+			)
+		}
+		if err := model.VerifyPeerObservationIdentity(
+			observation,
+			digest[:],
+		); err != nil {
+			return manifestRecord{}, fmt.Errorf(
+				"verify pending evidence payload: %w",
+				err,
+			)
+		}
+		record.PendingEvidenceWrite = &manifestPendingEvidenceWrite{
+			Observation: observation,
+			Digest:      digest,
+			Payload:     raw.PendingEvidencePayload,
+			WriterID:    uuid16(*raw.PendingEvidenceWriter),
+			ReservedAt:  *raw.PendingEvidenceAt,
+		}
+	}
 	if raw.PendingRollbackState == "none" {
 		if raw.PendingRollbackID != nil ||
 			raw.PendingRollbackEventSeq != nil ||
@@ -1190,6 +1722,15 @@ func (raw manifestDBRow) manifestRecord() (manifestRecord, error) {
 		if raw.PendingRollbackID == nil ||
 			raw.PendingRollbackEventSeq == nil ||
 			raw.PendingRollbackOldPhysicalEventSeq == nil ||
+			raw.PendingRollbackDepth == nil ||
+			raw.PendingRollbackRequired == nil ||
+			raw.PendingRollbackCheckID == nil ||
+			raw.PendingRollbackAgreementGroup == nil ||
+			raw.PendingRollbackCheckAttempt == nil ||
+			raw.PendingRollbackCheckedEventSeq == nil ||
+			raw.PendingRollbackEvidenceCount == nil ||
+			raw.PendingRollbackEvidenceDigest == nil ||
+			raw.PendingRollbackWriterID == nil ||
 			raw.PendingRollbackStartedAt == nil {
 			return manifestRecord{}, errors.New("manifest pending rollback is incomplete")
 		}
@@ -1213,13 +1754,32 @@ func (raw manifestDBRow) manifestRecord() (manifestRecord, error) {
 		if err != nil {
 			return manifestRecord{}, fmt.Errorf("decode pending rollback old head: %w", err)
 		}
+		evidenceDigest, err := fixedHash(*raw.PendingRollbackEvidenceDigest)
+		if err != nil {
+			return manifestRecord{}, fmt.Errorf(
+				"decode pending rollback evidence digest: %w",
+				err,
+			)
+		}
 		record.PendingRollback = &manifestPendingRollback{
-			State:       raw.PendingRollbackState,
-			ID:          uuid16(*raw.PendingRollbackID),
-			EventSeq:    *raw.PendingRollbackEventSeq,
-			To:          to,
-			OldPhysical: manifestHead{EventSeq: *raw.PendingRollbackOldPhysicalEventSeq, Point: old},
-			StartedAt:   *raw.PendingRollbackStartedAt,
+			State:           raw.PendingRollbackState,
+			ID:              uuid16(*raw.PendingRollbackID),
+			EventSeq:        *raw.PendingRollbackEventSeq,
+			To:              to,
+			OldPhysical:     manifestHead{EventSeq: *raw.PendingRollbackOldPhysicalEventSeq, Point: old},
+			Depth:           *raw.PendingRollbackDepth,
+			Reason:          raw.PendingRollbackReason,
+			Peers:           append([]string(nil), raw.PendingRollbackObservedPeers...),
+			Operators:       append([]string(nil), raw.PendingRollbackObservedOperators...),
+			Required:        *raw.PendingRollbackRequired,
+			CheckID:         uuid16(*raw.PendingRollbackCheckID),
+			Group:           uuid16(*raw.PendingRollbackAgreementGroup),
+			CheckAttempt:    *raw.PendingRollbackCheckAttempt,
+			CheckedEventSeq: *raw.PendingRollbackCheckedEventSeq,
+			EvidenceCount:   *raw.PendingRollbackEvidenceCount,
+			EvidenceDigest:  evidenceDigest,
+			WriterID:        uuid16(*raw.PendingRollbackWriterID),
+			StartedAt:       *raw.PendingRollbackStartedAt,
 		}
 	}
 	normalizeManifestTimes(&record)
