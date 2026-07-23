@@ -30,18 +30,27 @@ SELECT greatest(
 	return eventSeq, nil
 }
 
-func (d *DB) ResolveActiveOutputs(
+func (d *DB) ResolveOutputStates(
 	ctx context.Context,
 	snapshot uint64,
 	refs []publication.OutputRef,
-) (map[publication.OutputRef]publication.ResolvedOutput, error) {
-	ret := make(map[publication.OutputRef]publication.ResolvedOutput)
+) (map[publication.OutputRef]publication.OutputResolution, error) {
+	ret := make(map[publication.OutputRef]publication.OutputResolution)
 	if len(refs) == 0 {
 		return ret, nil
 	}
-	hashes := make([]string, 0, len(refs))
-	indexes := make([]uint32, 0, len(refs))
+	uniqueRefs := make([]publication.OutputRef, 0, len(refs))
+	requested := make(map[publication.OutputRef]struct{}, len(refs))
 	for _, ref := range refs {
+		if _, duplicate := requested[ref]; duplicate {
+			continue
+		}
+		requested[ref] = struct{}{}
+		uniqueRefs = append(uniqueRefs, ref)
+	}
+	hashes := make([]string, 0, len(uniqueRefs))
+	indexes := make([]uint32, 0, len(uniqueRefs))
+	for _, ref := range uniqueRefs {
 		hashes = append(hashes, string(ref.Hash[:]))
 		indexes = append(indexes, ref.Index)
 	}
@@ -65,10 +74,14 @@ WHERE (o.tx_hash, o.output_index) IN
 )`
 	rows, err := d.conn.Query(ctx, query, hashes, indexes)
 	if err != nil {
-		return nil, fmt.Errorf("query active source outputs: %w", err)
+		return nil, fmt.Errorf("query source output facts: %w", err)
 	}
 	defer rows.Close()
-	publicationOutputs := make(map[uint64]map[publication.OutputRef]publication.ResolvedOutput)
+	publicationOutputs := make(
+		map[uint64]map[publication.OutputRef][]publication.ResolvedOutput,
+	)
+	outputFactSeen := make(map[publication.OutputRef]struct{}, len(uniqueRefs))
+	candidateSet := make(map[uint64]struct{})
 	var candidateIDs []uint64
 	for rows.Next() {
 		var hash []byte
@@ -94,6 +107,14 @@ WHERE (o.tx_hash, o.output_index) IN
 			return nil, err
 		}
 		ref := publication.OutputRef{Hash: converted, Index: index}
+		if _, requestedRef := requested[ref]; !requestedRef {
+			return nil, fmt.Errorf(
+				"output query returned unrequested fact %x#%d",
+				ref.Hash,
+				ref.Index,
+			)
+		}
+		outputFactSeen[ref] = struct{}{}
 		resolved := publication.ResolvedOutput{
 			Lovelace:              lovelace,
 			PaymentCredentialKind: credentialKind,
@@ -124,74 +145,93 @@ WHERE (o.tx_hash, o.output_index) IN
 		}
 		outputs := publicationOutputs[publicationID]
 		if outputs == nil {
-			candidateIDs = append(candidateIDs, publicationID)
-			outputs = make(map[publication.OutputRef]publication.ResolvedOutput)
+			outputs = make(
+				map[publication.OutputRef][]publication.ResolvedOutput,
+			)
 			publicationOutputs[publicationID] = outputs
 		}
-		if previous, duplicate := outputs[ref]; duplicate &&
-			!sameResolvedOutput(previous, resolved) {
-			return nil, fmt.Errorf(
-				"publication %d has conflicting output facts for %x#%d",
-				publicationID,
-				ref.Hash,
-				ref.Index,
-			)
+		outputs[ref] = append(outputs[ref], resolved)
+		if _, found := candidateSet[publicationID]; !found {
+			candidateSet[publicationID] = struct{}{}
+			candidateIDs = append(candidateIDs, publicationID)
 		}
-		outputs[ref] = resolved
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate active source outputs: %w", err)
+		return nil, fmt.Errorf("iterate source output facts: %w", err)
 	}
 	if err := rows.Close(); err != nil {
-		return nil, fmt.Errorf("close active source outputs: %w", err)
-	}
-	if len(candidateIDs) == 0 {
-		return ret, nil
+		return nil, fmt.Errorf("close source output facts: %w", err)
 	}
 	activeIDs, err := d.activeCandidatePublications(ctx, snapshot, candidateIDs)
 	if err != nil {
 		return nil, err
 	}
+	activeOutputs := make(
+		map[publication.OutputRef]publication.ResolvedOutput,
+	)
+	activeOutputPublication := make(map[publication.OutputRef]uint64)
 	for _, publicationID := range activeIDs {
-		for ref, resolved := range publicationOutputs[publicationID] {
-			if previous, duplicate := ret[ref]; duplicate &&
-				!sameResolvedOutput(previous, resolved) {
+		for ref, facts := range publicationOutputs[publicationID] {
+			if len(facts) != 1 {
 				return nil, fmt.Errorf(
-					"active publications conflict for output %x#%d",
+					"active publication %d has %d output facts for %x#%d",
+					publicationID,
+					len(facts),
 					ref.Hash,
 					ref.Index,
 				)
 			}
-			ret[ref] = resolved
+			if previous, duplicate := activeOutputPublication[ref]; duplicate {
+				return nil, fmt.Errorf(
+					"active publications %d and %d both contain output %x#%d",
+					previous,
+					publicationID,
+					ref.Hash,
+					ref.Index,
+				)
+			}
+			activeOutputPublication[ref] = publicationID
+			activeOutputs[ref] = facts[0]
 		}
 	}
-	spent, err := d.activeConsumedOutputRefs(ctx, snapshot, refs)
+	activeConsumptions, err := d.activeConsumedOutputRefs(
+		ctx,
+		snapshot,
+		uniqueRefs,
+	)
 	if err != nil {
 		return nil, err
 	}
-	for ref := range spent {
-		delete(ret, ref)
+	for _, ref := range uniqueRefs {
+		_, factSeen := outputFactSeen[ref]
+		resolution := publication.OutputResolution{
+			OutputFactSeen: factSeen,
+		}
+		if _, consumed := activeConsumptions[ref]; consumed {
+			resolution.State = publication.OutputKnownInactive
+			resolution.ActiveConsumption = true
+			if output, active := activeOutputs[ref]; active {
+				resolution.Output = output
+			}
+		} else if output, active := activeOutputs[ref]; active {
+			resolution.State = publication.OutputActiveUnspent
+			resolution.Output = output
+		} else if factSeen {
+			resolution.State = publication.OutputKnownInactive
+		} else {
+			resolution.State = publication.OutputNeverSeen
+		}
+		ret[ref] = resolution
 	}
 	return ret, nil
-}
-
-func sameResolvedOutput(left, right publication.ResolvedOutput) bool {
-	if left.Lovelace != right.Lovelace ||
-		left.PaymentCredentialKind != right.PaymentCredentialKind {
-		return false
-	}
-	if left.PaymentCredentialHash == nil || right.PaymentCredentialHash == nil {
-		return left.PaymentCredentialHash == nil && right.PaymentCredentialHash == nil
-	}
-	return *left.PaymentCredentialHash == *right.PaymentCredentialHash
 }
 
 func (d *DB) activeConsumedOutputRefs(
 	ctx context.Context,
 	snapshot uint64,
 	refs []publication.OutputRef,
-) (map[publication.OutputRef]struct{}, error) {
-	ret := make(map[publication.OutputRef]struct{})
+) (map[publication.OutputRef]uint64, error) {
+	ret := make(map[publication.OutputRef]uint64)
 	if len(refs) == 0 {
 		return ret, nil
 	}
@@ -202,7 +242,7 @@ func (d *DB) activeConsumedOutputRefs(
 		indexes = append(indexes, ref.Index)
 	}
 	const query = `
-SELECT source_tx_hash, source_output_index, groupUniqArray(publication_id)
+SELECT source_tx_hash, source_output_index, publication_id, count()
 FROM clicksync.inputs
 WHERE is_consumed
   AND (source_tx_hash, source_output_index) IN
@@ -213,19 +253,26 @@ WHERE is_consumed
         SELECT arrayJoin(arrayZip(?, ?)) AS ref
     )
 )
-GROUP BY source_tx_hash, source_output_index`
+GROUP BY source_tx_hash, source_output_index, publication_id`
 	rows, err := d.conn.Query(ctx, query, hashes, indexes)
 	if err != nil {
 		return nil, fmt.Errorf("query candidate consumed outputs: %w", err)
 	}
 	defer rows.Close()
-	byPublication := make(map[uint64][]publication.OutputRef)
+	byPublication := make(map[uint64]map[publication.OutputRef]uint64)
+	candidateSet := make(map[uint64]struct{})
 	var candidateIDs []uint64
 	for rows.Next() {
 		var hashBytes []byte
 		var index uint32
-		var publicationIDs []uint64
-		if err := rows.Scan(&hashBytes, &index, &publicationIDs); err != nil {
+		var publicationID uint64
+		var factCount uint64
+		if err := rows.Scan(
+			&hashBytes,
+			&index,
+			&publicationID,
+			&factCount,
+		); err != nil {
 			return nil, fmt.Errorf("scan candidate consumed output: %w", err)
 		}
 		hash, err := hash32(hashBytes)
@@ -233,11 +280,23 @@ GROUP BY source_tx_hash, source_output_index`
 			return nil, err
 		}
 		ref := publication.OutputRef{Hash: hash, Index: index}
-		for _, publicationID := range publicationIDs {
-			if _, first := byPublication[publicationID]; !first {
-				candidateIDs = append(candidateIDs, publicationID)
-			}
-			byPublication[publicationID] = append(byPublication[publicationID], ref)
+		facts := byPublication[publicationID]
+		if facts == nil {
+			facts = make(map[publication.OutputRef]uint64)
+			byPublication[publicationID] = facts
+		}
+		if _, duplicate := facts[ref]; duplicate {
+			return nil, fmt.Errorf(
+				"consumption query duplicated publication %d output %x#%d",
+				publicationID,
+				ref.Hash,
+				ref.Index,
+			)
+		}
+		facts[ref] = factCount
+		if _, found := candidateSet[publicationID]; !found {
+			candidateSet[publicationID] = struct{}{}
+			candidateIDs = append(candidateIDs, publicationID)
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -248,8 +307,26 @@ GROUP BY source_tx_hash, source_output_index`
 		return nil, err
 	}
 	for _, publicationID := range activeIDs {
-		for _, ref := range byPublication[publicationID] {
-			ret[ref] = struct{}{}
+		for ref, factCount := range byPublication[publicationID] {
+			if factCount != 1 {
+				return nil, fmt.Errorf(
+					"active publication %d has %d consumption facts for %x#%d",
+					publicationID,
+					factCount,
+					ref.Hash,
+					ref.Index,
+				)
+			}
+			if previous, duplicate := ret[ref]; duplicate {
+				return nil, fmt.Errorf(
+					"active publications %d and %d both consume output %x#%d",
+					previous,
+					publicationID,
+					ref.Hash,
+					ref.Index,
+				)
+			}
+			ret[ref] = publicationID
 		}
 	}
 	return ret, nil

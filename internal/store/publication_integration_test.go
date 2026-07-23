@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -456,6 +457,34 @@ WHERE tx_hash = ?`, string(fourthTx[:])).Scan(&effectiveCollateralFee); err != n
 		t.Fatalf("derived effective collateral fee = %v, want 60", effectiveCollateralFee)
 	}
 
+	snapshot, err := db.CommittedSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	neverSeenRef := publication.OutputRef{Hash: hash32Fill(0x78), Index: 10}
+	firstOutputRef := publication.OutputRef{Hash: firstTx, Index: 0}
+	unknownRef := publication.OutputRef{Hash: unknownTx, Index: 9}
+	states, err := db.ResolveOutputStates(ctx, snapshot, []publication.OutputRef{
+		firstOutputRef,
+		unknownRef,
+		neverSeenRef,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state := states[firstOutputRef]; state.State != publication.OutputKnownInactive ||
+		!state.OutputFactSeen || !state.ActiveConsumption {
+		t.Fatalf("spent active output state = %+v", state)
+	}
+	if state := states[unknownRef]; state.State != publication.OutputKnownInactive ||
+		state.OutputFactSeen || !state.ActiveConsumption {
+		t.Fatalf("pre-boundary active consumption state = %+v", state)
+	}
+	if state := states[neverSeenRef]; state.State != publication.OutputNeverSeen ||
+		state.OutputFactSeen || state.ActiveConsumption {
+		t.Fatalf("never-seen output state = %+v", state)
+	}
+
 	firstPoint := publication.Point{
 		Slot:        firstBlock.Slot,
 		Hash:        firstBlock.Hash,
@@ -486,7 +515,7 @@ WHERE tx_hash = ?`, string(fourthTx[:])).Scan(&effectiveCollateralFee); err != n
 	if err := db.InsertInvalidations(ctx, rollback, descendants); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := db.CommittedSnapshot(ctx)
+	snapshot, err = db.CommittedSnapshot(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -532,6 +561,28 @@ WHERE tx_hash = ?`, string(fourthTx[:])).Scan(&effectiveCollateralFee); err != n
 	}
 	if len(activeAfterHeader) != 0 {
 		t.Fatalf("committed rollback left descendant active: %v", activeAfterHeader)
+	}
+	forkOutputRef := publication.OutputRef{Hash: secondTx, Index: 0}
+	states, err = db.ResolveOutputStates(ctx, snapshot, []publication.OutputRef{
+		firstOutputRef,
+		unknownRef,
+		forkOutputRef,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state := states[firstOutputRef]; state.State != publication.OutputActiveUnspent ||
+		!state.OutputFactSeen || state.ActiveConsumption ||
+		state.Output.Lovelace != 42 {
+		t.Fatalf("rollback-restored output state = %+v", state)
+	}
+	if state := states[unknownRef]; state.State != publication.OutputNeverSeen ||
+		state.OutputFactSeen || state.ActiveConsumption {
+		t.Fatalf("rollback-invalidated consumption state = %+v", state)
+	}
+	if state := states[forkOutputRef]; state.State != publication.OutputKnownInactive ||
+		!state.OutputFactSeen || state.ActiveConsumption {
+		t.Fatalf("rollback-invalidated fork output state = %+v", state)
 	}
 	tip, err := db.CommittedTip(ctx, snapshot)
 	if err != nil {
@@ -596,6 +647,93 @@ LIMIT 1`).Scan(
 			manifestNumber,
 			manifestEBB,
 		)
+	}
+
+	canonicalAllocator, err := db.NewAllocator(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonicalCoordinator, err := publication.New(
+		db,
+		canonicalAllocator,
+		lock,
+		publication.Config{
+			WriterID:    writerID,
+			WriterBuild: "integration",
+			Now: func() time.Time {
+				return now
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonicalTx := hash32Fill(0x34)
+	canonicalBlock := model.Block{
+		Hash:                   hash32Fill(0x35),
+		ParentHash:             &firstBlock.Hash,
+		Slot:                   102,
+		Number:                 11,
+		Era:                    "conway",
+		Type:                   7,
+		BodyHashVerified:       true,
+		TransactionIDsVerified: true,
+		ObservedAt:             now,
+		Transactions: []model.Transaction{{
+			Hash:         canonicalTx,
+			Order:        0,
+			Era:          "conway",
+			Phase2Valid:  true,
+			FlowKind:     "regular",
+			DeclaredFee:  uint64Pointer(2),
+			EffectiveFee: uint64Pointer(2),
+			MintApplied:  true,
+			Inputs: []model.Input{
+				inputFixture(canonicalTx, 0, unknownTx, 9, 0),
+			},
+		}},
+	}
+	if _, err := canonicalCoordinator.PublishBatch(
+		ctx,
+		publication.Batch{
+			Items: []publication.BatchItem{{
+				Block:  canonicalBlock,
+				Source: sourceFixture(),
+			}},
+			FirstStagedAt: now,
+		},
+	); err != nil {
+		t.Fatalf("canonical consumption after rollback invalidation: %v", err)
+	}
+	snapshot, err = db.CommittedSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	states, err = db.ResolveOutputStates(
+		ctx,
+		snapshot,
+		[]publication.OutputRef{unknownRef},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state := states[unknownRef]; state.State != publication.OutputKnownInactive ||
+		state.OutputFactSeen || !state.ActiveConsumption {
+		t.Fatalf("later canonical consumption state = %+v", state)
+	}
+	if err := db.conn.Exec(ctx, `
+INSERT INTO clicksync.inputs
+SELECT *
+FROM clicksync.inputs
+WHERE tx_hash = ?`, string(canonicalTx[:])); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ResolveOutputStates(
+		ctx,
+		snapshot,
+		[]publication.OutputRef{unknownRef},
+	); err == nil || !strings.Contains(err.Error(), "2 consumption facts") {
+		t.Fatalf("conflicting active consumption facts error = %v", err)
 	}
 
 	audit, err := NewWriterAudit(

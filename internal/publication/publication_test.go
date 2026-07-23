@@ -44,6 +44,7 @@ type fakeBackend struct {
 	calls               []string
 	snapshot            uint64
 	resolved            map[OutputRef]ResolvedOutput
+	resolutions         map[OutputRef]OutputResolution
 	datums              map[model.Hash32][]byte
 	adoptions           int
 	rollbackHeaders     int
@@ -77,13 +78,27 @@ func (backend *fakeBackend) CommittedTip(context.Context, uint64) (Point, error)
 func (backend *fakeBackend) GenesisState(context.Context) (bool, bool, error) {
 	return backend.startOrigin, backend.genesisSeeded, nil
 }
-func (backend *fakeBackend) ResolveActiveOutputs(
+func (backend *fakeBackend) ResolveOutputStates(
 	_ context.Context,
 	_ uint64,
-	_ []OutputRef,
-) (map[OutputRef]ResolvedOutput, error) {
+	refs []OutputRef,
+) (map[OutputRef]OutputResolution, error) {
 	backend.call("resolve")
-	return backend.resolved, nil
+	ret := make(map[OutputRef]OutputResolution, len(refs))
+	for _, ref := range refs {
+		if resolution, found := backend.resolutions[ref]; found {
+			ret[ref] = resolution
+		} else if output, found := backend.resolved[ref]; found {
+			ret[ref] = OutputResolution{
+				State:          OutputActiveUnspent,
+				Output:         output,
+				OutputFactSeen: true,
+			}
+		} else {
+			ret[ref] = OutputResolution{State: OutputNeverSeen}
+		}
+	}
+	return ret, nil
 }
 func (backend *fakeBackend) ExistingDatumBodies(
 	_ context.Context,
@@ -462,6 +477,320 @@ func TestCompleteHistoryRejectsUnresolvedButAcceptsCrossBlockInput(t *testing.T)
 		FirstStagedAt: testNow(),
 	}); err != nil {
 		t.Fatalf("complete-history cross-block input: %v", err)
+	}
+}
+
+func TestBatchRejectsRepeatedPreBoundaryConsumption(t *testing.T) {
+	ref := OutputRef{Hash: filled32(0x71), Index: 4}
+	firstTx := filled32(0x72)
+	secondTx := filled32(0x73)
+	items := []BatchItem{
+		{
+			Block: model.Block{Transactions: []model.Transaction{{
+				Hash:     firstTx,
+				Order:    0,
+				FlowKind: "regular",
+				Inputs: []model.Input{
+					testRoleInput(firstTx, 0, ref, "regular", true, 0),
+				},
+			}}},
+		},
+		{
+			Block: model.Block{Transactions: []model.Transaction{{
+				Hash:     secondTx,
+				Order:    0,
+				FlowKind: "regular",
+				Inputs: []model.Input{
+					testRoleInput(secondTx, 0, ref, "regular", true, 0),
+				},
+			}}},
+		},
+	}
+	coordinator := &Coordinator{backend: &fakeBackend{}}
+	if _, err := coordinator.resolveBatchInputs(
+		context.Background(),
+		0,
+		items,
+	); err == nil || !strings.Contains(err.Error(), "appears after an earlier consumption") {
+		t.Fatalf("repeated pre-boundary consumption error = %v", err)
+	}
+}
+
+func TestCommittedConsumptionWithoutOutputFactIsKnownInactive(t *testing.T) {
+	ref := OutputRef{Hash: filled32(0x74), Index: 5}
+	txHash := filled32(0x75)
+	backend := &fakeBackend{resolutions: map[OutputRef]OutputResolution{
+		ref: {
+			State:             OutputKnownInactive,
+			ActiveConsumption: true,
+		},
+	}}
+	coordinator := &Coordinator{backend: backend}
+	if _, err := coordinator.resolveBatchInputs(
+		context.Background(),
+		9,
+		[]BatchItem{{Block: model.Block{Transactions: []model.Transaction{{
+			Hash:     txHash,
+			FlowKind: "regular",
+			Inputs: []model.Input{
+				testRoleInput(txHash, 0, ref, "regular", true, 0),
+			},
+		}}}}},
+	); err == nil || !strings.Contains(err.Error(), "is known inactive") {
+		t.Fatalf("committed repeat consumption error = %v", err)
+	}
+}
+
+func TestBatchRejectsLocallyProducedOutputSpentTwice(t *testing.T) {
+	producerHash := filled32(0x76)
+	ref := OutputRef{Hash: producerHash, Index: 0}
+	firstSpend := filled32(0x77)
+	secondSpend := filled32(0x78)
+	items := []BatchItem{{Block: model.Block{Transactions: []model.Transaction{
+		{
+			Hash:     producerHash,
+			Order:    0,
+			FlowKind: "regular",
+			Outputs: []model.Output{{
+				TransactionHash:       producerHash,
+				TransactionOrder:      0,
+				PaymentCredentialKind: "none",
+				Lovelace:              10,
+			}},
+		},
+		{
+			Hash:     firstSpend,
+			Order:    1,
+			FlowKind: "regular",
+			Inputs: []model.Input{
+				testRoleInput(firstSpend, 1, ref, "regular", true, 0),
+			},
+		},
+		{
+			Hash:     secondSpend,
+			Order:    2,
+			FlowKind: "regular",
+			Inputs: []model.Input{
+				testRoleInput(secondSpend, 2, ref, "regular", true, 0),
+			},
+		},
+	}}}}
+	coordinator := &Coordinator{backend: &fakeBackend{}}
+	if _, err := coordinator.resolveBatchInputs(
+		context.Background(),
+		0,
+		items,
+	); err == nil || !strings.Contains(err.Error(), "appears after an earlier consumption") {
+		t.Fatalf("local output double-spend error = %v", err)
+	}
+}
+
+func TestBatchRejectsAnyInputRoleAfterEarlierConsumption(t *testing.T) {
+	ref := OutputRef{Hash: filled32(0x79), Index: 6}
+	for _, role := range []string{"reference", "collateral"} {
+		t.Run(role, func(t *testing.T) {
+			firstTx := filled32(0x7a)
+			secondTx := filled32(0x7b)
+			items := []BatchItem{{Block: model.Block{Transactions: []model.Transaction{
+				{
+					Hash:     firstTx,
+					Order:    0,
+					FlowKind: "regular",
+					Inputs: []model.Input{
+						testRoleInput(firstTx, 0, ref, "regular", true, 0),
+					},
+				},
+				{
+					Hash:     secondTx,
+					Order:    1,
+					FlowKind: "regular",
+					Inputs: []model.Input{
+						testRoleInput(secondTx, 1, ref, role, false, 0),
+					},
+				},
+			}}}}
+			coordinator := &Coordinator{backend: &fakeBackend{}}
+			if _, err := coordinator.resolveBatchInputs(
+				context.Background(),
+				0,
+				items,
+			); err == nil || !strings.Contains(err.Error(), "appears after an earlier consumption") {
+				t.Fatalf("later %s input error = %v", role, err)
+			}
+		})
+	}
+}
+
+func TestBatchPreservesAllowedSameTransactionRoleOverlaps(t *testing.T) {
+	ref := OutputRef{Hash: filled32(0x7c), Index: 7}
+	for _, test := range []struct {
+		name       string
+		flow       string
+		phaseValid bool
+		inputs     []model.Input
+	}{
+		{
+			name:       "valid regular and collateral",
+			flow:       "regular",
+			phaseValid: true,
+			inputs: []model.Input{
+				testRoleInput(filled32(0x7d), 0, ref, "regular", true, 0),
+				testRoleInput(filled32(0x7d), 0, ref, "collateral", false, 0),
+			},
+		},
+		{
+			name:       "invalid regular and collateral",
+			flow:       "collateral",
+			phaseValid: false,
+			inputs: []model.Input{
+				testRoleInput(filled32(0x7e), 0, ref, "regular", false, 0),
+				testRoleInput(filled32(0x7e), 0, ref, "collateral", true, 0),
+			},
+		},
+		{
+			name:       "collateral and reference",
+			flow:       "regular",
+			phaseValid: true,
+			inputs: []model.Input{
+				testRoleInput(filled32(0x7f), 0, ref, "collateral", false, 0),
+				testRoleInput(filled32(0x7f), 0, ref, "reference", false, 0),
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			txHash := test.inputs[0].TransactionHash
+			fee := uint64(1)
+			transaction := model.Transaction{
+				Hash:        txHash,
+				Era:         "conway",
+				FlowKind:    test.flow,
+				Phase2Valid: test.phaseValid,
+				DeclaredFee: &fee,
+				MintApplied: test.phaseValid,
+				Inputs:      test.inputs,
+			}
+			if test.phaseValid {
+				transaction.EffectiveFee = &fee
+			}
+			block := validBlock()
+			block.Transactions = []model.Transaction{transaction}
+			backend := &fakeBackend{}
+			coordinator := newFakeCoordinator(
+				t,
+				backend,
+				&fakeAllocator{},
+				&fakeLock{held: true},
+				nil,
+			)
+			if _, err := coordinator.PublishBatch(
+				context.Background(),
+				Batch{
+					Items: []BatchItem{{
+						Block:  block,
+						Source: validSource(),
+					}},
+					FirstStagedAt: testNow(),
+				},
+			); err != nil {
+				t.Fatal(err)
+			}
+			if len(backend.lastAttempt.Block.Transactions[0].Inputs) != 2 {
+				t.Fatalf(
+					"role rows = %#v",
+					backend.lastAttempt.Block.Transactions[0].Inputs,
+				)
+			}
+		})
+	}
+}
+
+func TestBatchRejectsRollbackInactiveForkOutput(t *testing.T) {
+	ref := OutputRef{Hash: filled32(0x80), Index: 8}
+	txHash := filled32(0x81)
+	backend := &fakeBackend{resolutions: map[OutputRef]OutputResolution{
+		ref: {
+			State:          OutputKnownInactive,
+			OutputFactSeen: true,
+		},
+	}}
+	coordinator := &Coordinator{backend: backend}
+	if _, err := coordinator.resolveBatchInputs(
+		context.Background(),
+		10,
+		[]BatchItem{{Block: model.Block{Transactions: []model.Transaction{{
+			Hash:     txHash,
+			FlowKind: "regular",
+			Inputs: []model.Input{
+				testRoleInput(txHash, 0, ref, "reference", false, 0),
+			},
+		}}}}},
+	); err == nil || !strings.Contains(err.Error(), "is known inactive") {
+		t.Fatalf("inactive fork output error = %v", err)
+	}
+}
+
+func TestBatchRejectsSelfAndForwardOutputReferences(t *testing.T) {
+	producerHash := filled32(0x82)
+	ref := OutputRef{Hash: producerHash, Index: 0}
+	output := model.Output{
+		TransactionHash:       producerHash,
+		PaymentCredentialKind: "none",
+		Lovelace:              1,
+	}
+	consumerHash := filled32(0x83)
+	consumer := model.Transaction{
+		Hash:     consumerHash,
+		FlowKind: "regular",
+		Inputs: []model.Input{
+			testRoleInput(consumerHash, 0, ref, "regular", true, 0),
+		},
+	}
+	producer := model.Transaction{
+		Hash:     producerHash,
+		FlowKind: "regular",
+		Outputs:  []model.Output{output},
+	}
+	self := producer
+	self.Inputs = []model.Input{
+		testRoleInput(producerHash, 0, ref, "regular", true, 0),
+	}
+	for _, test := range []struct {
+		name  string
+		items []BatchItem
+	}{
+		{
+			name: "self reference",
+			items: []BatchItem{{Block: model.Block{
+				Transactions: []model.Transaction{self},
+			}}},
+		},
+		{
+			name: "later transaction",
+			items: []BatchItem{{Block: model.Block{
+				Transactions: []model.Transaction{consumer, producer},
+			}}},
+		},
+		{
+			name: "later block",
+			items: []BatchItem{
+				{Block: model.Block{Transactions: []model.Transaction{consumer}}},
+				{Block: model.Block{Transactions: []model.Transaction{producer}}},
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			coordinator := &Coordinator{backend: &fakeBackend{}}
+			if _, err := coordinator.resolveBatchInputs(
+				context.Background(),
+				0,
+				test.items,
+			); err == nil || !strings.Contains(
+				err.Error(),
+				"same or a future batch position",
+			) {
+				t.Fatalf("forward-reference error = %v", err)
+			}
+		})
 	}
 }
 
@@ -983,6 +1312,25 @@ func filled28(value byte) model.Hash28 {
 }
 
 func pointer32(value uint32) *uint32 { return &value }
+
+func testRoleInput(
+	txHash model.Hash32,
+	txOrder uint32,
+	ref OutputRef,
+	role string,
+	consumed bool,
+	ordinal uint32,
+) model.Input {
+	return model.Input{
+		TransactionHash:  txHash,
+		TransactionOrder: txOrder,
+		SourceHash:       ref.Hash,
+		SourceIndex:      ref.Index,
+		BodyOrdinal:      ordinal,
+		Role:             role,
+		Consumed:         consumed,
+	}
+}
 
 func testNow() time.Time {
 	return time.Date(2026, 7, 23, 1, 2, 3, 0, time.UTC)

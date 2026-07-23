@@ -32,6 +32,21 @@ type ResolvedOutput struct {
 	PaymentCredentialHash *model.Hash28
 }
 
+type OutputResolutionState string
+
+const (
+	OutputNeverSeen     OutputResolutionState = "never_seen"
+	OutputActiveUnspent OutputResolutionState = "active_unspent"
+	OutputKnownInactive OutputResolutionState = "known_inactive"
+)
+
+type OutputResolution struct {
+	State             OutputResolutionState
+	Output            ResolvedOutput
+	OutputFactSeen    bool
+	ActiveConsumption bool
+}
+
 type Point struct {
 	Origin      bool
 	Slot        uint64
@@ -165,7 +180,7 @@ type Backend interface {
 	CommittedSnapshot(context.Context) (uint64, error)
 	CommittedTip(context.Context, uint64) (Point, error)
 	GenesisState(context.Context) (bool, bool, error)
-	ResolveActiveOutputs(context.Context, uint64, []OutputRef) (map[OutputRef]ResolvedOutput, error)
+	ResolveOutputStates(context.Context, uint64, []OutputRef) (map[OutputRef]OutputResolution, error)
 	ExistingDatumBodies(context.Context, []model.Hash32) (map[model.Hash32][]byte, error)
 
 	InsertPeerObservations(context.Context, []model.PeerObservation) error
@@ -717,16 +732,39 @@ func (coordinator *Coordinator) resolveBatchInputs(
 			}
 		}
 	}
-	active, err := coordinator.backend.ResolveActiveOutputs(ctx, snapshot, refs)
+	prior, err := coordinator.backend.ResolveOutputStates(ctx, snapshot, refs)
 	if err != nil {
-		return nil, fmt.Errorf("resolve prior active outputs: %w", err)
+		return nil, fmt.Errorf("resolve prior output states: %w", err)
 	}
 	type stagedOutput struct {
-		block  int
-		order  uint32
-		output ResolvedOutput
+		block       int
+		transaction int
+		output      ResolvedOutput
 	}
 	produced := make(map[OutputRef]stagedOutput)
+	for blockIndex, item := range items {
+		for transactionIndex, transaction := range item.Block.Transactions {
+			for _, output := range transaction.Outputs {
+				ref := OutputRef{Hash: output.TransactionHash, Index: output.Index}
+				if _, duplicate := produced[ref]; duplicate {
+					return nil, fmt.Errorf(
+						"duplicate batch output %x#%d",
+						ref.Hash,
+						ref.Index,
+					)
+				}
+				produced[ref] = stagedOutput{
+					block:       blockIndex,
+					transaction: transactionIndex,
+					output: ResolvedOutput{
+						Lovelace:              output.Lovelace,
+						PaymentCredentialKind: output.PaymentCredentialKind,
+						PaymentCredentialHash: cloneHash28(output.PaymentCredentialHash),
+					},
+				}
+			}
+		}
+	}
 	consumed := make(map[OutputRef]struct{})
 	ret := make([]model.Block, len(items))
 	for blockIndex, item := range items {
@@ -737,32 +775,97 @@ func (coordinator *Coordinator) resolveBatchInputs(
 			transaction.Inputs = append([]model.Input(nil), transaction.Inputs...)
 			transaction.Redeemers = append([]model.Redeemer(nil), transaction.Redeemers...)
 			resolved := make(map[OutputRef]ResolvedOutput, len(transaction.Inputs))
+			consumedByTransaction := make(map[OutputRef]struct{})
 			for inputIndex := range transaction.Inputs {
 				input := &transaction.Inputs[inputIndex]
 				ref := OutputRef{Hash: input.SourceHash, Index: input.SourceIndex}
-				if input.Consumed {
-					if _, duplicate := consumed[ref]; duplicate {
-						return nil, fmt.Errorf("batch output %x#%d is consumed more than once", ref.Hash, ref.Index)
-					}
-					consumed[ref] = struct{}{}
+				if _, alreadyConsumed := consumed[ref]; alreadyConsumed {
+					return nil, fmt.Errorf(
+						"batch output %x#%d appears after an earlier consumption",
+						ref.Hash,
+						ref.Index,
+					)
 				}
-				priorOutput, prior := active[ref]
+				if input.Consumed {
+					if _, duplicate := consumedByTransaction[ref]; duplicate {
+						return nil, fmt.Errorf(
+							"batch output %x#%d has more than one consumption effect in one transaction",
+							ref.Hash,
+							ref.Index,
+						)
+					}
+					consumedByTransaction[ref] = struct{}{}
+				}
+				resolution, found := prior[ref]
+				if !found {
+					return nil, fmt.Errorf(
+						"backend omitted output state for %x#%d",
+						ref.Hash,
+						ref.Index,
+					)
+				}
 				staged, sameBatch := produced[ref]
 				stagedBefore := sameBatch &&
 					(staged.block < blockIndex ||
-						(staged.block == blockIndex && staged.order < transaction.Order))
-				if prior && stagedBefore {
+						(staged.block == blockIndex &&
+							staged.transaction < transactionIndex))
+				if sameBatch && !stagedBefore {
+					return nil, fmt.Errorf(
+						"output %x#%d is produced at the same or a future batch position",
+						ref.Hash,
+						ref.Index,
+					)
+				}
+				if resolution.State == OutputActiveUnspent && stagedBefore {
 					return nil, fmt.Errorf(
 						"output %x#%d exists in both the active snapshot and staged prefix",
 						ref.Hash,
 						ref.Index,
 					)
 				}
-				input.SourceResolved = prior || stagedBefore
-				if prior {
-					resolved[ref] = priorOutput
-				} else if stagedBefore {
+				switch {
+				case stagedBefore && !resolution.ActiveConsumption:
+					input.SourceResolved = true
 					resolved[ref] = staged.output
+				case resolution.State == OutputActiveUnspent:
+					if !resolution.OutputFactSeen || resolution.ActiveConsumption {
+						return nil, fmt.Errorf(
+							"backend returned inconsistent active output state for %x#%d",
+							ref.Hash,
+							ref.Index,
+						)
+					}
+					input.SourceResolved = true
+					resolved[ref] = resolution.Output
+				case resolution.State == OutputNeverSeen:
+					if resolution.OutputFactSeen || resolution.ActiveConsumption {
+						return nil, fmt.Errorf(
+							"backend returned inconsistent never-seen output state for %x#%d",
+							ref.Hash,
+							ref.Index,
+						)
+					}
+					input.SourceResolved = false
+				case resolution.State == OutputKnownInactive:
+					if !resolution.OutputFactSeen && !resolution.ActiveConsumption {
+						return nil, fmt.Errorf(
+							"backend returned unevidenced inactive output state for %x#%d",
+							ref.Hash,
+							ref.Index,
+						)
+					}
+					return nil, fmt.Errorf(
+						"output %x#%d is known inactive",
+						ref.Hash,
+						ref.Index,
+					)
+				default:
+					return nil, fmt.Errorf(
+						"backend returned unknown output state %q for %x#%d",
+						resolution.State,
+						ref.Hash,
+						ref.Index,
+					)
 				}
 			}
 			if err := resolveTransactionFacts(transaction, resolved); err != nil {
@@ -773,20 +876,8 @@ func (coordinator *Coordinator) resolveBatchInputs(
 					err,
 				)
 			}
-			for _, output := range transaction.Outputs {
-				ref := OutputRef{Hash: output.TransactionHash, Index: output.Index}
-				if _, duplicate := produced[ref]; duplicate {
-					return nil, fmt.Errorf("duplicate batch output %x#%d", ref.Hash, ref.Index)
-				}
-				produced[ref] = stagedOutput{
-					block: blockIndex,
-					order: transaction.Order,
-					output: ResolvedOutput{
-						Lovelace:              output.Lovelace,
-						PaymentCredentialKind: output.PaymentCredentialKind,
-						PaymentCredentialHash: cloneHash28(output.PaymentCredentialHash),
-					},
-				}
+			for ref := range consumedByTransaction {
+				consumed[ref] = struct{}{}
 			}
 		}
 		ret[blockIndex] = block
