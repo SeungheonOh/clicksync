@@ -2,8 +2,10 @@ package clickhouse
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"math"
 
 	"golang.org/x/crypto/blake2b"
@@ -66,7 +68,14 @@ func scanOutput(row scanner) (model.Output, error) {
 	); err != nil {
 		return model.Output{}, err
 	}
-	return makeOutput(values)
+	output, err := makeOutput(values)
+	if err != nil {
+		return model.Output{}, transactionCorruption(
+			"invalid persisted output: %v",
+			err,
+		)
+	}
+	return output, nil
 }
 
 func scanAddressOutput(row scanner) (model.Output, uint64, error) {
@@ -95,7 +104,13 @@ func scanAddressOutput(row scanner) (model.Output, uint64, error) {
 		return model.Output{}, 0, err
 	}
 	output, err := makeOutput(values)
-	return output, publicationID, err
+	if err != nil {
+		return model.Output{}, 0, transactionCorruption(
+			"invalid persisted output: %v",
+			err,
+		)
+	}
+	return output, publicationID, nil
 }
 
 func makeOutput(values outputValues) (model.Output, error) {
@@ -112,6 +127,11 @@ func makeOutput(values outputValues) (model.Output, error) {
 	}
 	assets := make([]model.OutputAsset, len(values.policies))
 	for index := range values.policies {
+		if len(values.names[index]) > 32 {
+			return model.Output{}, errors.New(
+				"output asset name exceeds 32 bytes",
+			)
+		}
 		policy, err := model.PolicyIDFromBytes([]byte(values.policies[index]))
 		if err != nil {
 			return model.Output{}, err
@@ -213,7 +233,15 @@ func makeOutput(values outputValues) (model.Output, error) {
 		output.ReferenceScriptHash = &value
 	}
 	if values.referenceLanguage != nil {
-		output.ReferenceScriptLanguage = *values.referenceLanguage
+		switch *values.referenceLanguage {
+		case "native", "plutus_v1", "plutus_v2", "plutus_v3", "plutus_v4":
+			output.ReferenceScriptLanguage = *values.referenceLanguage
+		default:
+			return model.Output{}, fmt.Errorf(
+				"unsupported reference script language %q",
+				*values.referenceLanguage,
+			)
+		}
 	}
 	return output, nil
 }
@@ -225,10 +253,16 @@ func paymentCredentialFromRawAddress(address []byte) (string, []byte, error) {
 	if len(address) == 0 {
 		return "", nil, errors.New("empty output address")
 	}
+	if len(address) > 256 {
+		return "", nil, fmt.Errorf(
+			"output address has %d bytes, maximum 256",
+			len(address),
+		)
+	}
 	addressType := address[0] >> 4
 	if addressType == 8 {
-		if len(address) < 2 {
-			return "", nil, errors.New("truncated Byron output address")
+		if err := validateByronAddress(address); err != nil {
+			return "", nil, err
 		}
 		return "none", nil, nil
 	}
@@ -283,7 +317,7 @@ func paymentCredentialFromRawAddress(address []byte) (string, []byte, error) {
 
 func validatePointerAddressSuffix(suffix []byte) error {
 	offset := 0
-	componentLimits := [...]uint64{math.MaxUint64, math.MaxUint16, math.MaxUint16}
+	componentLimits := [...]uint64{math.MaxUint32, math.MaxUint16, math.MaxUint16}
 	for component, limit := range componentLimits {
 		start := offset
 		var accumulated uint64
@@ -315,6 +349,226 @@ func validatePointerAddressSuffix(suffix []byte) error {
 	}
 	if offset != len(suffix) {
 		return fmt.Errorf("pointer address has %d trailing bytes", len(suffix)-offset)
+	}
+	return nil
+}
+
+type boundedCBOR struct {
+	data   []byte
+	offset int
+}
+
+func (decoder *boundedCBOR) head() (byte, uint64, error) {
+	if decoder.offset >= len(decoder.data) {
+		return 0, 0, errors.New("truncated CBOR")
+	}
+	initial := decoder.data[decoder.offset]
+	decoder.offset++
+	major := initial >> 5
+	additional := initial & 0x1f
+	switch {
+	case additional < 24:
+		return major, uint64(additional), nil
+	case additional == 24:
+		if decoder.offset+1 > len(decoder.data) {
+			return 0, 0, errors.New("truncated CBOR uint8")
+		}
+		value := uint64(decoder.data[decoder.offset])
+		decoder.offset++
+		if value < 24 {
+			return 0, 0, errors.New("nonminimal CBOR uint8")
+		}
+		return major, value, nil
+	case additional == 25:
+		if decoder.offset+2 > len(decoder.data) {
+			return 0, 0, errors.New("truncated CBOR uint16")
+		}
+		value := uint64(binary.BigEndian.Uint16(
+			decoder.data[decoder.offset : decoder.offset+2],
+		))
+		decoder.offset += 2
+		if value <= math.MaxUint8 {
+			return 0, 0, errors.New("nonminimal CBOR uint16")
+		}
+		return major, value, nil
+	case additional == 26:
+		if decoder.offset+4 > len(decoder.data) {
+			return 0, 0, errors.New("truncated CBOR uint32")
+		}
+		value := uint64(binary.BigEndian.Uint32(
+			decoder.data[decoder.offset : decoder.offset+4],
+		))
+		decoder.offset += 4
+		if value <= math.MaxUint16 {
+			return 0, 0, errors.New("nonminimal CBOR uint32")
+		}
+		return major, value, nil
+	case additional == 27:
+		if decoder.offset+8 > len(decoder.data) {
+			return 0, 0, errors.New("truncated CBOR uint64")
+		}
+		value := binary.BigEndian.Uint64(
+			decoder.data[decoder.offset : decoder.offset+8],
+		)
+		decoder.offset += 8
+		if value <= math.MaxUint32 {
+			return 0, 0, errors.New("nonminimal CBOR uint64")
+		}
+		return major, value, nil
+	default:
+		return 0, 0, errors.New(
+			"indefinite or reserved CBOR form is unsupported",
+		)
+	}
+}
+
+func (decoder *boundedCBOR) bytes() ([]byte, error) {
+	major, length, err := decoder.head()
+	if err != nil {
+		return nil, err
+	}
+	if major != 2 || length > uint64(len(decoder.data)-decoder.offset) {
+		return nil, errors.New("invalid CBOR byte string")
+	}
+	start := decoder.offset
+	decoder.offset += int(length)
+	return decoder.data[start:decoder.offset], nil
+}
+
+func (decoder *boundedCBOR) skip(depth uint8) error {
+	if depth > 16 {
+		return errors.New("CBOR nesting exceeds 16")
+	}
+	major, value, err := decoder.head()
+	if err != nil {
+		return err
+	}
+	switch major {
+	case 0, 1, 7:
+		return nil
+	case 2, 3:
+		if value > uint64(len(decoder.data)-decoder.offset) {
+			return errors.New("truncated CBOR string")
+		}
+		decoder.offset += int(value)
+		return nil
+	case 4:
+		for index := uint64(0); index < value; index++ {
+			if err := decoder.skip(depth + 1); err != nil {
+				return err
+			}
+		}
+		return nil
+	case 5:
+		if value > uint64(len(decoder.data)) {
+			return errors.New("CBOR map is too large")
+		}
+		for index := uint64(0); index < value; index++ {
+			if err := decoder.skip(depth + 1); err != nil {
+				return err
+			}
+			if err := decoder.skip(depth + 1); err != nil {
+				return err
+			}
+		}
+		return nil
+	case 6:
+		return decoder.skip(depth + 1)
+	default:
+		return errors.New("unsupported CBOR major type")
+	}
+}
+
+func validateByronAddress(address []byte) error {
+	outer := boundedCBOR{data: address}
+	major, length, err := outer.head()
+	if err != nil || major != 4 || length != 2 {
+		return errors.New("Byron address outer CBOR is not a pair")
+	}
+	major, tag, err := outer.head()
+	if err != nil || major != 6 || tag != 24 {
+		return errors.New("Byron address lacks CBOR tag 24")
+	}
+	payload, err := outer.bytes()
+	if err != nil {
+		return fmt.Errorf("Byron address payload: %w", err)
+	}
+	major, checksum, err := outer.head()
+	if err != nil || major != 0 || checksum > math.MaxUint32 {
+		return errors.New("Byron address CRC is malformed")
+	}
+	if outer.offset != len(address) {
+		return errors.New("Byron address has trailing bytes")
+	}
+	if uint32(checksum) != crc32.ChecksumIEEE(payload) {
+		return errors.New("Byron address CRC mismatch")
+	}
+	inner := boundedCBOR{data: payload}
+	major, length, err = inner.head()
+	if err != nil || major != 4 || length != 3 {
+		return errors.New("Byron address payload is not a triple")
+	}
+	root, err := inner.bytes()
+	if err != nil || len(root) != 28 {
+		return errors.New("Byron address root is malformed")
+	}
+	major, attributes, err := inner.head()
+	if err != nil || major != 5 || attributes > 16 {
+		return errors.New("Byron address attributes are malformed")
+	}
+	attributeKeys := make(map[uint64]struct{}, attributes)
+	var previousKey uint64
+	for index := uint64(0); index < attributes; index++ {
+		major, key, err := inner.head()
+		if err != nil || major != 0 {
+			return errors.New("Byron address attribute key is malformed")
+		}
+		if key != 1 && key != 2 {
+			return errors.New("Byron address has an unknown attribute")
+		}
+		if index > 0 && previousKey >= key {
+			return errors.New(
+				"Byron address attributes are not canonically ordered",
+			)
+		}
+		previousKey = key
+		if _, duplicate := attributeKeys[key]; duplicate {
+			return errors.New("Byron address has a duplicate attribute")
+		}
+		attributeKeys[key] = struct{}{}
+		switch key {
+		case 1:
+			payload, err := inner.bytes()
+			if err != nil || len(payload) == 0 {
+				return errors.New(
+					"Byron derivation-path attribute is malformed",
+				)
+			}
+		case 2:
+			encodedNetwork, err := inner.bytes()
+			if err != nil {
+				return errors.New(
+					"Byron network attribute is not encoded CBOR bytes",
+				)
+			}
+			network := boundedCBOR{data: encodedNetwork}
+			major, value, err := network.head()
+			if err != nil ||
+				major != 0 ||
+				value > math.MaxUint32 ||
+				network.offset != len(encodedNetwork) {
+				return errors.New(
+					"Byron network attribute is not an encoded UInt32",
+				)
+			}
+		}
+	}
+	major, addressType, err := inner.head()
+	if err != nil || major != 0 || addressType > 2 {
+		return errors.New("Byron address type is malformed")
+	}
+	if inner.offset != len(payload) {
+		return errors.New("Byron address payload has trailing bytes")
 	}
 	return nil
 }
@@ -528,6 +782,9 @@ func decodeSignedAssets(policies, names []string, quantities []int64) ([]model.S
 	}
 	result := make([]model.SignedAssetQuantity, len(policies))
 	for index := range policies {
+		if len(names[index]) > 32 {
+			return nil, errors.New("mint asset name exceeds 32 bytes")
+		}
 		policy, err := model.PolicyIDFromBytes([]byte(policies[index]))
 		if err != nil {
 			return nil, fmt.Errorf("mint policy %d: %w", index, err)

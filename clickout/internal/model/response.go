@@ -1,6 +1,8 @@
 package model
 
 import (
+	"encoding/json"
+	"errors"
 	"strings"
 	"time"
 
@@ -209,12 +211,89 @@ func sameSnapshotSelector(left, right SnapshotSelector) bool {
 		*left.SelectedPoint == *right.SelectedPoint
 }
 
+type TruncationReason string
+
+const (
+	TruncationAddressSeedLimit TruncationReason = "address_seed_limit"
+	TruncationAddressPageLimit TruncationReason = "address_page_limit"
+	TruncationMaxNodes         TruncationReason = "max_nodes"
+	TruncationMaxEdges         TruncationReason = "max_edges"
+	TruncationLayerTimeout     TruncationReason = "layer_timeout"
+	TruncationMaxDepth         TruncationReason = "max_depth"
+)
+
+func (reason TruncationReason) Valid() bool {
+	switch reason {
+	case TruncationAddressSeedLimit,
+		TruncationAddressPageLimit,
+		TruncationMaxNodes,
+		TruncationMaxEdges,
+		TruncationLayerTimeout,
+		TruncationMaxDepth:
+		return true
+	default:
+		return false
+	}
+}
+
 type Truncation struct {
-	Truncated            bool      `json:"truncated"`
-	Reason               string    `json:"reason,omitempty"`
-	ContinuationCursor   string    `json:"continuation_cursor,omitempty"`
-	ContinuationFrontier []UTxORef `json:"continuation_frontier"`
-	LosslessResume       bool      `json:"lossless_resume"`
+	Truncated            bool             `json:"truncated"`
+	Reason               TruncationReason `json:"reason,omitempty"`
+	ContinuationCursor   string           `json:"continuation_cursor,omitempty"`
+	ContinuationFrontier []UTxORef        `json:"continuation_frontier"`
+	LosslessResume       bool             `json:"lossless_resume"`
+}
+
+func (truncation Truncation) Valid() bool {
+	if !truncation.Truncated {
+		return truncation.Reason == "" &&
+			truncation.ContinuationCursor == "" &&
+			len(truncation.ContinuationFrontier) == 0 &&
+			!truncation.LosslessResume
+	}
+	if !truncation.Reason.Valid() {
+		return false
+	}
+	switch truncation.Reason {
+	case TruncationAddressSeedLimit:
+		return truncation.ContinuationCursor != "" &&
+			len(truncation.ContinuationFrontier) == 0 &&
+			!truncation.LosslessResume
+	case TruncationAddressPageLimit:
+		return truncation.ContinuationCursor == "" &&
+			len(truncation.ContinuationFrontier) == 0 &&
+			truncation.LosslessResume
+	case TruncationMaxNodes,
+		TruncationMaxEdges,
+		TruncationLayerTimeout,
+		TruncationMaxDepth:
+		return truncation.ContinuationCursor == "" &&
+			len(truncation.ContinuationFrontier) > 0 &&
+			!truncation.LosslessResume
+	default:
+		return false
+	}
+}
+
+func (truncation Truncation) MarshalJSON() ([]byte, error) {
+	if !truncation.Valid() {
+		return nil, errors.New("invalid truncation reason/state")
+	}
+	type plain Truncation
+	return json.Marshal(plain(truncation))
+}
+
+func (truncation *Truncation) UnmarshalJSON(data []byte) error {
+	type plain Truncation
+	var decoded plain
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	if !Truncation(decoded).Valid() {
+		return errors.New("invalid truncation reason/state")
+	}
+	*truncation = Truncation(decoded)
+	return nil
 }
 
 type PartialHistoryBoundary struct {

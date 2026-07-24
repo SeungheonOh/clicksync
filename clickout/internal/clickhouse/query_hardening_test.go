@@ -104,12 +104,12 @@ func TestTraceCandidateSentinelDoesNotHydratePastBudget(t *testing.T) {
 func TestHyperedgeNodeBudgetIsAtomicAndCountsUniqueUTxOs(t *testing.T) {
 	t.Parallel()
 	edge := model.FlowHyperedge{
-		Transaction: repeatedHash(9),
+		Transaction: model.FlowTransaction{Hash: repeatedHash(9)},
 		Inputs: []model.Spend{
 			{Source: model.UTxORef{TxHash: repeatedHash(1), Index: 0}},
 			{Source: model.UTxORef{TxHash: repeatedHash(1), Index: 0}, Role: model.InputReference},
 		},
-		ProducedOutputs: []model.Output{
+		Outputs: []model.Output{
 			{Ref: model.UTxORef{TxHash: repeatedHash(9), Index: 0}},
 			{Ref: model.UTxORef{TxHash: repeatedHash(9), Index: 1}},
 		},
@@ -205,10 +205,7 @@ func TestInputRowsUseRoleRankOrdinalAndStableTiebreakers(t *testing.T) {
 	if err := validateSpendRows(outOfOrder, spendByTransaction); err == nil {
 		t.Fatal("collateral-before-regular ordering was accepted")
 	}
-	for name, sql := range map[string]string{
-		"transaction": inputsByTxSQL,
-		"uses":        usesByRefSQL,
-	} {
+	for name, sql := range map[string]string{"uses": usesByRefSQL} {
 		for _, fragment := range []string{
 			"i.role = 'regular'",
 			"i.role = 'collateral'",
@@ -275,6 +272,7 @@ func (rows *fixedHashRows) Scan(dest ...any) error {
 	raw := append([]byte(nil), rows.values[rows.index][:]...)
 	rows.index++
 	*(dest[0].(*[]byte)) = raw
+	*(dest[1].(*uint8)) = 1
 	return nil
 }
 

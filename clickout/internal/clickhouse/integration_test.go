@@ -153,8 +153,8 @@ func TestContractReadsRollbackAndTrace(t *testing.T) {
 	)
 	forward := forwardResult.Hyperedges
 	if err != nil || len(boundaries) != 0 || len(forward) != 1 ||
-		forward[0].Transaction != fixture.txB || len(forward[0].ProducedOutputs) != 2 ||
-		len(forward[0].AppliedWithdrawals) != 1 || forward[0].FeeSink == nil {
+		forward[0].Transaction.Hash != fixture.txB || len(forward[0].Outputs) != 2 ||
+		len(forward[0].Transaction.AppliedWithdrawals) != 1 || forward[0].FeeSink == nil {
 		t.Fatalf("unexpected forward edge: %#v, %#v, %v", forward, boundaries, err)
 	}
 	reverseResult, boundaries, err := store.ExpandReverse(
@@ -166,8 +166,8 @@ func TestContractReadsRollbackAndTrace(t *testing.T) {
 	)
 	reverse := reverseResult.Hyperedges
 	if err != nil || len(boundaries) != 0 || len(reverse) != 1 ||
-		len(reverse[0].ConsumedInputValues) != 1 ||
-		reverse[0].ConsumedInputValues[0].Ref != fixture.source {
+		len(reverse[0].ConsumedInputValues()) != 1 ||
+		reverse[0].ConsumedInputValues()[0].Ref != fixture.source {
 		t.Fatalf("unexpected reverse edge: %#v, %#v, %v", reverse, boundaries, err)
 	}
 	fanInResult, boundaries, err := store.ExpandReverse(
@@ -180,9 +180,9 @@ func TestContractReadsRollbackAndTrace(t *testing.T) {
 		model.AssetSelector{ADA: true},
 		repository.ExpansionBudget{MaxEdges: 1, MaxNodes: 1000},
 	)
-	if err != nil || len(boundaries) != 0 || fanInResult.Truncated ||
+	if err != nil || len(boundaries) != 0 || fanInResult.TruncationReason != "" ||
 		len(fanInResult.Hyperedges) != 1 ||
-		fanInResult.Hyperedges[0].Transaction != fixture.txB {
+		fanInResult.Hyperedges[0].Transaction.Hash != fixture.txB {
 		t.Fatalf("reverse fan-in did not deduplicate candidate transaction: %#v, %#v, %v", fanInResult, boundaries, err)
 	}
 	invalidTx, _, err := store.Transaction(ctx, snapshot, fixture.txC)
@@ -200,12 +200,12 @@ func TestContractReadsRollbackAndTrace(t *testing.T) {
 	)
 	invalidEdges := invalidResult.Hyperedges
 	if err != nil || len(invalidEdges) != 1 || len(invalidEdges[0].MintDeltas) != 0 ||
-		len(invalidEdges[0].AppliedWithdrawals) != 0 ||
+		len(invalidEdges[0].Transaction.AppliedWithdrawals) != 0 ||
 		invalidEdges[0].FeeSink == nil || invalidEdges[0].FeeSink.Lovelace != 300000 ||
-		len(invalidEdges[0].ConsumedInputs) != 1 ||
-		invalidEdges[0].ConsumedInputs[0] != fixture.collateral ||
-		len(invalidEdges[0].ProducedOutputs) != 1 ||
-		invalidEdges[0].ProducedOutputs[0].Kind != model.OutputCollateralReturn {
+		len(invalidEdges[0].ConsumedInputs()) != 1 ||
+		invalidEdges[0].ConsumedInputs()[0].Source != fixture.collateral ||
+		len(invalidEdges[0].Outputs) != 1 ||
+		invalidEdges[0].Outputs[0].Kind != model.OutputCollateralReturn {
 		t.Fatalf("invalid collateral hyperedge wrong: %#v, %v", invalidEdges, err)
 	}
 
@@ -2669,7 +2669,7 @@ func (fixture fixture) insert(t *testing.T, store *Store) authorityRecord {
              withdrawal_count,redeemer_count,metadata_count,synthetic,source_peer,
              source_address,source_operator,n2n_version,network_magic,body_hash_verified,
              transaction_hashes_verified,facts_digest,writer_id,observed_at,inserted_at)
-	            VALUES (?,?,?, ?,?,'conway',0,?,?,?,?,?,?,?,false,'peer','127.0.0.1',
+	            VALUES (?,?,?, ?,?,'Conway',0,?,?,?,?,?,?,?,false,'peer','127.0.0.1',
 	                    'test',15,764824073,true,true,?,toUUID(?),?,?)`,
 			block.publication, hashArgument(block.hash), parent, block.slot, block.number,
 			block.transactions, block.inputs, block.outputs, block.datums,
@@ -2696,7 +2696,7 @@ func (fixture fixture) insert(t *testing.T, store *Store) authorityRecord {
          regular_input_count,collateral_input_count,reference_input_count,
          produced_output_count,withdrawal_count,redeemer_count,metadata_present,
          datum_observation_count)
-        VALUES (101,1,?,0,NULL,NULL,'conway',true,'regular',0,0,true,[],[],[],
+        VALUES (101,1,?,0,NULL,NULL,'Conway',true,'regular',0,0,true,[],[],[],
                 0,0,0,2,0,0,false,0)`, hashArgument(fixture.txA))
 	exec(`INSERT INTO transactions
         (publication_id,block_number,tx_hash,tx_order,parent_tx_hash,subtransaction_index,
@@ -2705,7 +2705,7 @@ func (fixture fixture) insert(t *testing.T, store *Store) authorityRecord {
          regular_input_count,collateral_input_count,reference_input_count,
          produced_output_count,withdrawal_count,redeemer_count,metadata_present,
          datum_observation_count)
-        VALUES (102,2,?,0,NULL,NULL,'conway',true,'regular',200000,200000,true,[?],[?],[7],
+        VALUES (102,2,?,0,NULL,NULL,'Conway',true,'regular',200000,200000,true,[?],[?],[7],
                 1,0,0,2,1,1,true,2)`, hashArgument(fixture.txB), string(fixture.policy[:]), string([]byte{0x00, 0xff}))
 	exec(`INSERT INTO transactions
         (publication_id,block_number,tx_hash,tx_order,parent_tx_hash,subtransaction_index,
@@ -2714,7 +2714,7 @@ func (fixture fixture) insert(t *testing.T, store *Store) authorityRecord {
          regular_input_count,collateral_input_count,reference_input_count,
          produced_output_count,withdrawal_count,redeemer_count,metadata_present,
          datum_observation_count)
-        VALUES (101,1,?,1,NULL,NULL,'conway',false,'collateral',200000,300000,
+        VALUES (101,1,?,1,NULL,NULL,'Conway',false,'collateral',200000,300000,
                 false,[?],[?],[99],1,1,0,1,1,0,false,0)`,
 		hashArgument(fixture.txC), string(fixture.policy[:]), string([]byte{0x00, 0xff}))
 	exec(`INSERT INTO inputs
@@ -2827,7 +2827,7 @@ func (fixture fixture) insertUnpublishedAddressCandidate(t *testing.T, store *St
          withdrawal_count,redeemer_count,metadata_count,synthetic,source_peer,
          source_address,source_operator,n2n_version,network_magic,body_hash_verified,
          transaction_hashes_verified,facts_digest,writer_id,observed_at,inserted_at)
-        VALUES (50,?,NULL,0,0,'conway',0,1,0,1,0,0,0,0,false,'peer',
+        VALUES (50,?,NULL,0,0,'Conway',0,1,0,1,0,0,0,0,false,'peer',
                 '127.0.0.1','test',15,764824073,true,true,?,toUUID(?),
                 now64(6),now64(6))`,
 		hashArgument(block),
@@ -3101,7 +3101,7 @@ func (fixture fixture) insertPostWatermarkShadow(t *testing.T, store *Store) {
          withdrawal_count,redeemer_count,metadata_count,synthetic,source_peer,
          source_address,source_operator,n2n_version,network_magic,body_hash_verified,
          transaction_hashes_verified,facts_digest,writer_id,observed_at,inserted_at)
-        VALUES (999,?,NULL,4,4,'conway',0,1,0,1,0,0,0,0,false,'peer',
+        VALUES (999,?,NULL,4,4,'Conway',0,1,0,1,0,0,0,0,false,'peer',
                 '127.0.0.1','test',15,764824073,true,true,?,toUUID(?),now64(6),now64(6))`,
 		hashArgument(shadowBlock), hashArgument(shadowBlock), writer)
 	// This simulates a row becoming visible after the request captured its
@@ -3146,7 +3146,7 @@ func (fixture fixture) inflateIrrelevantHistory(t *testing.T, store *Store) {
             NULL,
             number + 10000,
             number + 10000,
-            'conway',
+            'Conway',
             0,
             0, 1, 0, 0, 0, 0, 0,
             true,

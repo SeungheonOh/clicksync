@@ -94,10 +94,14 @@ func (engine *Engine) trace(
 		response.UnresolvedPartialHistory,
 		boundaries...,
 	)
-	if seedResult.Truncated {
+	if seedResult.TruncationReason != "" {
 		response.Truncation.Truncated = true
-		response.Truncation.Reason = "address_seed_limit"
+		response.Truncation.Reason = seedResult.TruncationReason
 		response.Truncation.ContinuationCursor = seedResult.ContinuationCursor
+		response.Truncation.ContinuationFrontier = append(
+			response.Truncation.ContinuationFrontier,
+			seedResult.ContinuationFrontier...,
+		)
 		response.Truncation.LosslessResume = false
 	}
 
@@ -207,23 +211,23 @@ func (engine *Engine) trace(
 				return nil, errors.New("repository exceeded trace expansion edge budget")
 			}
 			for index, edge := range expansion.Hyperedges {
-				key := edge.Transaction.String()
+				key := edge.Transaction.Hash.String()
 				if _, exists := seenEdges[key]; exists ||
 					(index > 0 &&
-						expansion.Hyperedges[index-1].Transaction.String() >= key) {
+						expansion.Hyperedges[index-1].Transaction.Hash.String() >= key) {
 					cancel()
 					return nil, errors.New("repository returned duplicate or unordered hyperedges")
 				}
 				seenEdges[key] = struct{}{}
 				response.Data.Hyperedges = append(response.Data.Hyperedges, edge)
 				if invocation.Trace.Direction == repository.Forward {
-					for _, output := range edge.ProducedOutputs {
+					for _, output := range edge.Outputs {
 						if assetMatches(output, invocation.Trace.Asset) {
 							next = append(next, output.Ref)
 						}
 					}
 				} else {
-					for _, output := range edge.ConsumedInputValues {
+					for _, output := range edge.ConsumedInputValues() {
 						if assetMatches(output, invocation.Trace.Asset) {
 							next = append(next, output.Ref)
 						}
@@ -231,9 +235,9 @@ func (engine *Engine) trace(
 				}
 			}
 			offset = end
-			if expansion.Truncated {
+			if expansion.TruncationReason != "" {
 				response.Truncation.Truncated = true
-				response.Truncation.Reason = "max_edges"
+				response.Truncation.Reason = expansion.TruncationReason
 				response.Truncation.ContinuationFrontier = append(
 					response.Truncation.ContinuationFrontier,
 					frontier[batchStart:]...,

@@ -1,10 +1,31 @@
 package clickhouse
 
 import (
+	"encoding/binary"
+	"encoding/hex"
+	"hash/crc32"
 	"testing"
 
 	"github.com/clicksync-project/clickout/internal/model"
 )
+
+func testByronAddressWithAttributes(attributes []byte) []byte {
+	payload := append([]byte{0x83, 0x58, 0x1c}, make([]byte, 28)...)
+	payload = append(payload, attributes...)
+	payload = append(payload, 0x00)
+	address := []byte{0x82, 0xd8, 0x18, 0x58, byte(len(payload))}
+	address = append(address, payload...)
+	address = append(address, 0x1a, 0, 0, 0, 0)
+	binary.BigEndian.PutUint32(
+		address[len(address)-4:],
+		crc32.ChecksumIEEE(payload),
+	)
+	return address
+}
+
+func testByronAddress() []byte {
+	return testByronAddressWithAttributes([]byte{0xa0})
+}
 
 func TestOutputReadValidationFailsClosed(t *testing.T) {
 	t.Parallel()
@@ -12,7 +33,7 @@ func TestOutputReadValidationFailsClosed(t *testing.T) {
 		txHash:      make([]byte, 32),
 		blockHash:   make([]byte, 32),
 		kind:        "regular",
-		address:     []byte{0x82, 0x01},
+		address:     testByronAddress(),
 		paymentKind: "none",
 		datumKind:   "none",
 	}
@@ -54,6 +75,36 @@ func TestOutputReadValidationFailsClosed(t *testing.T) {
 				value.quantities = []uint64{0}
 			},
 		},
+		{
+			name: "oversized asset name",
+			mutate: func(value *outputValues) {
+				value.policies = []string{string(make([]byte, 28))}
+				value.names = []string{string(make([]byte, 33))}
+				value.quantities = []uint64{1}
+			},
+		},
+		{
+			name: "unsupported reference language",
+			mutate: func(value *outputValues) {
+				hash := string(make([]byte, 28))
+				language := "plutus_v5"
+				value.referenceScriptHash = &hash
+				value.referenceLanguage = &language
+			},
+		},
+		{
+			name: "oversized address",
+			mutate: func(value *outputValues) {
+				value.address = make([]byte, 257)
+				value.address[0] = 0x82
+			},
+		},
+		{
+			name: "fake Byron address",
+			mutate: func(value *outputValues) {
+				value.address = []byte{0x82, 0x01}
+			},
+		},
 	}
 	for _, test := range tests {
 		test := test
@@ -88,7 +139,7 @@ func TestOutputAddressPaymentCredentialValidation(t *testing.T) {
 		{"enterprise key", append([]byte{0x61}, hash...), "key", &asString, true},
 		{"enterprise script", append([]byte{0x71}, hash...), "script", &asString, true},
 		{"pointer key", append(append([]byte{0x41}, hash...), 0, 0, 0), "key", &asString, true},
-		{"Byron none", []byte{0x82, 0x01}, "none", nil, true},
+		{"Byron none", testByronAddress(), "none", nil, true},
 		{"wrong network", append([]byte{0x60}, hash...), "key", &asString, false},
 		{"reward output", append([]byte{0xe1}, hash...), "key", &asString, false},
 		{"pointer truncated", append(append([]byte{0x41}, hash...), 0, 0), "key", &asString, false},
@@ -126,7 +177,7 @@ func TestPointerAddressCanonicalBounds(t *testing.T) {
 	valid := [][]byte{
 		{0x81, 0x00, 0, 0},
 		{0x81, 0x00, 0x83, 0xff, 0x7f, 1},
-		{0x81, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f, 0, 0},
+		{0x8f, 0xff, 0xff, 0xff, 0x7f, 0, 0},
 	}
 	for _, suffix := range valid {
 		if err := validatePointerAddressSuffix(suffix); err != nil {
@@ -142,6 +193,44 @@ func TestPointerAddressCanonicalBounds(t *testing.T) {
 		if err := validatePointerAddressSuffix(suffix); err == nil {
 			t.Fatalf("invalid pointer suffix %x accepted", suffix)
 		}
+	}
+}
+
+func TestByronAddressKnownAttributesFailClosed(t *testing.T) {
+	t.Parallel()
+	for name, attributes := range map[string][]byte{
+		"derivation payload is not bytes": {0xa1, 0x01, 0x00},
+		"network payload is not bytes":    {0xa1, 0x02, 0x00},
+		"network bytes are not uint32":    {0xa1, 0x02, 0x41, 0xff},
+		"duplicate attribute":             {0xa2, 0x01, 0x40, 0x01, 0x40},
+		"unknown attribute":               {0xa1, 0x03, 0x40},
+		"empty derivation payload":        {0xa1, 0x01, 0x40},
+	} {
+		attributes := attributes
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if err := validateByronAddress(
+				testByronAddressWithAttributes(attributes),
+			); err == nil {
+				t.Fatal("malformed Byron address was accepted")
+			}
+		})
+	}
+	for name, encoded := range map[string]string{
+		"nonminimal address type": "82d818582583581c5d5e698eba3dd9452add99a1af9461beb0ba61b8bece26e7399878dda102410218001a7b9bf95c",
+		"unsorted attributes":     "82d818582783581c5d5e698eba3dd9452add99a1af9461beb0ba61b8bece26e7399878dda20241020141aa001a15989de6",
+	} {
+		encoded := encoded
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			address, err := hex.DecodeString(encoded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := validateByronAddress(address); err == nil {
+				t.Fatal("noncanonical Byron address was accepted")
+			}
+		})
 	}
 }
 

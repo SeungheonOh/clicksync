@@ -16,160 +16,145 @@ func (store *Store) Redeemers(
 ) ([]model.Redeemer, []model.PartialHistoryBoundary, error) {
 	queryCtx, finish := store.instrument(ctx, "redeemers")
 	defer finish()
-	rows, err := store.conn.Query(
+	transactions, boundaries, err := store.transactionsByTx(
 		queryCtx,
-		redeemersByTxSQL,
-		activeArguments(snapshot, hashArgument(hash))...,
+		snapshot,
+		[]model.Hash32{hash},
 	)
 	if err != nil {
 		return nil, nil, err
 	}
-	defer rows.Close()
-	result := make([]model.Redeemer, 0)
-	boundaries := make([]model.PartialHistoryBoundary, 0)
-	for rows.Next() {
-		var (
-			txHash         []byte
-			rawPurpose     uint8
-			purpose        string
-			index          uint32
-			dataCBOR       []byte
-			dataLength     uint32
-			dataHash       []byte
-			memory         uint64
-			steps          uint64
-			applied        bool
-			resolution     string
-			targetTx       *string
-			targetOutput   *uint32
-			targetPolicy   *string
-			targetReward   *string
-			targetOrdinal  *uint32
-			targetIdentity *string
-			resolvedScript *string
-		)
-		if err := rows.Scan(
-			&txHash,
-			&rawPurpose,
-			&purpose,
-			&index,
-			&dataCBOR,
-			&dataLength,
-			&dataHash,
-			&memory,
-			&steps,
-			&applied,
-			&resolution,
-			&targetTx,
-			&targetOutput,
-			&targetPolicy,
-			&targetReward,
-			&targetOrdinal,
-			&targetIdentity,
-			&resolvedScript,
-		); err != nil {
-			return nil, nil, err
-		}
-		tx, err := model.Hash32FromBytes(txHash)
-		if err != nil {
-			return nil, nil, err
-		}
-		if uint32(len(dataCBOR)) != dataLength {
-			return nil, nil, errors.New("redeemer data length mismatch")
-		}
-		storedDataHash, err := model.Hash32FromBytes(dataHash)
-		if err != nil {
-			return nil, nil, err
-		}
-		if storedDataHash != calculateContentHash(dataCBOR) {
-			return nil, nil, errors.New("redeemer data hash mismatch")
-		}
-		redeemer := model.Redeemer{
-			TxHash:     tx,
-			PurposeTag: rawPurpose,
-			Purpose:    purpose,
-			Index:      index,
-			DataCBOR:   model.Bytes(bytes.Clone(dataCBOR)),
-			Memory:     memory,
-			Steps:      steps,
-			Applied:    applied,
-			Target: model.ResolvedTarget{
-				Status: resolution,
-			},
-		}
-		if targetTx != nil {
-			target, err := model.Hash32FromBytes([]byte(*targetTx))
-			if err != nil {
-				return nil, nil, err
-			}
-			if targetOutput == nil {
-				return nil, nil, errors.New("redeemer target transaction lacks output index")
-			}
-			ref := model.UTxORef{TxHash: target, Index: *targetOutput}
-			redeemer.Target.SourceUTxO = &ref
-		}
-		if targetPolicy != nil {
-			policy, err := model.PolicyIDFromBytes([]byte(*targetPolicy))
-			if err != nil {
-				return nil, nil, err
-			}
-			redeemer.Target.PolicyID = &policy
-		}
-		if targetReward != nil {
-			redeemer.Target.RewardAccount = model.Bytes([]byte(*targetReward))
-		}
-		redeemer.Target.BodyOrdinal = targetOrdinal
-		if targetIdentity != nil {
-			redeemer.Target.ProcedureIdentity = model.Bytes([]byte(*targetIdentity))
-		}
-		if resolvedScript != nil {
-			if len(*resolvedScript) != 28 {
-				return nil, nil, fmt.Errorf("resolved script hash has %d bytes", len(*resolvedScript))
-			}
-			redeemer.Target.ScriptHash = model.Bytes([]byte(*resolvedScript))
-		}
-		if err := validateRedeemerTarget(redeemer); err != nil {
-			return nil, nil, err
-		}
-		result = append(result, redeemer)
+	if len(transactions) != 1 || transactions[0].Hash != hash {
+		return nil, nil, ErrConflictingRow
 	}
-	if err := rows.Err(); err != nil {
-		return nil, nil, err
+	return transactions[0].Redeemers, boundaries, nil
+}
+
+func scanRedeemerRow(row scanner) (model.Hash32, model.Redeemer, error) {
+	var (
+		txHash         []byte
+		rawPurpose     uint8
+		purpose        string
+		index          uint32
+		dataCBOR       []byte
+		dataLength     uint32
+		dataHash       []byte
+		memory         uint64
+		steps          uint64
+		applied        bool
+		resolution     string
+		targetTx       *string
+		targetOutput   *uint32
+		targetPolicy   *string
+		targetReward   *string
+		targetOrdinal  *uint32
+		targetIdentity *string
+		resolvedScript *string
+	)
+	if err := row.Scan(
+		&txHash,
+		&rawPurpose,
+		&purpose,
+		&index,
+		&dataCBOR,
+		&dataLength,
+		&dataHash,
+		&memory,
+		&steps,
+		&applied,
+		&resolution,
+		&targetTx,
+		&targetOutput,
+		&targetPolicy,
+		&targetReward,
+		&targetOrdinal,
+		&targetIdentity,
+		&resolvedScript,
+	); err != nil {
+		return model.Hash32{}, model.Redeemer{}, err
 	}
-	refs := make([]model.UTxORef, 0)
-	for index := range result {
-		if result[index].Purpose == "spend" && result[index].Target.SourceUTxO != nil {
-			refs = append(refs, *result[index].Target.SourceUTxO)
-		}
-	}
-	refs = uniqueRefs(refs)
-	outputs, outputBoundaries, err := store.outputsByRefs(ctx, snapshot, refs)
+	owner, err := model.Hash32FromBytes(txHash)
 	if err != nil {
-		return nil, nil, err
+		return model.Hash32{}, model.Redeemer{}, err
 	}
-	for index := range outputBoundaries {
-		outputBoundaries[index].Reason =
-			"resolved spend target output predates this partial-history dataset"
+	if uint32(len(dataCBOR)) != dataLength {
+		return model.Hash32{}, model.Redeemer{}, errors.New(
+			"redeemer data length mismatch",
+		)
 	}
-	boundaries = append(boundaries, outputBoundaries...)
-	byRef := make(map[string]model.Output, len(outputs))
-	for _, output := range outputs {
-		byRef[output.Ref.String()] = output
+	storedDataHash, err := model.Hash32FromBytes(dataHash)
+	if err != nil {
+		return model.Hash32{}, model.Redeemer{}, err
 	}
-	for index := range result {
-		ref := result[index].Target.SourceUTxO
-		if ref == nil {
-			continue
+	if len(dataCBOR) == 0 ||
+		len(dataCBOR) > maximumTransactionContextBytes ||
+		storedDataHash != calculateContentHash(dataCBOR) {
+		return model.Hash32{}, model.Redeemer{}, errors.New(
+			"redeemer data hash mismatch",
+		)
+	}
+	redeemer := model.Redeemer{
+		PurposeTag: rawPurpose,
+		Purpose:    purpose,
+		Index:      index,
+		DataCBOR:   model.Bytes(bytes.Clone(dataCBOR)),
+		Memory:     memory,
+		Steps:      steps,
+		Applied:    applied,
+		Target: model.ResolvedTarget{
+			Status: resolution,
+		},
+	}
+	if targetTx != nil {
+		target, err := model.Hash32FromBytes([]byte(*targetTx))
+		if err != nil {
+			return model.Hash32{}, model.Redeemer{}, err
 		}
-		if output, ok := byRef[ref.String()]; ok {
-			if err := validateSpendScriptContext(result[index], output); err != nil {
-				return nil, nil, err
-			}
-			value := output
-			result[index].Target.SourceOutput = &value
+		if targetOutput == nil {
+			return model.Hash32{}, model.Redeemer{}, errors.New(
+				"redeemer target transaction lacks output index",
+			)
 		}
+		ref := model.UTxORef{TxHash: target, Index: *targetOutput}
+		redeemer.Target.SourceUTxO = &ref
+	} else if targetOutput != nil {
+		return model.Hash32{}, model.Redeemer{}, errors.New(
+			"redeemer target output index lacks transaction",
+		)
 	}
-	return result, boundaries, nil
+	if targetPolicy != nil {
+		policy, err := model.PolicyIDFromBytes([]byte(*targetPolicy))
+		if err != nil {
+			return model.Hash32{}, model.Redeemer{}, err
+		}
+		redeemer.Target.PolicyID = &policy
+	}
+	if targetReward != nil {
+		redeemer.Target.RewardAccount = model.Bytes(
+			bytes.Clone([]byte(*targetReward)),
+		)
+	}
+	redeemer.Target.BodyOrdinal = targetOrdinal
+	if targetIdentity != nil {
+		redeemer.Target.ProcedureIdentity = model.Bytes(
+			bytes.Clone([]byte(*targetIdentity)),
+		)
+	}
+	if resolvedScript != nil {
+		if len(*resolvedScript) != 28 {
+			return model.Hash32{}, model.Redeemer{}, fmt.Errorf(
+				"resolved script hash has %d bytes",
+				len(*resolvedScript),
+			)
+		}
+		redeemer.Target.ScriptHash = model.Bytes(
+			bytes.Clone([]byte(*resolvedScript)),
+		)
+	}
+	if err := validateRedeemerTarget(redeemer); err != nil {
+		return model.Hash32{}, model.Redeemer{}, err
+	}
+	return owner, redeemer, nil
 }
 
 func validateRedeemerTarget(redeemer model.Redeemer) error {

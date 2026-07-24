@@ -85,6 +85,96 @@ func TestEveryResponseCarriesRequiredDatasetSemantics(t *testing.T) {
 	}
 }
 
+func TestTruncationReasonsAreStableAndStateValidated(t *testing.T) {
+	t.Parallel()
+	reasons := []struct {
+		reason TruncationReason
+		text   string
+	}{
+		{TruncationAddressSeedLimit, "address_seed_limit"},
+		{TruncationAddressPageLimit, "address_page_limit"},
+		{TruncationMaxNodes, "max_nodes"},
+		{TruncationMaxEdges, "max_edges"},
+		{TruncationLayerTimeout, "layer_timeout"},
+		{TruncationMaxDepth, "max_depth"},
+	}
+	for _, test := range reasons {
+		if string(test.reason) != test.text || !test.reason.Valid() {
+			t.Errorf("unstable truncation reason %q, want %q", test.reason, test.text)
+		}
+		value := Truncation{Truncated: true, Reason: test.reason}
+		switch test.reason {
+		case TruncationAddressSeedLimit:
+			value.ContinuationCursor = "cursor"
+		case TruncationAddressPageLimit:
+			value.LosslessResume = true
+		case TruncationMaxNodes,
+			TruncationMaxEdges,
+			TruncationLayerTimeout,
+			TruncationMaxDepth:
+			value.ContinuationFrontier = []UTxORef{{TxHash: Hash32{1}}}
+		}
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			t.Fatalf("marshal %q: %v", test.reason, err)
+		}
+		var decoded Truncation
+		if err := json.Unmarshal(encoded, &decoded); err != nil {
+			t.Fatalf("unmarshal %q: %v", test.reason, err)
+		}
+		if decoded.Reason != test.reason || !decoded.Valid() {
+			t.Errorf("round trip %q = %#v", test.reason, decoded)
+		}
+	}
+
+	if !(Truncation{}).Valid() {
+		t.Fatal("untruncated empty reason rejected")
+	}
+	for _, invalid := range []Truncation{
+		{Truncated: true},
+		{Reason: TruncationMaxNodes},
+		{Truncated: true, Reason: "unknown"},
+		{ContinuationCursor: "cursor"},
+		{
+			Truncated:          true,
+			Reason:             TruncationAddressSeedLimit,
+			ContinuationCursor: "cursor",
+			ContinuationFrontier: []UTxORef{{
+				TxHash: Hash32{1},
+			}},
+		},
+		{
+			Truncated:          true,
+			Reason:             TruncationAddressPageLimit,
+			ContinuationCursor: "cursor",
+			LosslessResume:     true,
+		},
+		{Truncated: true, Reason: TruncationMaxEdges},
+		{
+			Truncated:          true,
+			Reason:             TruncationMaxDepth,
+			ContinuationCursor: "cursor",
+		},
+	} {
+		if invalid.Valid() {
+			t.Errorf("invalid truncation accepted: %#v", invalid)
+		}
+		if _, err := json.Marshal(invalid); err == nil {
+			t.Errorf("invalid truncation marshaled: %#v", invalid)
+		}
+	}
+	for _, encoded := range []string{
+		`{"truncated":true}`,
+		`{"truncated":false,"reason":"max_nodes"}`,
+		`{"truncated":true,"reason":"unknown"}`,
+	} {
+		var decoded Truncation
+		if err := json.Unmarshal([]byte(encoded), &decoded); err == nil {
+			t.Errorf("invalid JSON accepted: %s", encoded)
+		}
+	}
+}
+
 func TestSnapshotValidSelectorAndHistoryRules(t *testing.T) {
 	t.Parallel()
 	valid := validSnapshotForTest()

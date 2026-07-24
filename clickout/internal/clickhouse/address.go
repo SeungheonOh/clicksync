@@ -445,9 +445,19 @@ func (store *Store) hydrateAddressCandidates(
 	sql := `
 WITH toUInt64(?) AS publication_watermark
 SELECT` + outputColumns + `,
-    o.publication_id
+    o.publication_id,
+    ifNull(
+        toUInt8(
+            b.publication_id = o.publication_id
+            AND b.block_number = o.block_number
+            AND o.tx_order < b.transaction_count
+        ),
+        toUInt8(0)
+    ),
+    ifNull(b.era, ''),
+    ifNull(b.synthetic, false)
 FROM outputs AS o
-INNER JOIN blocks AS b ON o.publication_id = b.publication_id
+LEFT JOIN blocks AS b ON o.publication_id = b.publication_id
 WHERE ` + predicate + `
   AND o.publication_id <= publication_watermark
 ORDER BY
@@ -474,8 +484,16 @@ ORDER BY
 		expected[addressCandidateIdentity(candidate)] = candidate
 	}
 	for rows.Next() {
-		output, publicationID, err := scanAddressOutput(rows)
+		owner := &outputOwnerScanner{row: rows}
+		output, publicationID, err := scanAddressOutput(owner)
 		if err != nil {
+			return nil, err
+		}
+		if err := validateOutputEraCapabilities(
+			output,
+			owner.era,
+			owner.synthetic,
+		); err != nil {
 			return nil, err
 		}
 		candidate := addressCandidate{
@@ -541,10 +559,17 @@ SELECT
     i.source_tx_hash,
     i.source_output_index,
     i.tx_hash,
-    i.publication_id
+    i.publication_id,
+    toUInt8(
+        ifNull(b.present, toUInt8(0)) = 1
+        AND ifNull(b.block_number, toUInt64(0)) = i.block_number
+        AND i.tx_order < ifNull(b.transaction_count, toUInt32(0))
+    )
 FROM fact_candidates AS i
 INNER JOIN active_candidate_publications AS ap
     ON i.publication_id = ap.publication_id
+LEFT JOIN candidate_blocks AS b
+    ON i.publication_id = b.publication_id
 ORDER BY
     i.source_tx_hash,
     i.source_output_index,
@@ -570,7 +595,12 @@ ORDER BY
 		var sourceHash, txHash []byte
 		var sourceIndex uint32
 		var publicationID uint64
-		if err := rows.Scan(&sourceHash, &sourceIndex, &txHash, &publicationID); err != nil {
+		if err := (&blockPresenceScanner{row: rows}).Scan(
+			&sourceHash,
+			&sourceIndex,
+			&txHash,
+			&publicationID,
+		); err != nil {
 			return nil, err
 		}
 		source, err := model.Hash32FromBytes(sourceHash)

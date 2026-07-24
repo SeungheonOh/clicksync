@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 
+	"github.com/clicksync-project/clickout/internal/limits"
 	"github.com/clicksync-project/clickout/internal/model"
 )
 
@@ -34,20 +35,88 @@ type TraceQuery struct {
 }
 
 type TraceSeedResult struct {
-	UTxOs              []model.UTxORef
-	Truncated          bool
-	ContinuationCursor string
+	UTxOs                []model.UTxORef
+	TruncationReason     model.TruncationReason
+	ContinuationCursor   string
+	ContinuationFrontier []model.UTxORef
 }
 
 type ExpansionBudget struct {
+	KnownUTxOs          []model.UTxORef
 	MaxEdges            uint32
 	MaxNodes            uint32
 	ExcludeTransactions []model.Hash32
 }
 
 type ExpansionResult struct {
-	Hyperedges []model.FlowHyperedge
-	Truncated  bool
+	Hyperedges       []model.FlowHyperedge
+	TruncationReason model.TruncationReason
+}
+
+func (result TraceSeedResult) Valid() bool {
+	if !strictlySortedRefs(result.UTxOs) ||
+		!strictlySortedRefs(result.ContinuationFrontier) ||
+		len(result.UTxOs)+len(result.ContinuationFrontier) >
+			int(limits.HardMaxTraceNodes) {
+		return false
+	}
+	switch result.TruncationReason {
+	case "":
+		return result.ContinuationCursor == "" &&
+			len(result.ContinuationFrontier) == 0
+	case model.TruncationAddressSeedLimit:
+		return result.ContinuationCursor != "" &&
+			len(result.ContinuationFrontier) == 0
+	case model.TruncationMaxNodes:
+		return result.ContinuationCursor == "" &&
+			len(result.ContinuationFrontier) > 0 &&
+			(len(result.UTxOs) == 0 ||
+				result.UTxOs[len(result.UTxOs)-1].String() <
+					result.ContinuationFrontier[0].String())
+	default:
+		return false
+	}
+}
+
+func strictlySortedRefs(refs []model.UTxORef) bool {
+	previous := ""
+	for _, ref := range refs {
+		current := ref.String()
+		if previous != "" && previous >= current {
+			return false
+		}
+		previous = current
+	}
+	return true
+}
+
+func (budget ExpansionBudget) Valid() bool {
+	if budget.MaxEdges == 0 ||
+		budget.MaxEdges > limits.HardMaxTraceEdges ||
+		budget.MaxNodes == 0 ||
+		budget.MaxNodes > limits.HardMaxTraceNodes ||
+		len(budget.KnownUTxOs) > int(budget.MaxNodes) ||
+		len(budget.ExcludeTransactions) > int(budget.MaxEdges) {
+		return false
+	}
+	if !strictlySortedRefs(budget.KnownUTxOs) {
+		return false
+	}
+	previous := ""
+	for _, hash := range budget.ExcludeTransactions {
+		current := hash.String()
+		if previous != "" && previous >= current {
+			return false
+		}
+		previous = current
+	}
+	return true
+}
+
+func (result ExpansionResult) Valid() bool {
+	return result.TruncationReason == "" ||
+		result.TruncationReason == model.TruncationMaxNodes ||
+		result.TruncationReason == model.TruncationMaxEdges
 }
 
 // Reader is the complete Clickout/Clicksync boundary. Implementations consume

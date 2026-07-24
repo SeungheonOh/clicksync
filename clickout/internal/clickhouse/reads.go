@@ -41,11 +41,6 @@ func (store *Store) UTxO(
 	if err != nil {
 		return model.OutputState{}, nil, err
 	}
-	for index := range uses {
-		uses[index].SourceResolved = true
-		source := output
-		uses[index].SourceOutput = &source
-	}
 	consumers, err := store.spendersByRef(ctx, snapshot, ref)
 	if err != nil {
 		return model.OutputState{}, nil, err
@@ -65,12 +60,18 @@ func (store *Store) UTxO(
 		if err != nil {
 			return model.OutputState{}, nil, err
 		}
-		if len(edges) != 1 || edges[0].Transaction != consumers[0] {
+		if len(edges) != 1 || edges[0].Transaction.Hash != consumers[0] {
 			return model.OutputState{}, nil, ErrConflictingRow
 		}
 		edge := edges[0]
 		state.Consumption = &edge
+		if err := validateOutputStateContextOccurrences(state); err != nil {
+			return model.OutputState{}, nil, err
+		}
 		return state, boundaries, nil
+	}
+	if err := validateOutputStateContextOccurrences(state); err != nil {
+		return model.OutputState{}, nil, err
 	}
 	return state, nil, nil
 }
@@ -93,8 +94,16 @@ func (store *Store) outputByRef(
 	defer rows.Close()
 	var results []model.Output
 	for rows.Next() {
-		output, err := scanOutput(rows)
+		owner := &outputOwnerScanner{row: rows}
+		output, err := scanOutput(owner)
 		if err != nil {
+			return model.Output{}, err
+		}
+		if err := validateOutputEraCapabilities(
+			output,
+			owner.era,
+			owner.synthetic,
+		); err != nil {
 			return model.Output{}, err
 		}
 		results = append(results, output)
@@ -119,7 +128,7 @@ func (store *Store) usesByRef(
 	ctx context.Context,
 	snapshot model.Snapshot,
 	ref model.UTxORef,
-) ([]model.Spend, bool, error) {
+) ([]model.OutputUse, bool, error) {
 	queryCtx, finish := store.instrument(ctx, "utxo_uses")
 	defer finish()
 	rows, err := store.conn.Query(
@@ -131,23 +140,27 @@ func (store *Store) usesByRef(
 		return nil, false, err
 	}
 	defer rows.Close()
-	result := make([]model.Spend, 0)
+	spends := make([]model.Spend, 0)
 	for rows.Next() {
-		use, err := scanSpend(rows)
+		use, err := scanSpend(&blockPresenceScanner{row: rows})
 		if err != nil {
 			return nil, false, err
 		}
-		result = append(result, use)
+		spends = append(spends, use)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, false, err
 	}
-	if err := validateSpendRows(result, spendByBlockThenTransaction); err != nil {
+	if err := validateSpendRows(spends, spendByBlockThenTransaction); err != nil {
 		return nil, false, err
 	}
-	truncated := len(result) > 10_000
+	truncated := len(spends) > 10_000
 	if truncated {
-		result = result[:10_000]
+		spends = spends[:10_000]
+	}
+	result := make([]model.OutputUse, len(spends))
+	for index, spend := range spends {
+		result[index] = model.NewOutputUse(spend)
 	}
 	return result, truncated, nil
 }
@@ -171,7 +184,7 @@ func (store *Store) spendersByRef(
 	result := make([]model.Hash32, 0, 1)
 	for rows.Next() {
 		var raw []byte
-		if err := rows.Scan(&raw); err != nil {
+		if err := (&blockPresenceScanner{row: rows}).Scan(&raw); err != nil {
 			return nil, err
 		}
 		hash, err := model.Hash32FromBytes(raw)
@@ -188,212 +201,18 @@ func (store *Store) Transaction(
 	snapshot model.Snapshot,
 	hash model.Hash32,
 ) (model.Transaction, []model.PartialHistoryBoundary, error) {
-	transaction, err := store.transactionHeader(ctx, snapshot, hash)
-	if err != nil {
-		return model.Transaction{}, nil, err
-	}
-	inputs, _, err := store.inputsByTx(ctx, snapshot, hash)
-	if err != nil {
-		return model.Transaction{}, nil, err
-	}
-	refs := make([]model.UTxORef, 0, len(inputs))
-	for _, input := range inputs {
-		refs = append(refs, input.Source)
-	}
-	resolvedOutputs, boundaries, err := store.outputsByRefs(ctx, snapshot, refs)
-	if err != nil {
-		return model.Transaction{}, nil, err
-	}
-	resolved := make(map[string]struct{}, len(resolvedOutputs))
-	resolvedValues := make(map[string]model.Output, len(resolvedOutputs))
-	for _, output := range resolvedOutputs {
-		resolved[output.Ref.String()] = struct{}{}
-		resolvedValues[output.Ref.String()] = output
-	}
-	for index := range inputs {
-		key := inputs[index].Source.String()
-		_, inputs[index].SourceResolved = resolved[key]
-		if output, ok := resolvedValues[key]; ok {
-			value := output
-			inputs[index].SourceOutput = &value
-		}
-	}
-	outputs, err := store.outputsByTx(ctx, snapshot, hash)
-	if err != nil {
-		return model.Transaction{}, nil, err
-	}
-	transaction.Inputs = inputs
-	transaction.Outputs = outputs
-	if snapshot.Identity.CompleteHistory {
-		boundaries = nil
-	}
-	return transaction, boundaries, nil
-}
-
-func (store *Store) transactionHeader(
-	ctx context.Context,
-	snapshot model.Snapshot,
-	hash model.Hash32,
-) (model.Transaction, error) {
-	queryCtx, finish := store.instrument(ctx, "transaction")
-	defer finish()
-	rows, err := store.conn.Query(
-		queryCtx,
-		transactionHeaderSQL,
-		activeArguments(snapshot, hashArgument(hash))...,
+	transactions, boundaries, err := store.transactionsByTx(
+		ctx,
+		snapshot,
+		[]model.Hash32{hash},
 	)
 	if err != nil {
-		return model.Transaction{}, err
+		return model.Transaction{}, nil, err
 	}
-	defer rows.Close()
-	var results []model.Transaction
-	for rows.Next() {
-		var (
-			txHash       []byte
-			blockHash    []byte
-			blockNumber  uint64
-			txOrder      uint32
-			parentHash   *string
-			subIndex     *uint32
-			era          string
-			phase2Valid  bool
-			flowKind     string
-			declaredFee  *uint64
-			effectiveFee *uint64
-			mintApplied  bool
-			policies     []string
-			names        []string
-			quantities   []int64
-		)
-		if err := rows.Scan(
-			&txHash,
-			&blockHash,
-			&blockNumber,
-			&txOrder,
-			&parentHash,
-			&subIndex,
-			&era,
-			&phase2Valid,
-			&flowKind,
-			&declaredFee,
-			&effectiveFee,
-			&mintApplied,
-			&policies,
-			&names,
-			&quantities,
-		); err != nil {
-			return model.Transaction{}, err
-		}
-		tx, err := model.Hash32FromBytes(txHash)
-		if err != nil {
-			return model.Transaction{}, err
-		}
-		block, err := model.Hash32FromBytes(blockHash)
-		if err != nil {
-			return model.Transaction{}, err
-		}
-		mint, err := decodeSignedAssets(policies, names, quantities)
-		if err != nil {
-			return model.Transaction{}, err
-		}
-		transaction := model.Transaction{
-			Hash:                tx,
-			BlockHash:           block,
-			BlockHeight:         blockNumber,
-			Order:               txOrder,
-			SubtransactionIndex: subIndex,
-			Era:                 era,
-			Phase2Valid:         phase2Valid,
-			FlowKind:            flowKind,
-			DeclaredFee:         declaredFee,
-			EffectiveFee:        effectiveFee,
-			MintApplied:         mintApplied,
-			Mint:                mint,
-			Inputs:              make([]model.Spend, 0),
-			Outputs:             make([]model.Output, 0),
-		}
-		if parentHash != nil {
-			parent, err := model.Hash32FromBytes([]byte(*parentHash))
-			if err != nil {
-				return model.Transaction{}, err
-			}
-			transaction.ParentHash = &parent
-		}
-		results = append(results, transaction)
+	if len(transactions) != 1 || transactions[0].Hash != hash {
+		return model.Transaction{}, nil, ErrConflictingRow
 	}
-	if err := rows.Err(); err != nil {
-		return model.Transaction{}, err
-	}
-	switch len(results) {
-	case 0:
-		return model.Transaction{}, ErrNotFound
-	case 1:
-		return results[0], nil
-	default:
-		return model.Transaction{}, ErrConflictingRow
-	}
-}
-
-func (store *Store) inputsByTx(
-	ctx context.Context,
-	snapshot model.Snapshot,
-	hash model.Hash32,
-) ([]model.Spend, []model.PartialHistoryBoundary, error) {
-	queryCtx, finish := store.instrument(ctx, "transaction_inputs")
-	defer finish()
-	rows, err := store.conn.Query(queryCtx, inputsByTxSQL, activeArguments(snapshot, hashArgument(hash))...)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer rows.Close()
-	inputs := make([]model.Spend, 0)
-	boundaries := make([]model.PartialHistoryBoundary, 0)
-	for rows.Next() {
-		input, err := scanSpend(rows)
-		if err != nil {
-			return nil, nil, err
-		}
-		inputs = append(inputs, input)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, nil, err
-	}
-	if err := validateCompleteSpendRows(inputs); err != nil {
-		return nil, nil, err
-	}
-	return inputs, boundaries, nil
-}
-
-func (store *Store) outputsByTx(
-	ctx context.Context,
-	snapshot model.Snapshot,
-	hash model.Hash32,
-) ([]model.Output, error) {
-	queryCtx, finish := store.instrument(ctx, "transaction_outputs")
-	defer finish()
-	rows, err := store.conn.Query(queryCtx, outputsByTxSQL, activeArguments(snapshot, hashArgument(hash))...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	outputs := make([]model.Output, 0)
-	for rows.Next() {
-		output, err := scanOutput(rows)
-		if err != nil {
-			return nil, err
-		}
-		outputs = append(outputs, output)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	if err := validateCompleteOutputRows(outputs); err != nil {
-		return nil, err
-	}
-	if err := store.hydrateInlineDatums(ctx, outputs); err != nil {
-		return nil, err
-	}
-	return outputs, nil
+	return transactions[0], boundaries, nil
 }
 
 func (store *Store) Datum(
@@ -422,10 +241,17 @@ func (store *Store) Datum(
 			finish()
 			return model.Datum{}, err
 		}
-		if uint32(len(body)) != length {
+		if len(body) == 0 ||
+			len(body) > maximumTransactionContextBytes ||
+			uint32(len(body)) != length {
 			rows.Close()
 			finish()
-			return model.Datum{}, errors.New("datum length does not match stored byte_length")
+			return model.Datum{}, persistedRowCorruption(
+				"datum body",
+				errors.New(
+					"datum length does not match stored byte_length",
+				),
+			)
 		}
 		if variants != 1 {
 			rows.Close()
@@ -436,7 +262,10 @@ func (store *Store) Datum(
 		if err != nil || content != hash || content != calculateContentHash(body) {
 			rows.Close()
 			finish()
-			return model.Datum{}, errors.New("datum content hash mismatch")
+			return model.Datum{}, persistedRowCorruption(
+				"datum body",
+				errors.New("datum content hash mismatch"),
+			)
 		}
 		result.BodyCBOR = model.Bytes(bytes.Clone(body))
 		result.BodyVerified = true
@@ -466,20 +295,50 @@ func (store *Store) Datum(
 	for rows.Next() {
 		var datumHash, txHash, blockHash []byte
 		var sourceKind string
-		if err := rows.Scan(&datumHash, &txHash, &blockHash, &sourceKind); err != nil {
+		owner := &outputOwnerScanner{row: rows}
+		if err := owner.Scan(
+			&datumHash,
+			&txHash,
+			&blockHash,
+			&sourceKind,
+		); err != nil {
 			return model.Datum{}, err
+		}
+		level, ok := transactionEraLevel(owner.era)
+		if !ok || level < 3 {
+			return model.Datum{}, transactionCorruption(
+				"datum observation belongs to unsupported era %q",
+				owner.era,
+			)
+		}
+		if sourceKind != "witness" &&
+			(sourceKind != "inline_output" || level < 4) {
+			return model.Datum{}, transactionCorruption(
+				"datum observation source %q is invalid in %s",
+				sourceKind,
+				owner.era,
+			)
 		}
 		datum, err := model.Hash32FromBytes(datumHash)
 		if err != nil {
-			return model.Datum{}, err
+			return model.Datum{}, persistedRowCorruption(
+				"datum observation",
+				err,
+			)
 		}
 		tx, err := model.Hash32FromBytes(txHash)
 		if err != nil {
-			return model.Datum{}, err
+			return model.Datum{}, persistedRowCorruption(
+				"datum observation",
+				err,
+			)
 		}
 		block, err := model.Hash32FromBytes(blockHash)
 		if err != nil {
-			return model.Datum{}, err
+			return model.Datum{}, persistedRowCorruption(
+				"datum observation",
+				err,
+			)
 		}
 		result.ActiveObservations = append(result.ActiveObservations, model.DatumObservation{
 			DatumHash:  datum,
@@ -505,51 +364,52 @@ func (store *Store) Withdrawals(
 ) ([]model.Withdrawal, error) {
 	queryCtx, finish := store.instrument(ctx, "withdrawals")
 	defer finish()
-	rows, err := store.conn.Query(
+	transactions, _, err := store.transactionsByTx(
 		queryCtx,
-		withdrawalsByTxSQL,
-		activeArguments(snapshot, hashArgument(hash))...,
+		snapshot,
+		[]model.Hash32{hash},
 	)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	result := make([]model.Withdrawal, 0)
-	for rows.Next() {
-		var txHash, reward, credential []byte
-		var credentialKind string
-		var amount uint64
-		var ordinal uint32
-		var applied bool
-		if err := rows.Scan(
-			&txHash,
-			&reward,
-			&amount,
-			&ordinal,
-			&applied,
-			&credentialKind,
-			&credential,
-		); err != nil {
-			return nil, err
-		}
-		tx, err := model.Hash32FromBytes(txHash)
-		if err != nil {
-			return nil, err
-		}
-		if err := validateRewardAccount(reward, credentialKind, credential); err != nil {
-			return nil, err
-		}
-		result = append(result, model.Withdrawal{
-			TxHash:         tx,
-			RewardAccount:  model.Bytes(bytes.Clone(reward)),
-			Lovelace:       amount,
-			BodyOrdinal:    ordinal,
-			Applied:        applied,
-			CredentialKind: credentialKind,
-			CredentialHash: model.Bytes(bytes.Clone(credential)),
-		})
+	if len(transactions) != 1 || transactions[0].Hash != hash {
+		return nil, ErrConflictingRow
 	}
-	return result, rows.Err()
+	return transactions[0].Withdrawals, nil
+}
+
+func scanWithdrawalRow(row scanner) (model.Hash32, model.Withdrawal, error) {
+	var txHash, reward, credential []byte
+	var credentialKind string
+	var amount uint64
+	var ordinal uint32
+	var applied bool
+	if err := row.Scan(
+		&txHash,
+		&reward,
+		&amount,
+		&ordinal,
+		&applied,
+		&credentialKind,
+		&credential,
+	); err != nil {
+		return model.Hash32{}, model.Withdrawal{}, err
+	}
+	owner, err := model.Hash32FromBytes(txHash)
+	if err != nil {
+		return model.Hash32{}, model.Withdrawal{}, err
+	}
+	if err := validateRewardAccount(reward, credentialKind, credential); err != nil {
+		return model.Hash32{}, model.Withdrawal{}, err
+	}
+	return owner, model.Withdrawal{
+		RewardAccount:  model.Bytes(bytes.Clone(reward)),
+		Lovelace:       amount,
+		BodyOrdinal:    ordinal,
+		Applied:        applied,
+		CredentialKind: credentialKind,
+		CredentialHash: model.Bytes(bytes.Clone(credential)),
+	}, nil
 }
 
 func (store *Store) Metadata(
@@ -559,63 +419,65 @@ func (store *Store) Metadata(
 ) (model.TransactionMetadata, error) {
 	queryCtx, finish := store.instrument(ctx, "metadata")
 	defer finish()
-	rows, err := store.conn.Query(
+	transactions, _, err := store.transactionsByTx(
 		queryCtx,
-		metadataByTxSQL,
-		activeArguments(snapshot, hashArgument(hash))...,
+		snapshot,
+		[]model.Hash32{hash},
 	)
 	if err != nil {
 		return model.TransactionMetadata{}, err
 	}
-	defer rows.Close()
-	var results []model.TransactionMetadata
-	for rows.Next() {
-		var txHash, cbor, contentHash []byte
-		var labels []uint64
-		var length uint32
-		if err := rows.Scan(&txHash, &labels, &cbor, &length, &contentHash); err != nil {
-			return model.TransactionMetadata{}, err
-		}
-		tx, err := model.Hash32FromBytes(txHash)
-		if err != nil {
-			return model.TransactionMetadata{}, err
-		}
-		content, err := model.Hash32FromBytes(contentHash)
-		if err != nil {
-			return model.TransactionMetadata{}, err
-		}
-		if uint32(len(cbor)) != length {
-			return model.TransactionMetadata{}, errors.New("metadata length mismatch")
-		}
-		if content != calculateContentHash(cbor) {
-			return model.TransactionMetadata{}, errors.New("metadata content hash mismatch")
-		}
-		for index := 1; index < len(labels); index++ {
-			if labels[index-1] >= labels[index] {
-				return model.TransactionMetadata{}, errors.New(
-					"metadata labels are not strictly sorted and unique",
-				)
-			}
-		}
-		results = append(results, model.TransactionMetadata{
-			TxHash:      tx,
-			Labels:      append([]uint64(nil), labels...),
-			MapCBOR:     model.Bytes(bytes.Clone(cbor)),
-			ByteLength:  uint64(length),
-			ContentHash: content,
-		})
-	}
-	if err := rows.Err(); err != nil {
-		return model.TransactionMetadata{}, err
-	}
-	switch len(results) {
-	case 0:
-		return model.TransactionMetadata{}, ErrNotFound
-	case 1:
-		return results[0], nil
-	default:
+	if len(transactions) != 1 || transactions[0].Hash != hash {
 		return model.TransactionMetadata{}, ErrConflictingRow
 	}
+	if transactions[0].Metadata == nil {
+		return model.TransactionMetadata{}, ErrNotFound
+	}
+	return *transactions[0].Metadata, nil
+}
+
+func scanMetadataRow(
+	row scanner,
+) (model.Hash32, model.TransactionMetadata, error) {
+	var txHash, cbor, contentHash []byte
+	var labels []uint64
+	var length uint32
+	if err := row.Scan(&txHash, &labels, &cbor, &length, &contentHash); err != nil {
+		return model.Hash32{}, model.TransactionMetadata{}, err
+	}
+	owner, err := model.Hash32FromBytes(txHash)
+	if err != nil {
+		return model.Hash32{}, model.TransactionMetadata{}, err
+	}
+	content, err := model.Hash32FromBytes(contentHash)
+	if err != nil {
+		return model.Hash32{}, model.TransactionMetadata{}, err
+	}
+	if len(cbor) == 0 ||
+		len(cbor) > maximumTransactionContextBytes ||
+		uint32(len(cbor)) != length {
+		return model.Hash32{}, model.TransactionMetadata{}, errors.New(
+			"metadata length mismatch",
+		)
+	}
+	if content != calculateContentHash(cbor) {
+		return model.Hash32{}, model.TransactionMetadata{}, errors.New(
+			"metadata content hash mismatch",
+		)
+	}
+	for index := 1; index < len(labels); index++ {
+		if labels[index-1] >= labels[index] {
+			return model.Hash32{}, model.TransactionMetadata{}, errors.New(
+				"metadata labels are not strictly sorted and unique",
+			)
+		}
+	}
+	return owner, model.TransactionMetadata{
+		Labels:      append([]uint64(nil), labels...),
+		MapCBOR:     model.Bytes(bytes.Clone(cbor)),
+		ByteLength:  uint64(length),
+		ContentHash: content,
+	}, nil
 }
 
 func validateRewardAccount(account []byte, kind string, credential []byte) error {

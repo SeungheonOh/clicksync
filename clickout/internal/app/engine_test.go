@@ -88,7 +88,7 @@ func TestTraceAddressSeedCursorPinsSnapshotAndPassesRepositoryKey(t *testing.T) 
 	reader := &fakeReader{
 		snapshot: snapshot,
 		seeds: repository.TraceSeedResult{
-			Truncated:          true,
+			TruncationReason:   model.TruncationAddressSeedLimit,
 			ContinuationCursor: next,
 		},
 	}
@@ -157,18 +157,18 @@ func TestForwardBFSHandlesConvergenceAndCycle(t *testing.T) {
 			switch frontier[0] {
 			case a:
 				return []model.FlowHyperedge{{
-					Transaction:     tx1,
-					ProducedOutputs: []model.Output{adaOutput(b), adaOutput(c)},
+					Transaction: model.FlowTransaction{Hash: tx1},
+					Outputs:     []model.Output{adaOutput(b), adaOutput(c)},
 				}}, nil
 			case b:
 				return []model.FlowHyperedge{{
-					Transaction:     tx2,
-					ProducedOutputs: []model.Output{adaOutput(a)},
+					Transaction: model.FlowTransaction{Hash: tx2},
+					Outputs:     []model.Output{adaOutput(a)},
 				}}, nil
 			default:
 				return []model.FlowHyperedge{{
-					Transaction:     tx2,
-					ProducedOutputs: []model.Output{adaOutput(a)},
+					Transaction: model.FlowTransaction{Hash: tx2},
+					Outputs:     []model.Output{adaOutput(a)},
 				}}, nil
 			}
 		},
@@ -203,8 +203,8 @@ func TestTraceNodeCapIsExplicitlyNotLossless(t *testing.T) {
 			[]model.UTxORef,
 		) ([]model.FlowHyperedge, error) {
 			return []model.FlowHyperedge{{
-				Transaction:     hash(9),
-				ProducedOutputs: []model.Output{adaOutput(b)},
+				Transaction: model.FlowTransaction{Hash: hash(9)},
+				Outputs:     []model.Output{adaOutput(b)},
 			}}, nil
 		},
 	}
@@ -235,7 +235,9 @@ func TestTraceEdgeCapIsDeterministicAndExplicit(t *testing.T) {
 			model.Snapshot,
 			[]model.UTxORef,
 		) ([]model.FlowHyperedge, error) {
-			return []model.FlowHyperedge{{Transaction: hash(8)}}, nil
+			return []model.FlowHyperedge{{
+				Transaction: model.FlowTransaction{Hash: hash(8)},
+			}}, nil
 		},
 		forwardTruncated: true,
 	}
@@ -247,7 +249,7 @@ func TestTraceEdgeCapIsDeterministicAndExplicit(t *testing.T) {
 	if !response.Truncation.Truncated || response.Truncation.Reason != "max_edges" ||
 		response.Truncation.LosslessResume ||
 		len(response.Data.Hyperedges) != 1 ||
-		response.Data.Hyperedges[0].Transaction != hash(8) ||
+		response.Data.Hyperedges[0].Transaction.Hash != hash(8) ||
 		len(response.Truncation.ContinuationFrontier) != 2 ||
 		response.Truncation.ContinuationFrontier[0] != a ||
 		response.Truncation.ContinuationFrontier[1] != b {
@@ -275,7 +277,11 @@ func TestTraceMultiBatchPassesRemainingBudgetsAndExclusions(t *testing.T) {
 			_ model.Snapshot,
 			frontier []model.UTxORef,
 		) ([]model.FlowHyperedge, error) {
-			return []model.FlowHyperedge{{Transaction: hash(frontier[0].TxHash[0] + 10)}}, nil
+			return []model.FlowHyperedge{{
+				Transaction: model.FlowTransaction{
+					Hash: hash(frontier[0].TxHash[0] + 10),
+				},
+			}}, nil
 		},
 	}
 	if _, err := New(reader).Execute(
@@ -311,13 +317,25 @@ func TestReverseBFSUsesConsumedSourceValues(t *testing.T) {
 				frontier[0] != target {
 				t.Fatalf("unexpected reverse frontier: %#v at %#v", frontier, snapshot)
 			}
+			sourceBOutput := adaOutput(sourceB)
+			sourceAOutput := adaOutput(sourceA)
 			return []model.FlowHyperedge{{
-				Transaction: hash(9),
-				ConsumedInputValues: []model.Output{
-					adaOutput(sourceB),
-					adaOutput(sourceA),
+				Transaction: model.FlowTransaction{Hash: hash(9)},
+				Inputs: []model.Spend{
+					{
+						Source:         sourceB,
+						IsConsumed:     true,
+						SourceResolved: true,
+						SourceOutput:   &sourceBOutput,
+					},
+					{
+						Source:         sourceA,
+						IsConsumed:     true,
+						SourceResolved: true,
+						SourceOutput:   &sourceAOutput,
+					},
 				},
-				ProducedOutputs: []model.Output{adaOutput(target)},
+				Outputs: []model.Output{adaOutput(target)},
 			}}, nil
 		},
 	}
@@ -527,6 +545,10 @@ func TestAddressCursorDiagnosticsAreCanonicalizedEndToEnd(t *testing.T) {
 	if reader.lastAddress.Snapshot.Diagnostics != pre.Diagnostics ||
 		response.Snapshot.Diagnostics != finished.Diagnostics {
 		t.Fatalf("canonical diagnostics were not threaded: %#v", response)
+	}
+	if response.Truncation.Reason != model.TruncationAddressPageLimit ||
+		!response.Truncation.Valid() {
+		t.Fatalf("address-page truncation = %#v", response.Truncation)
 	}
 	next, err := cursor.Decode(
 		response.Data.Cursor,
@@ -986,8 +1008,8 @@ func (reader *fakeReader) ExpandForward(
 	reader.expansionBudgets = append(reader.expansionBudgets, budget)
 	edges, err := reader.expandForward(ctx, snapshot, frontier)
 	return repository.ExpansionResult{
-		Hyperedges: edges,
-		Truncated:  reader.forwardTruncated,
+		Hyperedges:       edges,
+		TruncationReason: map[bool]model.TruncationReason{true: model.TruncationMaxEdges}[reader.forwardTruncated],
 	}, nil, err
 }
 

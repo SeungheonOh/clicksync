@@ -21,11 +21,11 @@ func traceHydrationPhaseLimits() phaseLimits {
 }
 
 func validateHyperedgeResources(edge model.FlowHyperedge, maxNodes uint32) error {
-	nodes := make(map[string]struct{}, len(edge.Inputs)+len(edge.ProducedOutputs))
+	nodes := make(map[string]struct{}, len(edge.Inputs)+len(edge.Outputs))
 	for _, input := range edge.Inputs {
 		nodes[input.Source.String()] = struct{}{}
 	}
-	for _, output := range edge.ProducedOutputs {
+	for _, output := range edge.Outputs {
 		nodes[output.Ref.String()] = struct{}{}
 	}
 	if len(nodes) > int(maxNodes) {
@@ -33,7 +33,7 @@ func validateHyperedgeResources(edge model.FlowHyperedge, maxNodes uint32) error
 			Phase: "trace_hyperedge",
 			Cause: fmt.Errorf(
 				"transaction %s has %d input/output nodes, limit %d",
-				edge.Transaction,
+				edge.Transaction.Hash,
 				len(nodes),
 				maxNodes,
 			),
@@ -91,21 +91,41 @@ func (store *Store) TraceSeeds(
 		return repository.TraceSeedResult{UTxOs: []model.UTxORef{*query.Seed.UTxO}}, nil, nil
 	}
 	if query.Seed.Tx != nil {
-		outputs, err := store.outputsByTx(ctx, snapshot, *query.Seed.Tx)
+		transactions, boundaries, err := store.transactionsByTx(
+			ctx,
+			snapshot,
+			[]model.Hash32{*query.Seed.Tx},
+		)
 		if err != nil {
 			return repository.TraceSeedResult{}, nil, err
 		}
-		seeds := make([]model.UTxORef, 0, len(outputs))
-		for _, output := range outputs {
+		if len(transactions) != 1 ||
+			transactions[0].Hash != *query.Seed.Tx {
+			return repository.TraceSeedResult{}, nil, ErrConflictingRow
+		}
+		seeds := make([]model.UTxORef, 0, len(transactions[0].Outputs))
+		for _, output := range transactions[0].Outputs {
 			if outputHasAsset(output, query.Asset) {
 				seeds = append(seeds, output.Ref)
 			}
 		}
-		truncated := len(seeds) > int(limit)
-		if truncated {
-			seeds = seeds[:limit]
+		seeds = uniqueRefs(seeds)
+		result := repository.TraceSeedResult{UTxOs: seeds}
+		if len(seeds) > int(limit) {
+			result.UTxOs = append(
+				[]model.UTxORef(nil),
+				seeds[:limit]...,
+			)
+			result.TruncationReason = model.TruncationMaxNodes
+			result.ContinuationFrontier = append(
+				[]model.UTxORef(nil),
+				seeds[limit:]...,
+			)
 		}
-		return repository.TraceSeedResult{UTxOs: seeds, Truncated: truncated}, nil, nil
+		if !result.Valid() {
+			return repository.TraceSeedResult{}, nil, ErrConflictingRow
+		}
+		return result, boundaries, nil
 	}
 	if len(query.Seed.Address) > 0 {
 		seeds := make([]model.UTxORef, 0, limit)
@@ -157,11 +177,17 @@ func (store *Store) TraceSeeds(
 				truncated = true
 			}
 		}
-		return repository.TraceSeedResult{
-			UTxOs:              seeds,
-			Truncated:          truncated,
-			ContinuationCursor: continuation,
-		}, boundaries, nil
+		result := repository.TraceSeedResult{
+			UTxOs: uniqueRefs(seeds),
+		}
+		if truncated {
+			result.TruncationReason = model.TruncationAddressSeedLimit
+			result.ContinuationCursor = continuation
+		}
+		if !result.Valid() {
+			return repository.TraceSeedResult{}, nil, ErrConflictingRow
+		}
+		return result, boundaries, nil
 	}
 	return repository.TraceSeedResult{}, nil, errors.New("missing trace seed")
 }
@@ -188,10 +214,18 @@ func (store *Store) ExpandForward(
           AND `+predicate+`
           AND i.publication_id <= publication_watermark
 `, `
-SELECT DISTINCT i.tx_hash
+SELECT DISTINCT
+    i.tx_hash,
+    toUInt8(
+        ifNull(b.present, toUInt8(0)) = 1
+        AND ifNull(b.block_number, toUInt64(0)) = i.block_number
+        AND i.tx_order < ifNull(b.transaction_count, toUInt32(0))
+    )
 FROM fact_candidates AS i
 INNER JOIN active_candidate_publications AS ap
     ON i.publication_id = ap.publication_id
+LEFT JOIN candidate_blocks AS b
+    ON i.publication_id = b.publication_id
 WHERE 1`+exclusion+`
 ORDER BY i.tx_hash
 LIMIT ?`)
@@ -241,10 +275,18 @@ func (store *Store) ExpandReverse(
         WHERE `+predicate+`
           AND o.publication_id <= publication_watermark
 `, `
-SELECT DISTINCT o.tx_hash
+SELECT DISTINCT
+    o.tx_hash,
+    toUInt8(
+        ifNull(b.present, toUInt8(0)) = 1
+        AND ifNull(b.block_number, toUInt64(0)) = o.block_number
+        AND o.tx_order < ifNull(b.transaction_count, toUInt32(0))
+    )
 FROM fact_candidates AS o
 INNER JOIN active_candidate_publications AS ap
     ON o.publication_id = ap.publication_id
+LEFT JOIN candidate_blocks AS b
+    ON o.publication_id = b.publication_id
 WHERE 1`+exclusion+`
 ORDER BY o.tx_hash
 LIMIT ?`)
@@ -329,10 +371,17 @@ func (store *Store) hydrateExpansion(
 	if postHydrationTruncated || len(verified) != len(edges) {
 		return repository.ExpansionResult{}, nil, ErrConflictingRow
 	}
-	return repository.ExpansionResult{
-		Hyperedges: edges,
-		Truncated:  candidateTruncated || nodeTruncated,
-	}, boundaries, nil
+	result := repository.ExpansionResult{Hyperedges: edges}
+	switch {
+	case nodeTruncated:
+		result.TruncationReason = model.TruncationMaxNodes
+	case candidateTruncated:
+		result.TruncationReason = model.TruncationMaxEdges
+	}
+	if !result.Valid() {
+		return repository.ExpansionResult{}, nil, ErrConflictingRow
+	}
+	return result, boundaries, nil
 }
 
 func (store *Store) traceCandidateNodes(
@@ -377,16 +426,24 @@ func (store *Store) traceInputCandidateNodes(
 SELECT
     tx_hash,
     groupArray(source_tx_hash),
-    groupArray(source_output_index)
+    groupArray(source_output_index),
+    min(block_present)
 FROM
 (
     SELECT DISTINCT
         i.tx_hash,
         i.source_tx_hash,
-        i.source_output_index
+        i.source_output_index,
+        toUInt8(
+            ifNull(b.present, toUInt8(0)) = 1
+            AND ifNull(b.block_number, toUInt64(0)) = i.block_number
+            AND i.tx_order < ifNull(b.transaction_count, toUInt32(0))
+        ) AS block_present
     FROM fact_candidates AS i
     INNER JOIN active_candidate_publications AS ap
         ON i.publication_id = ap.publication_id
+    LEFT JOIN candidate_blocks AS b
+        ON i.publication_id = b.publication_id
     ORDER BY i.tx_hash, i.source_tx_hash, i.source_output_index
 )
 GROUP BY tx_hash
@@ -417,15 +474,23 @@ func (store *Store) traceOutputCandidateNodes(
 SELECT
     tx_hash,
     groupArray(tx_hash),
-    groupArray(output_index)
+    groupArray(output_index),
+    min(block_present)
 FROM
 (
     SELECT DISTINCT
         o.tx_hash,
-        o.output_index
+        o.output_index,
+        toUInt8(
+            ifNull(b.present, toUInt8(0)) = 1
+            AND ifNull(b.block_number, toUInt64(0)) = o.block_number
+            AND o.tx_order < ifNull(b.transaction_count, toUInt32(0))
+        ) AS block_present
     FROM fact_candidates AS o
     INNER JOIN active_candidate_publications AS ap
         ON o.publication_id = ap.publication_id
+    LEFT JOIN candidate_blocks AS b
+        ON o.publication_id = b.publication_id
     ORDER BY o.tx_hash, o.output_index
 )
 GROUP BY tx_hash
@@ -464,7 +529,11 @@ func (store *Store) scanTraceCandidateNodes(
 		var txHash []byte
 		var nodeHashes []string
 		var nodeIndexes []uint32
-		if err := rows.Scan(&txHash, &nodeHashes, &nodeIndexes); err != nil {
+		if err := (&blockPresenceScanner{row: rows}).Scan(
+			&txHash,
+			&nodeHashes,
+			&nodeIndexes,
+		); err != nil {
 			return mapQueryError(phase, err)
 		}
 		tx, err := model.Hash32FromBytes(txHash)
@@ -562,15 +631,15 @@ func fitTraceEdgeNodes(
 	nodes := make(map[string]map[string]struct{}, len(edges))
 	candidates := make([]model.Hash32, len(edges))
 	for index, edge := range edges {
-		candidates[index] = edge.Transaction
-		edgeNodes := make(map[string]struct{}, len(edge.Inputs)+len(edge.ProducedOutputs))
+		candidates[index] = edge.Transaction.Hash
+		edgeNodes := make(map[string]struct{}, len(edge.Inputs)+len(edge.Outputs))
 		for _, input := range edge.Inputs {
 			edgeNodes[input.Source.String()] = struct{}{}
 		}
-		for _, output := range edge.ProducedOutputs {
+		for _, output := range edge.Outputs {
 			edgeNodes[output.Ref.String()] = struct{}{}
 		}
-		nodes[edge.Transaction.String()] = edgeNodes
+		nodes[edge.Transaction.Hash.String()] = edgeNodes
 	}
 	accepted, truncated, err := fitTraceCandidateNodes(candidates, nodes, maxNodes)
 	if err != nil {
@@ -598,366 +667,29 @@ func (store *Store) hyperedgesByTx(
 	if len(hashes) == 0 {
 		return []model.FlowHyperedge{}, nil, nil
 	}
-	predicate, values := hashPredicate("t.tx_hash", hashes)
-	headerSQL := targetedFactSQL(`
-        SELECT *
-        FROM transactions AS t
-        WHERE `+predicate+`
-          AND t.publication_id <= publication_watermark
-`, `
-SELECT
-    t.tx_hash,
-    t.effective_fee_lovelace,
-    t.mint_is_applied,
-    t.mint_policy_ids,
-    t.mint_asset_names,
-    t.mint_quantities
-FROM fact_candidates AS t
-INNER JOIN active_candidate_publications AS ap
-    ON t.publication_id = ap.publication_id
-ORDER BY t.tx_hash`)
-	queryCtx, finish := store.instrumentPhase(
+	transactions, boundaries, err := store.transactionsByTx(
 		ctx,
-		"trace_transactions",
-		traceHydrationPhaseLimits(),
+		snapshot,
+		hashes,
 	)
-	rows, err := store.conn.Query(queryCtx, headerSQL, activeArguments(snapshot, values...)...)
 	if err != nil {
-		finish()
-		return nil, nil, mapQueryError("trace_transactions", err)
-	}
-	edges := make(map[string]*model.FlowHyperedge, len(hashes))
-	for rows.Next() {
-		var txHash []byte
-		var fee *uint64
-		var mintApplied bool
-		var policies, names []string
-		var quantities []int64
-		if err := rows.Scan(&txHash, &fee, &mintApplied, &policies, &names, &quantities); err != nil {
-			rows.Close()
-			finish()
-			return nil, nil, mapQueryError("trace_transactions", err)
-		}
-		tx, err := model.Hash32FromBytes(txHash)
-		if err != nil {
-			rows.Close()
-			finish()
-			return nil, nil, err
-		}
-		if _, exists := edges[tx.String()]; exists {
-			rows.Close()
-			finish()
+		if errors.Is(err, ErrNotFound) {
 			return nil, nil, ErrConflictingRow
 		}
-		mint, err := decodeSignedAssets(policies, names, quantities)
-		if err != nil {
-			rows.Close()
-			finish()
-			return nil, nil, err
-		}
-		edge := &model.FlowHyperedge{
-			Transaction:         tx,
-			Inputs:              make([]model.Spend, 0),
-			ConsumedInputs:      make([]model.UTxORef, 0),
-			ConsumedInputValues: make([]model.Output, 0),
-			ProducedOutputs:     make([]model.Output, 0),
-			AppliedWithdrawals:  make([]model.Withdrawal, 0),
-			MintDeltas:          make([]model.MintDelta, 0, len(mint)),
-		}
-		if fee != nil && *fee > 0 {
-			edge.FeeSink = &model.FeeSink{TxHash: tx, Lovelace: *fee}
-		}
-		if mintApplied {
-			for _, quantity := range mint {
-				edge.MintDeltas = append(edge.MintDeltas, model.MintDelta{
-					TxHash:   tx,
-					Asset:    quantity,
-					IsSource: quantity.Quantity > 0,
-					IsSink:   quantity.Quantity < 0,
-				})
-			}
-		}
-		edges[tx.String()] = edge
-	}
-	err = rows.Err()
-	rows.Close()
-	finish()
-	if err != nil {
-		return nil, nil, mapQueryError("trace_transactions", err)
-	}
-	if len(edges) != len(hashes) {
-		return nil, nil, ErrConflictingRow
-	}
-
-	hashPredicateSQL, hashValues := hashPredicate("i.tx_hash", hashes)
-	inputSQL := targetedFactSQL(`
-        SELECT *
-        FROM inputs AS i
-        WHERE `+hashPredicateSQL+`
-          AND i.publication_id <= publication_watermark
-`, `
-SELECT
-    i.source_tx_hash,
-    i.source_output_index,
-    i.tx_hash,
-    b.block_hash,
-    i.block_number,
-    i.role,
-    i.body_ordinal,
-    i.is_consumed,
-    i.source_is_resolved
-FROM fact_candidates AS i
-INNER JOIN active_candidate_publications AS ap
-    ON i.publication_id = ap.publication_id
-INNER JOIN candidate_blocks AS b ON i.publication_id = b.publication_id
-ORDER BY
-    i.tx_hash,
-    multiIf(i.role = 'regular', 0, i.role = 'collateral', 1, i.role = 'reference', 2, 3),
-    i.body_ordinal,
-    i.source_tx_hash,
-    i.source_output_index,
-    i.publication_id`)
-	queryCtx, finish = store.instrumentPhase(
-		ctx,
-		"trace_consumed_inputs",
-		traceHydrationPhaseLimits(),
-	)
-	rows, err = store.conn.Query(queryCtx, inputSQL, activeArguments(snapshot, hashValues...)...)
-	if err != nil {
-		finish()
-		return nil, nil, mapQueryError("trace_consumed_inputs", err)
-	}
-	boundaries := make([]model.PartialHistoryBoundary, 0)
-	resolvedRefs := make([]model.UTxORef, 0)
-	type inputLocation struct {
-		edge  *model.FlowHyperedge
-		index int
-	}
-	locations := make(map[string][]inputLocation)
-	scannedInputs := make([]model.Spend, 0)
-	for rows.Next() {
-		input, err := scanSpend(rows)
-		if err != nil {
-			rows.Close()
-			finish()
-			return nil, nil, mapQueryError("trace_consumed_inputs", err)
-		}
-		edge := edges[input.ConsumingTx.String()]
-		if edge == nil {
-			rows.Close()
-			finish()
-			return nil, nil, errors.New("input has no active transaction")
-		}
-		scannedInputs = append(scannedInputs, input)
-		edge.Inputs = append(edge.Inputs, input)
-		location := inputLocation{edge: edge, index: len(edge.Inputs) - 1}
-		locations[input.Source.String()] = append(locations[input.Source.String()], location)
-		if input.IsConsumed {
-			edge.ConsumedInputs = append(edge.ConsumedInputs, input.Source)
-		}
-		resolvedRefs = append(resolvedRefs, input.Source)
-	}
-	err = rows.Err()
-	rows.Close()
-	finish()
-	if err != nil {
-		return nil, nil, mapQueryError("trace_consumed_inputs", err)
-	}
-	if err := validateCompleteSpendRows(scannedInputs); err != nil {
 		return nil, nil, err
 	}
-
-	resolvedRefs = uniqueRefs(resolvedRefs)
-	inputValues, valueBoundaries, err := store.outputsByRefs(ctx, snapshot, resolvedRefs)
-	if err != nil {
-		return nil, nil, err
+	edges := make([]model.FlowHyperedge, len(transactions))
+	for index, transaction := range transactions {
+		edges[index] = model.NewFlowHyperedge(transaction)
 	}
-	boundaries = append(boundaries, valueBoundaries...)
-	for _, output := range inputValues {
-		inputLocations := locations[output.Ref.String()]
-		if len(inputLocations) == 0 {
-			return nil, nil, errors.New("resolved source output has no input")
-		}
-		for _, location := range inputLocations {
-			source := output
-			location.edge.Inputs[location.index].SourceResolved = true
-			location.edge.Inputs[location.index].SourceOutput = &source
-			if location.edge.Inputs[location.index].IsConsumed {
-				location.edge.ConsumedInputValues = append(
-					location.edge.ConsumedInputValues,
-					output,
-				)
-			}
-		}
-	}
-
-	outputPredicateSQL, outputValues := hashPredicate("o.tx_hash", hashes)
-	outputSQL := targetedFactSQL(`
-        SELECT *
-        FROM outputs AS o
-        WHERE `+outputPredicateSQL+`
-          AND o.publication_id <= publication_watermark
-`, `
-SELECT`+outputColumns+`
-FROM fact_candidates AS o
-INNER JOIN active_candidate_publications AS ap
-    ON o.publication_id = ap.publication_id
-INNER JOIN candidate_blocks AS b ON o.publication_id = b.publication_id
-ORDER BY o.tx_hash, o.body_ordinal, o.output_index, o.publication_id`)
-	queryCtx, finish = store.instrumentPhase(
-		ctx,
-		"trace_produced_outputs",
-		traceHydrationPhaseLimits(),
-	)
-	rows, err = store.conn.Query(queryCtx, outputSQL, activeArguments(snapshot, outputValues...)...)
-	if err != nil {
-		finish()
-		return nil, nil, mapQueryError("trace_produced_outputs", err)
-	}
-	scannedProduced := make([]model.Output, 0)
-	for rows.Next() {
-		output, err := scanOutput(rows)
-		if err != nil {
-			rows.Close()
-			finish()
-			return nil, nil, mapQueryError("trace_produced_outputs", err)
-		}
-		edge := edges[output.ProducingTx.String()]
-		if edge == nil {
-			rows.Close()
-			finish()
-			return nil, nil, errors.New("produced output has no active transaction")
-		}
-		scannedProduced = append(scannedProduced, output)
-		edge.ProducedOutputs = append(edge.ProducedOutputs, output)
-	}
-	err = rows.Err()
-	rows.Close()
-	finish()
-	if err != nil {
-		return nil, nil, mapQueryError("trace_produced_outputs", err)
-	}
-	if err := validateCompleteOutputRows(scannedProduced); err != nil {
-		return nil, nil, err
-	}
-	produced := make([]model.Output, 0)
-	for _, edge := range edges {
-		produced = append(produced, edge.ProducedOutputs...)
-	}
-	if err := store.hydrateInlineDatums(ctx, produced); err != nil {
-		return nil, nil, err
-	}
-	for _, edge := range edges {
-		edge.ProducedOutputs = edge.ProducedOutputs[:0]
-	}
-	for _, output := range produced {
-		edge := edges[output.ProducingTx.String()]
-		edge.ProducedOutputs = append(edge.ProducedOutputs, output)
-	}
-
-	withdrawalPredicateSQL, withdrawalValues := hashPredicate("w.tx_hash", hashes)
-	withdrawalSQL := targetedFactSQL(`
-        SELECT *
-        FROM withdrawals AS w
-        WHERE w.is_applied
-          AND `+withdrawalPredicateSQL+`
-          AND w.publication_id <= publication_watermark
-`, `
-SELECT
-    w.tx_hash,
-    w.reward_account,
-    w.lovelace,
-    w.body_ordinal,
-    w.credential_kind,
-    w.credential_hash
-FROM fact_candidates AS w
-INNER JOIN active_candidate_publications AS ap
-    ON w.publication_id = ap.publication_id
-ORDER BY w.tx_hash, w.body_ordinal`)
-	queryCtx, finish = store.instrumentPhase(
-		ctx,
-		"trace_applied_withdrawals",
-		traceHydrationPhaseLimits(),
-	)
-	rows, err = store.conn.Query(
-		queryCtx,
-		withdrawalSQL,
-		activeArguments(snapshot, withdrawalValues...)...,
-	)
-	if err != nil {
-		finish()
-		return nil, nil, mapQueryError("trace_applied_withdrawals", err)
-	}
-	for rows.Next() {
-		var txHash, reward, credential []byte
-		var credentialKind string
-		var amount uint64
-		var ordinal uint32
-		if err := rows.Scan(
-			&txHash,
-			&reward,
-			&amount,
-			&ordinal,
-			&credentialKind,
-			&credential,
-		); err != nil {
-			rows.Close()
-			finish()
-			return nil, nil, mapQueryError("trace_applied_withdrawals", err)
-		}
-		tx, err := model.Hash32FromBytes(txHash)
-		if err != nil {
-			rows.Close()
-			finish()
-			return nil, nil, err
-		}
-		if err := validateRewardAccount(reward, credentialKind, credential); err != nil {
-			rows.Close()
-			finish()
-			return nil, nil, err
-		}
-		edge := edges[tx.String()]
-		if edge == nil {
-			rows.Close()
-			finish()
-			return nil, nil, errors.New("withdrawal has no active transaction")
-		}
-		edge.AppliedWithdrawals = append(edge.AppliedWithdrawals, model.Withdrawal{
-			TxHash:         tx,
-			RewardAccount:  model.Bytes(bytes.Clone(reward)),
-			Lovelace:       amount,
-			BodyOrdinal:    ordinal,
-			Applied:        true,
-			CredentialKind: credentialKind,
-			CredentialHash: model.Bytes(bytes.Clone(credential)),
-		})
-	}
-	err = rows.Err()
-	rows.Close()
-	finish()
-	if err != nil {
-		return nil, nil, mapQueryError("trace_applied_withdrawals", err)
-	}
-
-	result := make([]model.FlowHyperedge, 0, len(edges))
-	keys := make([]string, 0, len(edges))
-	for key := range edges {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		if err := validateHyperedgeResources(*edges[key], limits.HardMaxTraceNodes); err != nil {
-			return nil, nil, err
-		}
-		result = append(result, *edges[key])
-	}
-	return result, boundaries, nil
+	return edges, boundaries, nil
 }
 
 func (store *Store) outputsByRefs(
 	ctx context.Context,
 	snapshot model.Snapshot,
 	refs []model.UTxORef,
+	contextBodies *contextBodyPool,
 ) ([]model.Output, []model.PartialHistoryBoundary, error) {
 	if len(refs) == 0 {
 		return []model.Output{}, nil, nil
@@ -969,16 +701,23 @@ func (store *Store) outputsByRefs(
         WHERE `+predicate+`
           AND o.publication_id <= publication_watermark
 `, `
-SELECT`+outputColumns+`
+SELECT`+outputColumns+`,
+    toUInt8(
+        ifNull(b.present, toUInt8(0)) = 1
+        AND ifNull(b.block_number, toUInt64(0)) = o.block_number
+        AND o.tx_order < ifNull(b.transaction_count, toUInt32(0))
+    ),
+    ifNull(b.era, ''),
+    ifNull(b.synthetic, false)
 FROM fact_candidates AS o
 INNER JOIN active_candidate_publications AS ap
     ON o.publication_id = ap.publication_id
-INNER JOIN candidate_blocks AS b ON o.publication_id = b.publication_id
+LEFT JOIN candidate_blocks AS b ON o.publication_id = b.publication_id
 ORDER BY o.tx_hash, o.body_ordinal, o.output_index, o.publication_id`)
 	queryCtx, finish := store.instrumentPhase(
 		ctx,
 		"trace_output_values",
-		traceHydrationPhaseLimits(),
+		hydrationPhaseLimits(uint64(len(refs))+1),
 	)
 	defer finish()
 	rows, err := store.conn.Query(queryCtx, sql, activeArguments(snapshot, values...)...)
@@ -989,9 +728,17 @@ ORDER BY o.tx_hash, o.body_ordinal, o.output_index, o.publication_id`)
 	outputs := make([]model.Output, 0, len(refs))
 	found := make(map[string]struct{}, len(refs))
 	for rows.Next() {
-		output, err := scanOutput(rows)
+		owner := &outputOwnerScanner{row: rows}
+		output, err := scanOutput(owner)
 		if err != nil {
 			return nil, nil, mapQueryError("trace_output_values", err)
+		}
+		if err := validateOutputEraCapabilities(
+			output,
+			owner.era,
+			owner.synthetic,
+		); err != nil {
+			return nil, nil, err
 		}
 		if _, duplicate := found[output.Ref.String()]; duplicate {
 			return nil, nil, ErrConflictingRow
@@ -1005,7 +752,11 @@ ORDER BY o.tx_hash, o.body_ordinal, o.output_index, o.publication_id`)
 	if err := validateOutputRows(outputs); err != nil {
 		return nil, nil, err
 	}
-	if err := store.hydrateInlineDatums(ctx, outputs); err != nil {
+	if err := store.hydrateInlineDatumsWithBodies(
+		ctx,
+		outputs,
+		contextBodies,
+	); err != nil {
 		return nil, nil, err
 	}
 	boundaries := make([]model.PartialHistoryBoundary, 0)
@@ -1076,8 +827,19 @@ func scanCandidateHashes(rows interface {
 	Scan(...any) error
 	Err() error
 }) ([]model.Hash32, error) {
-	result, err := scanHashes(rows)
-	if err != nil {
+	result := make([]model.Hash32, 0)
+	for rows.Next() {
+		var raw []byte
+		if err := (&blockPresenceScanner{row: rows}).Scan(&raw); err != nil {
+			return nil, err
+		}
+		hash, err := model.Hash32FromBytes(raw)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, hash)
+	}
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	for index := 1; index < len(result); index++ {
