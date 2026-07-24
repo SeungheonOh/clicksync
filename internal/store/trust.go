@@ -1004,8 +1004,17 @@ func (d *DB) FinalizeTrustCheck(
 				next.PendingEvidenceWrite != nil {
 				return errors.New("trust finalization requires frozen committed evidence")
 			}
+			primarySuffix := uint64(0)
 			if status == "agreed" && *next.Checked != next.Physical {
-				return errors.New("older agreed candidate requires rollback reservation before trust release")
+				var err error
+				primarySuffix, err = d.validatedPrimarySuffixAfterCheckedAncestor(
+					ctx,
+					*next,
+					check,
+				)
+				if err != nil {
+					return err
+				}
 			}
 			next.TrustStatus = status
 			next.CorroborationConfirmed = evidence.Confirmed
@@ -1030,7 +1039,12 @@ func (d *DB) FinalizeTrustCheck(
 				}
 				next.Effective = next.Physical
 				next.Servable = true
-				next.PrimarySuffix = 0
+				next.PrimarySuffix = primarySuffix
+				if primarySuffix == 0 {
+					next.TrustBasis = "sampled_peer"
+				} else {
+					next.TrustBasis = "primary_only"
+				}
 			case "unavailable":
 				if next.LastAgreed != nil || next.ServableFloorPermanent {
 					next.Effective = next.Physical
@@ -1056,6 +1070,65 @@ func (d *DB) FinalizeTrustCheck(
 		},
 	)
 	return resolution, err
+}
+
+// validatedPrimarySuffixAfterCheckedAncestor permits a periodic check that
+// began at the physical head to finish after later adoptions committed. The
+// sampled point remains the authority anchor; only its exact active physical
+// descendants form the primary-only suffix. An older candidate selected for a
+// rollback cannot use this path.
+func (d *DB) validatedPrimarySuffixAfterCheckedAncestor(
+	ctx context.Context,
+	record manifestRecord,
+	check syncer.CheckIdentity,
+) (uint64, error) {
+	if record.Checked == nil || !check.Physical {
+		return 0, errors.New(
+			"older agreed candidate requires rollback reservation before trust release",
+		)
+	}
+	if !manifestPointBefore(record.Checked.Point, record.Physical.Point) {
+		return 0, errors.New(
+			"advanced physical head is not strictly after its checked ancestor",
+		)
+	}
+	remote, err := d.remoteAdoptionsBetween(
+		ctx,
+		record.Checked.EventSeq,
+		record.Physical.EventSeq,
+	)
+	if err != nil {
+		return 0, fmt.Errorf(
+			"count primary suffix after checked ancestor: %w",
+			err,
+		)
+	}
+	if remote == 0 || remote > manifestMaximumSuffix {
+		return 0, fmt.Errorf(
+			"checked ancestor has invalid primary suffix length %d",
+			remote,
+		)
+	}
+	descendants, err := d.ActiveDescendants(
+		ctx,
+		record.Physical.EventSeq,
+		record.Checked.Point,
+		uint32(remote),
+	)
+	if err != nil {
+		return 0, fmt.Errorf(
+			"validate active primary suffix after checked ancestor: %w",
+			err,
+		)
+	}
+	if uint64(len(descendants)) != remote {
+		return 0, fmt.Errorf(
+			"active primary suffix has %d descendants but %d remote adoptions",
+			len(descendants),
+			remote,
+		)
+	}
+	return remote, nil
 }
 
 type trustEvidenceResult struct {

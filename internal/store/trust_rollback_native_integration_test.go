@@ -476,6 +476,106 @@ func TestNativeTrustAttemptIdentityAdvancesWithinAgreementGroup(t *testing.T) {
 	}
 }
 
+func TestNativePeriodicAgreementReleasesExactAdvancedPrimarySuffix(t *testing.T) {
+	if os.Getenv("CLICKSYNC_CLICKHOUSE_INTEGRATION") != "1" {
+		t.Skip("set CLICKSYNC_CLICKHOUSE_INTEGRATION=1 for isolated ClickHouse")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	db, lock, seed, first, second, now := nativeRollbackFixture(t, ctx)
+	defer db.Close()
+	defer lock.Release()
+
+	check := beginNativeRollbackCheck(t, ctx, db, lock, seed, second, now)
+	if !check.Physical {
+		t.Fatalf("periodic check did not begin at the physical head: %+v", check)
+	}
+	third := publication.Point{
+		Slot:        13,
+		Hash:        hash32Fill(0xa3),
+		BlockNumber: 4,
+	}
+	insertNativeBlock(t, ctx, db, 3, third, &second.Hash, seed.WriterID, now)
+	insertNativeAdoption(t, ctx, db, 3, 3, third, seed.WriterID, now)
+	if err := db.PersistManifest(ctx, lock, publication.ManifestUpdate{
+		EventSeq:        3,
+		Tip:             third,
+		Kind:            publication.ManifestAdoption,
+		RemoteAdoptions: 1,
+		WriterID:        seed.WriterID,
+		WriterBuild:     "advanced-periodic-check",
+		UpdatedAt:       now.Add(4 * time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	observations := []model.PeerObservation{
+		trustObservationForTest(check, "relay-a", "operator-a", "agreed", now.Add(5*time.Second)),
+		trustObservationForTest(check, "relay-b", "operator-b", "agreed", now.Add(5*time.Second)),
+	}
+	for index := range observations {
+		observations[index].Kind = "checkpoint"
+		observations[index].ProofMethod = syncer.ObservationProofChainSyncSingleton
+		if err := model.FinalizePeerObservationIdentity(&observations[index]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.InsertPeerObservations(ctx, lock, observations); err != nil {
+		t.Fatal(err)
+	}
+	resolution, err := db.FinalizeTrustCheck(
+		ctx,
+		lock,
+		check,
+		false,
+		"",
+		now.Add(6*time.Second),
+		seed.WriterID,
+		"advanced-periodic-check",
+	)
+	if err != nil || resolution.Status != "agreed" || !resolution.Servable {
+		t.Fatalf("resolution=%+v err=%v", resolution, err)
+	}
+	latest, found, err := db.loadLatestManifestRecord(ctx)
+	if err != nil || !found {
+		t.Fatalf("load manifest found=%t err=%v", found, err)
+	}
+	if latest.TrustBasis != "primary_only" ||
+		latest.PrimarySuffix != 1 ||
+		latest.LastAgreed == nil ||
+		*latest.LastAgreed != (manifestHead{EventSeq: 2, Point: second}) ||
+		latest.Physical != (manifestHead{EventSeq: 3, Point: third}) ||
+		latest.Effective != latest.Physical ||
+		!latest.Servable {
+		t.Fatalf("advanced periodic agreement = %+v", latest)
+	}
+	if err := verifyManifestRecord(latest); err != nil {
+		t.Fatalf("advanced periodic manifest is invalid: %v", err)
+	}
+
+	older := beginNativeRollbackCheck(t, ctx, db, lock, seed, first, now.Add(7*time.Second))
+	if older.Physical {
+		t.Fatalf("older rollback candidate was marked physical: %+v", older)
+	}
+	if err := db.InsertPeerObservations(ctx, lock, []model.PeerObservation{
+		trustObservationForTest(older, "relay-a", "operator-a", "agreed", now.Add(11*time.Second)),
+		trustObservationForTest(older, "relay-b", "operator-b", "agreed", now.Add(11*time.Second)),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.FinalizeTrustCheck(
+		ctx,
+		lock,
+		older,
+		false,
+		"",
+		now.Add(12*time.Second),
+		seed.WriterID,
+		"advanced-periodic-check",
+	); err == nil {
+		t.Fatal("older rollback candidate released the physical suffix")
+	}
+}
+
 func TestNativeConcurrentStatusNeverExposesRejectedPhysicalHead(t *testing.T) {
 	if os.Getenv("CLICKSYNC_CLICKHOUSE_INTEGRATION") != "1" {
 		t.Skip("set CLICKSYNC_CLICKHOUSE_INTEGRATION=1 for isolated ClickHouse")
