@@ -58,6 +58,7 @@ func TestParsePoint(t *testing.T) {
 func TestSyncConfigRejectsThresholdLikeOrUnboundedValues(t *testing.T) {
 	t.Setenv("CLICKHOUSE_PASSWORD", "secret")
 	t.Setenv("CARDANO_RELAYS", "a.example:3001|one,b.example:3001|two")
+	t.Setenv("CLICKSYNC_BLOCKFETCH_RANGE_BLOCKS", "4096")
 	cfg, err := SyncFromEnv()
 	if err != nil {
 		t.Fatalf("default sync config: %v", err)
@@ -65,9 +66,20 @@ func TestSyncConfigRejectsThresholdLikeOrUnboundedValues(t *testing.T) {
 	if got, want := len(cfg.Relays), 2; got != want {
 		t.Fatalf("relay count = %d, want %d", got, want)
 	}
-	cfg.HeaderBatchSize = 513
+	if cfg.BlockFetchRangeBlocks != 4096 {
+		t.Fatalf(
+			"BlockFetch range = %d, want 4096",
+			cfg.BlockFetchRangeBlocks,
+		)
+	}
+	cfg.BlockFetchRangeBlocks = 8193
 	if err := cfg.Validate(); err == nil {
-		t.Fatal("oversized header batch unexpectedly validated")
+		t.Fatal("oversized BlockFetch range unexpectedly validated")
+	}
+	cfg.BlockFetchRangeBlocks = 4096
+	cfg.BlockFetchQueueSize = 513
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("oversized BlockFetch queue unexpectedly validated")
 	}
 }
 

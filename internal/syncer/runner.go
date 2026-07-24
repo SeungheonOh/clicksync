@@ -251,16 +251,16 @@ func (r Runner) runAttempt(
 	for index, configured := range r.Config.Relays {
 		session, err := r.NewSession(
 			relay.Config{
-				RelayIndex:        index,
-				Host:              configured.Host,
-				Operator:          configured.Operator,
-				NetworkMagic:      r.Config.NetworkMagic,
-				ProtocolQueueSize: r.Config.ProtocolQueueSize,
-				HeaderBatchSize:   r.Config.HeaderBatchSize,
-				RelayQueueSize:    r.Config.RelayQueueSize,
-				RawQueueBytes:     r.Config.AgreedQueueBytes,
-				DialTimeout:       r.Config.DialTimeout,
-				BlockTimeout:      r.Config.ProtocolTimeout,
+				RelayIndex:            index,
+				Host:                  configured.Host,
+				Operator:              configured.Operator,
+				NetworkMagic:          r.Config.NetworkMagic,
+				BlockFetchRangeBlocks: r.Config.BlockFetchRangeBlocks,
+				BlockFetchQueueSize:   r.Config.BlockFetchQueueSize,
+				RelayQueueSize:        r.Config.RelayQueueSize,
+				RawQueueBytes:         r.Config.AgreedQueueBytes,
+				DialTimeout:           r.Config.DialTimeout,
+				BlockTimeout:          r.Config.ProtocolTimeout,
 			},
 			r.Logger.With(
 				"relay_index", index,

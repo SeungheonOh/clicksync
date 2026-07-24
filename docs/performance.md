@@ -134,7 +134,7 @@ Tune one dimension at a time:
 
 1. normalizer worker count;
 2. raw/reorder window;
-3. BlockFetch header range;
+3. BlockFetch range size;
 4. publication block/row/byte/age limits;
 5. ClickHouse connection pool;
 6. table insert concurrency.
@@ -145,7 +145,7 @@ each change.
 ## 7. Initial settings to validate
 
 ```text
-header batch:              512 blocks
+BlockFetch range:          512 blocks
 per-relay event queue:     256
 agreed/reorder window:     256 blocks / 256 MiB
 normalizer workers:        GOMAXPROCS

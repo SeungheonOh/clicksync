@@ -39,16 +39,16 @@ type Reader interface {
 }
 
 type Config struct {
-	RelayIndex        int
-	Host              string
-	Operator          string
-	NetworkMagic      uint32
-	ProtocolQueueSize int
-	HeaderBatchSize   int
-	RelayQueueSize    int
-	RawQueueBytes     int64
-	DialTimeout       time.Duration
-	BlockTimeout      time.Duration
+	RelayIndex            int
+	Host                  string
+	Operator              string
+	NetworkMagic          uint32
+	BlockFetchRangeBlocks int
+	BlockFetchQueueSize   int
+	RelayQueueSize        int
+	RawQueueBytes         int64
+	DialTimeout           time.Duration
+	BlockTimeout          time.Duration
 }
 
 // RawBlockDigest hashes the exact bytes supplied by BlockFetch. Point and
@@ -77,12 +77,14 @@ func New(config Config, logger *slog.Logger) (*Session, error) {
 		NetworkMagic: config.NetworkMagic,
 	}
 	return &Session{
-		config:   config,
-		logger:   logger,
-		identity: identity,
-		events:   make(chan Event, config.RelayQueueSize),
-		ready:    make(chan struct{}),
-		done:     make(chan struct{}),
-		rawWake:  make(chan struct{}, 1),
+		config:      config,
+		logger:      logger,
+		identity:    identity,
+		chainEvents: make(chan chainEvent, chainsyncQueueSize),
+		fetchJobs:   make(chan fetchJob, 1),
+		events:      make(chan Event, config.RelayQueueSize),
+		ready:       make(chan struct{}),
+		done:        make(chan struct{}),
+		rawWake:     make(chan struct{}, 1),
 	}, nil
 }

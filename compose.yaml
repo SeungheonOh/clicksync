@@ -64,6 +64,8 @@ services:
       CARDANO_RELAYS: ${CARDANO_RELAYS:-backbone.cardano.iog.io:3001|iog,backbone.mainnet.cardanofoundation.org:3001|cardano-foundation}
       CLICKSYNC_START: ${CLICKSYNC_START:-133660799:e757d57eb8dc9500a61c60a39fadb63d9be6973ba96ae337fd24453d4d15c343:10781330}
       CLICKSYNC_LOCK_PATH: /var/lib/clicksync/writer.lock
+      CLICKSYNC_BLOCKFETCH_RANGE_BLOCKS: ${CLICKSYNC_BLOCKFETCH_RANGE_BLOCKS:-512}
+      CLICKSYNC_BLOCKFETCH_QUEUE_SIZE: ${CLICKSYNC_BLOCKFETCH_QUEUE_SIZE:-512}
     volumes:
       - clicksync-state:/var/lib/clicksync
 

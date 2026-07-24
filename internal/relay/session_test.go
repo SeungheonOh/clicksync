@@ -110,7 +110,7 @@ func TestProtocolConfigsUseOnlyRawBlockCallbackAndSkipValidation(t *testing.T) {
 		t.Fatalf("BlockFetch queue = %d, want 8", blockConfig.RecvQueueSize)
 	}
 
-	session = newTestSession(t, 0, 256, 128, 1<<20)
+	session = newTestSession(t, 0, 256, 4096, 1<<20)
 	_, chainConfig, err = session.protocolConfigs()
 	if err != nil {
 		t.Fatal(err)
@@ -183,8 +183,8 @@ func TestSingleRangeAtTipRetainsOnlySourceRaw(t *testing.T) {
 			); err != nil {
 				t.Fatal(err)
 			}
-			raw[0] = 0xff
 			event := nextEvent(t, session)
+			raw[0] = 0xff
 			if event.Kind != Forward || event.Point != modelPointForHeader(header) {
 				t.Fatalf("unexpected event: %+v", event)
 			}
@@ -234,9 +234,87 @@ func TestOrderedMultiBlockRange(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	for index, header := range headers {
+		event := nextEvent(t, session)
+		if event.Point != modelPointForHeader(header) ||
+			event.BlockType != uint(index+1) {
+			t.Fatalf("event %d = %+v", index, event)
+		}
+	}
 	if !sameProtocolPoint(requestedStart, pointForHeader(headers[0])) ||
 		!sameProtocolPoint(requestedEnd, pointForHeader(headers[2])) {
 		t.Fatalf("requested wrong range %v..%v", requestedStart, requestedEnd)
+	}
+}
+
+func TestChainSyncPreparesNextRangeWhileBlockFetchStreams(t *testing.T) {
+	session := newTestSession(t, 0, 8, 2, 1<<20)
+	headers := []*fakeHeader{
+		testHeader(10, 100),
+		testHeader(11, 101),
+		testHeader(12, 102),
+		testHeader(13, 103),
+	}
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	secondStarted := make(chan struct{})
+	call := 0
+	armSession(t, session, func(_, _ pcommon.Point) error {
+		current := call
+		call++
+		if current == 0 {
+			close(firstStarted)
+			<-releaseFirst
+		} else {
+			close(secondStarted)
+		}
+		for index := range 2 {
+			if err := session.onRawBlock(
+				blockfetch.CallbackContext{},
+				uint(current*2+index+1),
+				[]byte{byte(current*2 + index + 1)},
+			); err != nil {
+				return err
+			}
+		}
+		return session.onBatchDone(blockfetch.CallbackContext{})
+	})
+
+	tip := tipForHeader(testHeader(20, 200))
+	for index := range 2 {
+		if err := session.onRollForward(
+			chainsync.CallbackContext{},
+			uint(index+1),
+			headers[index],
+			tip,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first range did not start")
+	}
+	for index := 2; index < 4; index++ {
+		if err := session.onRollForward(
+			chainsync.CallbackContext{},
+			uint(index+1),
+			headers[index],
+			tip,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitFor(t, func() bool {
+		return len(session.fetchJobs) == 1
+	})
+
+	close(releaseFirst)
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("prepared range did not start after first BatchDone")
 	}
 	for index, header := range headers {
 		event := nextEvent(t, session)
@@ -294,10 +372,9 @@ func TestProtocolCallbackCountAndOrderFailures(t *testing.T) {
 				headerCount = 1
 			}
 			session := newTestSession(t, 0, 4, headerCount, 1<<20)
-			armSession(t, session, callbacks(session))
-			var err error
+			ctx, _ := armSession(t, session, callbacks(session))
 			for index := range headerCount {
-				err = session.onRollForward(
+				if err := session.onRollForward(
 					chainsync.CallbackContext{},
 					uint(index+1),
 					testHeader(uint64(index+1), uint64(index+1)),
@@ -305,8 +382,16 @@ func TestProtocolCallbackCountAndOrderFailures(t *testing.T) {
 						uint64(headerCount),
 						uint64(headerCount),
 					)),
-				)
+				); err != nil && context.Cause(ctx) == nil {
+					t.Fatal(err)
+				}
 			}
+			select {
+			case <-ctx.Done():
+			case <-time.After(time.Second):
+				t.Fatal("protocol failure did not stop the fetch loop")
+			}
+			err := context.Cause(ctx)
 			if err == nil || FailureOf(err) != FailureProtocol {
 				t.Fatalf("error = %v, failure = %s", err, FailureOf(err))
 			}
@@ -318,20 +403,24 @@ func TestRollbackFlushesPendingForwardsBeforeTarget(t *testing.T) {
 	session := newTestSession(t, 0, 8, 8, 1<<20)
 	first := testHeader(20, 200)
 	second := testHeader(21, 201)
+	resumed := testHeader(22, 202)
+	rangeCall := 0
 	armSession(t, session, func(_, _ pcommon.Point) error {
-		if err := session.onRawBlock(
-			blockfetch.CallbackContext{},
-			1,
-			[]byte{1},
-		); err != nil {
-			return err
+		rangeCall++
+		firstType := 1
+		count := 2
+		if rangeCall == 2 {
+			firstType = 3
+			count = 1
 		}
-		if err := session.onRawBlock(
-			blockfetch.CallbackContext{},
-			2,
-			[]byte{2},
-		); err != nil {
-			return err
+		for index := range count {
+			if err := session.onRawBlock(
+				blockfetch.CallbackContext{},
+				uint(firstType+index),
+				[]byte{byte(firstType + index)},
+			); err != nil {
+				return err
+			}
 		}
 		return session.onBatchDone(blockfetch.CallbackContext{})
 	})
@@ -356,6 +445,14 @@ func TestRollbackFlushesPendingForwardsBeforeTarget(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
+	if err := session.onRollForward(
+		chainsync.CallbackContext{},
+		3,
+		resumed,
+		tipForHeader(resumed),
+	); err != nil {
+		t.Fatal(err)
+	}
 	if event := nextEvent(t, session); event.Point != modelPointForHeader(first) {
 		t.Fatalf("first event = %+v", event)
 	}
@@ -367,54 +464,71 @@ func TestRollbackFlushesPendingForwardsBeforeTarget(t *testing.T) {
 	if event.Kind != Rollback || event.Point != target || event.RawCBOR != nil {
 		t.Fatalf("rollback = %+v, want target %+v", event, target)
 	}
+	if event := nextEvent(t, session); event.Point != modelPointForHeader(resumed) {
+		t.Fatalf("resumed event = %+v", event)
+	}
 }
 
 func TestEventItemBackpressureCancellation(t *testing.T) {
 	session := newTestSessionWithQueue(t, 0, 4, 2, 1, 1<<20)
+	rangeDone := make(chan error, 1)
 	ctx, cancel := armSession(t, session, func(_, _ pcommon.Point) error {
-		if err := session.onRawBlock(
+		err := session.onRawBlock(
 			blockfetch.CallbackContext{},
 			1,
 			[]byte{1},
-		); err != nil {
-			return err
-		}
-		return session.onRawBlock(
-			blockfetch.CallbackContext{},
-			2,
-			[]byte{2},
 		)
+		if err == nil {
+			err = session.onRawBlock(
+				blockfetch.CallbackContext{},
+				2,
+				[]byte{2},
+			)
+		}
+		rangeDone <- err
+		return err
 	})
-	done := make(chan error, 1)
-	go func() {
-		if err := session.onRollForward(
-			chainsync.CallbackContext{},
-			1,
-			testHeader(1, 1),
-			tipForHeader(testHeader(2, 2)),
-		); err != nil {
-			done <- err
-			return
-		}
-		done <- session.onRollForward(
-			chainsync.CallbackContext{},
-			2,
-			testHeader(2, 2),
-			tipForHeader(testHeader(2, 2)),
-		)
-	}()
+	if err := session.onRollForward(
+		chainsync.CallbackContext{},
+		1,
+		testHeader(1, 1),
+		tipForHeader(testHeader(2, 2)),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.onRollForward(
+		chainsync.CallbackContext{},
+		2,
+		testHeader(2, 2),
+		tipForHeader(testHeader(2, 2)),
+	); err != nil {
+		t.Fatal(err)
+	}
 	waitFor(t, func() bool {
 		depth, _ := session.QueueDepth()
 		return depth == 1
 	})
+	for index := 3; index <= 4; index++ {
+		if err := session.onRollForward(
+			chainsync.CallbackContext{},
+			uint(index),
+			testHeader(uint64(index), uint64(index)),
+			tipForHeader(testHeader(4, 4)),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitFor(t, func() bool {
+		return len(session.fetchJobs) == 1
+	})
 	cancel(context.Canceled)
 	select {
-	case err := <-done:
-		if err != nil && !errors.Is(err, context.Canceled) {
-			t.Fatalf("callback error = %v", err)
+	case err := <-rangeDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("active range error = %v, want cancellation", err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("callback remained blocked after cancellation")
+		t.Fatal("active range remained blocked after cancellation")
 	}
 	if context.Cause(ctx) == nil {
 		t.Fatal("test context was not canceled")
@@ -423,53 +537,54 @@ func TestEventItemBackpressureCancellation(t *testing.T) {
 
 func TestRawByteBackpressureAndRelease(t *testing.T) {
 	session := newTestSessionWithQueue(t, 0, 4, 2, 4, 3)
+	rangeDone := make(chan error, 1)
 	armSession(t, session, func(_, _ pcommon.Point) error {
-		if err := session.onRawBlock(
+		err := session.onRawBlock(
 			blockfetch.CallbackContext{},
 			1,
 			[]byte{1, 1, 1},
-		); err != nil {
-			return err
-		}
-		if err := session.onRawBlock(
-			blockfetch.CallbackContext{},
-			2,
-			[]byte{2, 2, 2},
-		); err != nil {
-			return err
-		}
-		return session.onBatchDone(blockfetch.CallbackContext{})
-	})
-	done := make(chan error, 1)
-	go func() {
-		if err := session.onRollForward(
-			chainsync.CallbackContext{},
-			1,
-			testHeader(1, 1),
-			tipForHeader(testHeader(2, 2)),
-		); err != nil {
-			done <- err
-			return
-		}
-		done <- session.onRollForward(
-			chainsync.CallbackContext{},
-			2,
-			testHeader(2, 2),
-			tipForHeader(testHeader(2, 2)),
 		)
-	}()
+		if err == nil {
+			err = session.onRawBlock(
+				blockfetch.CallbackContext{},
+				2,
+				[]byte{2, 2, 2},
+			)
+		}
+		if err == nil {
+			err = session.onBatchDone(blockfetch.CallbackContext{})
+		}
+		rangeDone <- err
+		return err
+	})
+	if err := session.onRollForward(
+		chainsync.CallbackContext{},
+		1,
+		testHeader(1, 1),
+		tipForHeader(testHeader(2, 2)),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.onRollForward(
+		chainsync.CallbackContext{},
+		2,
+		testHeader(2, 2),
+		tipForHeader(testHeader(2, 2)),
+	); err != nil {
+		t.Fatal(err)
+	}
 	waitFor(t, func() bool {
 		used, _ := session.RawQueueDepth()
 		return used == 3
 	})
 	select {
-	case err := <-done:
+	case err := <-rangeDone:
 		t.Fatalf("range completed before raw bytes were released: %v", err)
 	default:
 	}
 	_ = nextEvent(t, session)
 	select {
-	case err := <-done:
+	case err := <-rangeDone:
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -485,19 +600,27 @@ func TestRawByteBackpressureAndRelease(t *testing.T) {
 
 func TestOversizeRawBlockFailsBound(t *testing.T) {
 	session := newTestSessionWithQueue(t, 0, 1, 1, 1, 3)
-	armSession(t, session, func(_, _ pcommon.Point) error {
+	ctx, _ := armSession(t, session, func(_, _ pcommon.Point) error {
 		return session.onRawBlock(
 			blockfetch.CallbackContext{},
 			1,
 			[]byte{1, 2, 3, 4},
 		)
 	})
-	err := session.onRollForward(
+	if err := session.onRollForward(
 		chainsync.CallbackContext{},
 		1,
 		testHeader(1, 1),
 		tipForHeader(testHeader(1, 1)),
-	)
+	); err != nil && context.Cause(ctx) == nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("oversize raw block did not stop the fetch loop")
+	}
+	err := context.Cause(ctx)
 	if FailureOf(err) != FailureBound {
 		t.Fatalf("failure = %s, want bound: %v", FailureOf(err), err)
 	}
@@ -509,15 +632,18 @@ func TestOversizeRawBlockFailsBound(t *testing.T) {
 
 func TestFinishDrainsRawReservations(t *testing.T) {
 	session := newTestSessionWithQueue(t, 0, 1, 1, 2, 100)
+	rangeDone := make(chan error, 1)
 	armSession(t, session, func(_, _ pcommon.Point) error {
-		if err := session.onRawBlock(
+		err := session.onRawBlock(
 			blockfetch.CallbackContext{},
 			1,
 			[]byte{1, 2, 3},
-		); err != nil {
-			return err
+		)
+		if err == nil {
+			err = session.onBatchDone(blockfetch.CallbackContext{})
 		}
-		return session.onBatchDone(blockfetch.CallbackContext{})
+		rangeDone <- err
+		return err
 	})
 	if err := session.onRollForward(
 		chainsync.CallbackContext{},
@@ -525,6 +651,9 @@ func TestFinishDrainsRawReservations(t *testing.T) {
 		testHeader(1, 1),
 		tipForHeader(testHeader(1, 1)),
 	); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-rangeDone; err != nil {
 		t.Fatal(err)
 	}
 	session.finish(io.EOF)
@@ -561,15 +690,15 @@ func TestFailureClassification(t *testing.T) {
 
 func newTestSession(
 	t *testing.T,
-	relayIndex, protocolQueue, headerBatch int,
+	relayIndex, blockFetchQueue, rangeBlocks int,
 	rawBytes int64,
 ) *Session {
 	t.Helper()
 	return newTestSessionWithQueue(
 		t,
 		relayIndex,
-		protocolQueue,
-		headerBatch,
+		blockFetchQueue,
+		rangeBlocks,
 		16,
 		rawBytes,
 	)
@@ -577,22 +706,22 @@ func newTestSession(
 
 func newTestSessionWithQueue(
 	t *testing.T,
-	relayIndex, protocolQueue, headerBatch, relayQueue int,
+	relayIndex, blockFetchQueue, rangeBlocks, relayQueue int,
 	rawBytes int64,
 ) *Session {
 	t.Helper()
 	session, err := New(
 		Config{
-			RelayIndex:        relayIndex,
-			Host:              "relay.example:3001",
-			Operator:          "operator",
-			NetworkMagic:      764824073,
-			ProtocolQueueSize: protocolQueue,
-			HeaderBatchSize:   headerBatch,
-			RelayQueueSize:    relayQueue,
-			RawQueueBytes:     rawBytes,
-			DialTimeout:       time.Second,
-			BlockTimeout:      time.Second,
+			RelayIndex:            relayIndex,
+			Host:                  "relay.example:3001",
+			Operator:              "operator",
+			NetworkMagic:          764824073,
+			BlockFetchRangeBlocks: rangeBlocks,
+			BlockFetchQueueSize:   blockFetchQueue,
+			RelayQueueSize:        relayQueue,
+			RawQueueBytes:         rawBytes,
+			DialTimeout:           time.Second,
+			BlockTimeout:          time.Second,
 		},
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
@@ -613,10 +742,35 @@ func armSession(
 	session.runMu.Lock()
 	session.runCtx = ctx
 	session.cancel = cancel
-	session.rangeClient = client
 	session.runMu.Unlock()
+	workerDone := make(chan error, 2)
+	startWorker := func(run func() error) {
+		go func() {
+			err := run()
+			if err == nil {
+				err = errors.New("test session worker ended without an error")
+			}
+			if context.Cause(ctx) == nil {
+				cancel(err)
+			}
+			workerDone <- err
+		}()
+	}
+	startWorker(func() error {
+		return session.runRangeBuilder(ctx)
+	})
+	startWorker(func() error {
+		return session.runFetchLoop(ctx, client)
+	})
 	t.Cleanup(func() {
 		cancel(context.Canceled)
+		for range 2 {
+			select {
+			case <-workerDone:
+			case <-time.After(time.Second):
+				t.Fatal("test session worker did not stop")
+			}
+		}
 	})
 	return ctx, cancel
 }

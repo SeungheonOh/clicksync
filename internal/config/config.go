@@ -52,25 +52,25 @@ type Sync struct {
 	Relays       []Relay
 	Start        Point
 
-	LockPath          string
-	DialTimeout       time.Duration
-	ProtocolTimeout   time.Duration
-	ShutdownTimeout   time.Duration
-	ReconnectInitial  time.Duration
-	ReconnectMaximum  time.Duration
-	HeaderBatchSize   int
-	ProtocolQueueSize int
-	RelayQueueSize    int
-	AgreedQueueSize   int
-	AgreedQueueBytes  int64
-	NormalizeWorkers  int
-	ReorderSize       int
-	ReorderBytes      int64
-	BatchBlocks       int
-	BatchBytes        int64
-	BatchRows         uint64
-	BatchAge          time.Duration
-	RollbackDepth     uint32
+	LockPath              string
+	DialTimeout           time.Duration
+	ProtocolTimeout       time.Duration
+	ShutdownTimeout       time.Duration
+	ReconnectInitial      time.Duration
+	ReconnectMaximum      time.Duration
+	BlockFetchRangeBlocks int
+	BlockFetchQueueSize   int
+	RelayQueueSize        int
+	AgreedQueueSize       int
+	AgreedQueueBytes      int64
+	NormalizeWorkers      int
+	ReorderSize           int
+	ReorderBytes          int64
+	BatchBlocks           int
+	BatchBytes            int64
+	BatchRows             uint64
+	BatchAge              time.Duration
+	RollbackDepth         uint32
 }
 
 func DatabaseFromEnv() (Database, error) {
@@ -134,30 +134,30 @@ func SyncFromEnv() (Sync, error) {
 		return Sync{}, err
 	}
 	cfg := Sync{
-		Database:          database,
-		NetworkName:       textEnv("CARDANO_NETWORK_NAME", "mainnet"),
-		NetworkMagic:      networkMagic,
-		Relays:            relays,
-		Start:             start,
-		LockPath:          textEnv("CLICKSYNC_LOCK_PATH", "./clicksync-state/writer.lock"),
-		DialTimeout:       durationEnv("CLICKSYNC_DIAL_TIMEOUT", 10*time.Second),
-		ProtocolTimeout:   durationEnv("CLICKSYNC_PROTOCOL_TIMEOUT", 90*time.Second),
-		ShutdownTimeout:   durationEnv("CLICKSYNC_SHUTDOWN_TIMEOUT", 45*time.Second),
-		ReconnectInitial:  durationEnv("CLICKSYNC_RECONNECT_INITIAL", time.Second),
-		ReconnectMaximum:  durationEnv("CLICKSYNC_RECONNECT_MAXIMUM", 30*time.Second),
-		HeaderBatchSize:   intEnvValue("CLICKSYNC_HEADER_BATCH_SIZE", 512),
-		ProtocolQueueSize: intEnvValue("CLICKSYNC_PROTOCOL_QUEUE_SIZE", 512),
-		RelayQueueSize:    intEnvValue("CLICKSYNC_RELAY_QUEUE_SIZE", 256),
-		AgreedQueueSize:   intEnvValue("CLICKSYNC_AGREED_QUEUE_SIZE", 256),
-		AgreedQueueBytes:  int64EnvValue("CLICKSYNC_AGREED_QUEUE_BYTES", 256<<20),
-		NormalizeWorkers:  intEnvValue("CLICKSYNC_NORMALIZE_WORKERS", runtime.GOMAXPROCS(0)),
-		ReorderSize:       intEnvValue("CLICKSYNC_REORDER_SIZE", 256),
-		ReorderBytes:      int64EnvValue("CLICKSYNC_REORDER_BYTES", 256<<20),
-		BatchBlocks:       intEnvValue("CLICKSYNC_BATCH_BLOCKS", 1024),
-		BatchBytes:        int64EnvValue("CLICKSYNC_BATCH_BYTES", 128<<20),
-		BatchRows:         uint64EnvValue("CLICKSYNC_BATCH_ROWS", 2_000_000),
-		BatchAge:          durationEnv("CLICKSYNC_BATCH_AGE", time.Second),
-		RollbackDepth:     rollbackDepth,
+		Database:              database,
+		NetworkName:           textEnv("CARDANO_NETWORK_NAME", "mainnet"),
+		NetworkMagic:          networkMagic,
+		Relays:                relays,
+		Start:                 start,
+		LockPath:              textEnv("CLICKSYNC_LOCK_PATH", "./clicksync-state/writer.lock"),
+		DialTimeout:           durationEnv("CLICKSYNC_DIAL_TIMEOUT", 10*time.Second),
+		ProtocolTimeout:       durationEnv("CLICKSYNC_PROTOCOL_TIMEOUT", 90*time.Second),
+		ShutdownTimeout:       durationEnv("CLICKSYNC_SHUTDOWN_TIMEOUT", 45*time.Second),
+		ReconnectInitial:      durationEnv("CLICKSYNC_RECONNECT_INITIAL", time.Second),
+		ReconnectMaximum:      durationEnv("CLICKSYNC_RECONNECT_MAXIMUM", 30*time.Second),
+		BlockFetchRangeBlocks: intEnvValue("CLICKSYNC_BLOCKFETCH_RANGE_BLOCKS", 512),
+		BlockFetchQueueSize:   intEnvValue("CLICKSYNC_BLOCKFETCH_QUEUE_SIZE", 512),
+		RelayQueueSize:        intEnvValue("CLICKSYNC_RELAY_QUEUE_SIZE", 256),
+		AgreedQueueSize:       intEnvValue("CLICKSYNC_AGREED_QUEUE_SIZE", 256),
+		AgreedQueueBytes:      int64EnvValue("CLICKSYNC_AGREED_QUEUE_BYTES", 256<<20),
+		NormalizeWorkers:      intEnvValue("CLICKSYNC_NORMALIZE_WORKERS", runtime.GOMAXPROCS(0)),
+		ReorderSize:           intEnvValue("CLICKSYNC_REORDER_SIZE", 256),
+		ReorderBytes:          int64EnvValue("CLICKSYNC_REORDER_BYTES", 256<<20),
+		BatchBlocks:           intEnvValue("CLICKSYNC_BATCH_BLOCKS", 1024),
+		BatchBytes:            int64EnvValue("CLICKSYNC_BATCH_BYTES", 128<<20),
+		BatchRows:             uint64EnvValue("CLICKSYNC_BATCH_ROWS", 2_000_000),
+		BatchAge:              durationEnv("CLICKSYNC_BATCH_AGE", time.Second),
+		RollbackDepth:         rollbackDepth,
 	}
 	return cfg, cfg.Validate()
 }
@@ -194,10 +194,10 @@ func (c Sync) Validate() error {
 		return errors.New("CLICKSYNC_SHUTDOWN_TIMEOUT must be positive")
 	case c.ReconnectInitial <= 0 || c.ReconnectMaximum < c.ReconnectInitial:
 		return errors.New("reconnect durations must be positive and ordered")
-	case c.HeaderBatchSize < 1 || c.HeaderBatchSize > 512:
-		return errors.New("CLICKSYNC_HEADER_BATCH_SIZE must be in 1..512")
-	case c.ProtocolQueueSize < c.HeaderBatchSize || c.ProtocolQueueSize > 512:
-		return errors.New("CLICKSYNC_PROTOCOL_QUEUE_SIZE must be between header batch size and 512")
+	case c.BlockFetchRangeBlocks < 1 || c.BlockFetchRangeBlocks > 8192:
+		return errors.New("CLICKSYNC_BLOCKFETCH_RANGE_BLOCKS must be in 1..8192")
+	case c.BlockFetchQueueSize < 1 || c.BlockFetchQueueSize > 512:
+		return errors.New("CLICKSYNC_BLOCKFETCH_QUEUE_SIZE must be in 1..512")
 	case c.RelayQueueSize < 1 || c.RelayQueueSize > 4096:
 		return errors.New("CLICKSYNC_RELAY_QUEUE_SIZE must be in 1..4096")
 	case c.AgreedQueueSize < 1 || c.AgreedQueueSize > 4096:

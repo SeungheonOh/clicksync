@@ -59,12 +59,18 @@ A relay session:
 
 1. negotiates node-to-node with the configured network magic;
 2. finds one of the supplied durable intersection candidates;
-3. starts ChainSync from that exact point;
-4. accumulates up to `header_batch_size` roll-forward headers;
-5. requests the matching BlockFetch range;
-6. uses gOuroboros's raw block callback;
-7. computes a content digest without decoding or validating the block;
-8. emits ordered `Forward` or `Rollback` events to its bounded channel.
+3. starts maximally pipelined ChainSync from that exact point;
+4. puts ordered headers and rollbacks on a bounded session FIFO;
+5. batches headers in one range-builder worker;
+6. requests ranges from one independent, sequential BlockFetch worker;
+7. streams raw blocks directly into the existing bounded output;
+8. computes a content digest without decoding or validating the block;
+9. emits ordered `Forward` or `Rollback` events to its bounded channel.
+
+ChainSync and BlockFetch share the one N2N connection but never wait on each
+other directly. A one-slot fetch FIFO keeps one range prepared while one range
+streams. If downstream processing falls behind, the fixed queues eventually
+apply backpressure to ChainSync and then the socket.
 
 The raw BlockFetch callback is intentional. It avoids decoding every block N
 times and avoids gOuroboros block-body validation. Only relay zero retains a

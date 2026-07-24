@@ -30,17 +30,47 @@ type rangeClient interface {
 	DoneChan() <-chan struct{}
 }
 
+const chainsyncQueueSize = chainsync.MaxPipelineLimit
+
 type expectedHeader struct {
 	point     model.Point
 	tip       model.Point
 	blockType uint
 }
 
+type chainEvent struct {
+	kind       EventKind
+	header     expectedHeader
+	rollback   Event
+	atTip      bool
+	observedAt time.Time
+}
+
 type activeRange struct {
-	headers []expectedHeader
-	next    int
-	done    chan error
-	once    sync.Once
+	headers        []expectedHeader
+	next           int
+	rawBytes       uint64
+	rawBudgetWait  time.Duration
+	eventSendWait  time.Duration
+	requestStarted time.Time
+	firstRaw       time.Time
+	lastRaw        time.Time
+	completed      time.Time
+	headerCollect  time.Duration
+	getRangeWait   time.Duration
+	interRangeIdle time.Duration
+	preparedBefore bool
+	hasPriorRange  bool
+	done           chan error
+	once           sync.Once
+}
+
+type fetchJob struct {
+	kind          EventKind
+	headers       []expectedHeader
+	rollback      Event
+	headerStarted time.Time
+	readyAt       time.Time
 }
 
 func (r *activeRange) finish(err error) {
@@ -61,13 +91,14 @@ type Session struct {
 	runCtx       context.Context
 	cancel       context.CancelCauseFunc
 	conn         *ouroboros.Connection
-	rangeClient  rangeClient
 	intersection model.Point
 	hasIntersect bool
 	cause        error
 
+	chainEvents chan chainEvent
+	fetchJobs   chan fetchJob
+
 	rangeMu sync.Mutex
-	pending []expectedHeader
 	active  *activeRange
 
 	rawMu     sync.Mutex
@@ -80,6 +111,10 @@ type Session struct {
 
 	readyOnce sync.Once
 	doneOnce  sync.Once
+
+	fetchMetrics fetchMetrics
+	fetchTotals  fetchTotals
+	fetchLogAt   time.Time
 }
 
 func validateConfig(config Config, logger *slog.Logger) error {
@@ -95,12 +130,12 @@ func validateConfig(config Config, logger *slog.Logger) error {
 		err = errors.New("relay operator is required")
 	case config.NetworkMagic == 0:
 		err = errors.New("network magic must be non-zero")
-	case config.HeaderBatchSize < 1 || config.HeaderBatchSize > blockfetch.MaxRecvQueueSize:
-		err = fmt.Errorf("header batch size must be in 1..%d", blockfetch.MaxRecvQueueSize)
-	case config.ProtocolQueueSize < config.HeaderBatchSize ||
-		config.ProtocolQueueSize > blockfetch.MaxRecvQueueSize:
+	case config.BlockFetchRangeBlocks < 1 || config.BlockFetchRangeBlocks > 8192:
+		err = errors.New("BlockFetch range must be in 1..8192")
+	case config.BlockFetchQueueSize < 1 ||
+		config.BlockFetchQueueSize > blockfetch.MaxRecvQueueSize:
 		err = fmt.Errorf(
-			"protocol queue size must be between header batch size and %d",
+			"BlockFetch queue size must be in 1..%d",
 			blockfetch.MaxRecvQueueSize,
 		)
 	case config.RelayQueueSize < 1 || config.RelayQueueSize > 4096:
@@ -136,9 +171,15 @@ func (s *Session) Run(ctx context.Context, candidates []model.Point) (retErr err
 	if err != nil {
 		return err
 	}
+	var miniProtocolDone []<-chan struct{}
+	var workers sync.WaitGroup
 	defer func() {
 		cancel(retErr)
 		s.closeConnection()
+		for _, done := range miniProtocolDone {
+			<-done
+		}
+		workers.Wait()
 		s.finish(retErr)
 	}()
 
@@ -175,9 +216,10 @@ func (s *Session) Run(ctx context.Context, candidates []model.Point) (retErr err
 			errors.New("required mini-protocol was not initialized after handshake"),
 		)
 	}
-	s.runMu.Lock()
-	s.rangeClient = blockFetch.Client
-	s.runMu.Unlock()
+	miniProtocolDone = []<-chan struct{}{
+		chainSync.Client.DoneChan(),
+		blockFetch.Client.DoneChan(),
+	}
 	s.captureNegotiatedIdentity(conn)
 
 	closeWatcherDone := make(chan struct{})
@@ -190,6 +232,26 @@ func (s *Session) Run(ctx context.Context, candidates []model.Point) (retErr err
 		cancel(retErr)
 		<-closeWatcherDone
 	}()
+
+	startWorker := func(operation string, run func() error) {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			err := run()
+			if err == nil {
+				err = fmt.Errorf("%s ended without an error", operation)
+			}
+			if context.Cause(runCtx) == nil {
+				cancel(err)
+			}
+		}()
+	}
+	startWorker("ChainSync range builder", func() error {
+		return s.runRangeBuilder(runCtx)
+	})
+	startWorker("BlockFetch loop", func() error {
+		return s.runFetchLoop(runCtx, blockFetch.Client)
+	})
 
 	chosen, err := selectIntersection(chainSync.Client, candidates)
 	if err != nil {
@@ -209,9 +271,12 @@ func (s *Session) Run(ctx context.Context, candidates []model.Point) (retErr err
 	select {
 	case <-runCtx.Done():
 		return wrapFailure("run", s.config.Host, context.Cause(runCtx))
-	case err := <-asyncErrors:
+	case err, ok := <-asyncErrors:
 		if cause := context.Cause(runCtx); cause != nil {
 			return wrapFailure("run", s.config.Host, cause)
+		}
+		if !ok {
+			err = protocol.ErrProtocolShuttingDown
 		}
 		return wrapFailure("peer protocol", s.config.Host, err)
 	case <-chainSync.Client.DoneChan():
@@ -249,6 +314,7 @@ func (s *Session) begin(
 	}
 	s.started = true
 	s.runCtx, s.cancel = context.WithCancelCause(parent)
+	s.fetchMetrics.start(time.Now())
 	return s.runCtx, s.cancel, nil
 }
 
@@ -355,7 +421,7 @@ func (s *Session) protocolConfigs() (
 	blockConfig, err := blockfetch.NewConfig(
 		blockfetch.WithBatchStartTimeout(s.config.BlockTimeout),
 		blockfetch.WithBlockTimeout(s.config.BlockTimeout),
-		blockfetch.WithRecvQueueSize(s.config.ProtocolQueueSize),
+		blockfetch.WithRecvQueueSize(s.config.BlockFetchQueueSize),
 		blockfetch.WithBlockRawFunc(s.onRawBlock),
 		blockfetch.WithBatchDoneFunc(s.onBatchDone),
 	)
@@ -367,10 +433,9 @@ func (s *Session) protocolConfigs() (
 	// validation.
 	blockConfig.SkipBlockValidation = true
 
-	chainQueue := min(s.config.ProtocolQueueSize, chainsync.MaxRecvQueueSize)
 	chainConfig := chainsync.NewConfig(
-		chainsync.WithPipelineLimit(chainQueue),
-		chainsync.WithRecvQueueSize(chainQueue),
+		chainsync.WithPipelineLimit(chainsync.MaxPipelineLimit),
+		chainsync.WithRecvQueueSize(chainsync.MaxRecvQueueSize),
 		chainsync.WithIntersectTimeout(s.config.DialTimeout),
 		chainsync.WithBlockTimeout(s.config.BlockTimeout),
 		chainsync.WithRollForwardFunc(s.onRollForward),
@@ -411,27 +476,17 @@ func (s *Session) onRollForward(
 		))
 	}
 
-	s.rangeMu.Lock()
-	if s.active != nil {
-		s.rangeMu.Unlock()
-		return s.callbackError(protocolFailure(
-			"ChainSync roll-forward",
-			s.config.Host,
-			errors.New("header arrived during an active BlockFetch range"),
-		))
+	event := chainEvent{
+		kind: Forward,
+		header: expectedHeader{
+			point:     point,
+			tip:       tipPoint,
+			blockType: blockType,
+		},
+		atTip:      sameModelProtocolPoint(point, tip.Point),
+		observedAt: time.Now().UTC(),
 	}
-	s.pending = append(s.pending, expectedHeader{
-		point:     point,
-		tip:       tipPoint,
-		blockType: blockType,
-	})
-	flush := len(s.pending) >= s.config.HeaderBatchSize ||
-		sameModelProtocolPoint(point, tip.Point)
-	s.rangeMu.Unlock()
-	if !flush {
-		return nil
-	}
-	if err := s.flushPending(); err != nil {
+	if err := s.enqueueChainEvent(event); err != nil {
 		return s.callbackError(err)
 	}
 	return nil
@@ -442,11 +497,6 @@ func (s *Session) onRollBackward(
 	point pcommon.Point,
 	tip chainsync.Tip,
 ) error {
-	// Pending roll-forwards happened before this rollback and must remain in
-	// the relay's event order even when the header range was not full.
-	if err := s.flushPending(); err != nil {
-		return s.callbackError(err)
-	}
 	target, err := pointFromProtocol(point)
 	if err != nil {
 		return s.callbackError(protocolFailure(
@@ -463,76 +513,256 @@ func (s *Session) onRollBackward(
 			err,
 		))
 	}
-	event := Event{
-		Kind:       Rollback,
-		Point:      target,
-		Tip:        tipPoint,
-		Relay:      s.Identity(),
-		ObservedAt: time.Now().UTC(),
+	observedAt := time.Now().UTC()
+	event := chainEvent{
+		kind:       Rollback,
+		observedAt: observedAt,
+		rollback: Event{
+			Kind:       Rollback,
+			Point:      target,
+			Tip:        tipPoint,
+			Relay:      s.Identity(),
+			ObservedAt: observedAt,
+		},
 	}
-	if err := s.emit(event, false); err != nil {
+	if err := s.enqueueChainEvent(event); err != nil {
 		return s.callbackError(err)
 	}
 	return nil
 }
 
-func (s *Session) flushPending() error {
+// ChainSync callbacks do only the point conversion above and this bounded
+// enqueue. Returning quickly lets gOuroboros replenish its RequestNext
+// pipeline without waiting for BlockFetch or downstream publication.
+func (s *Session) enqueueChainEvent(event chainEvent) error {
+	ctx := s.currentContext()
+	if ctx == nil {
+		return protocolFailure(
+			"enqueue ChainSync event",
+			s.config.Host,
+			errors.New("session context is unavailable"),
+		)
+	}
+	started := time.Now()
+	select {
+	case s.chainEvents <- event:
+		s.fetchMetrics.observeChainEvent(
+			event.kind,
+			time.Since(started),
+			len(s.chainEvents),
+		)
+		return nil
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	}
+}
+
+// runRangeBuilder is the sole owner of the pending header batch. The input
+// FIFO preserves ChainSync order; the output FIFO makes a rollback a strict
+// barrier between all ranges before and after it.
+func (s *Session) runRangeBuilder(ctx context.Context) error {
+	if ctx == nil {
+		return protocolFailure(
+			"run ChainSync range builder",
+			s.config.Host,
+			errors.New("context is required"),
+		)
+	}
+	pending := make(
+		[]expectedHeader,
+		0,
+		s.config.BlockFetchRangeBlocks,
+	)
+	var headerStarted time.Time
+	flush := func() error {
+		if len(pending) == 0 {
+			return nil
+		}
+		readyAt := time.Now()
+		job := fetchJob{
+			kind:          Forward,
+			headers:       pending,
+			headerStarted: headerStarted,
+			readyAt:       readyAt,
+		}
+		pending = make(
+			[]expectedHeader,
+			0,
+			s.config.BlockFetchRangeBlocks,
+		)
+		headerStarted = time.Time{}
+		s.fetchMetrics.observePending(0)
+		return s.enqueueJob(ctx, job)
+	}
+
+	for {
+		var event chainEvent
+		select {
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		case event = <-s.chainEvents:
+		}
+		switch event.kind {
+		case Forward:
+			if len(pending) == 0 {
+				headerStarted = event.observedAt
+			}
+			pending = append(pending, event.header)
+			s.fetchMetrics.observePending(len(pending))
+			if len(pending) >= s.config.BlockFetchRangeBlocks ||
+				event.atTip {
+				if err := flush(); err != nil {
+					return err
+				}
+			}
+		case Rollback:
+			if err := flush(); err != nil {
+				return err
+			}
+			if err := s.enqueueJob(ctx, fetchJob{
+				kind:     Rollback,
+				rollback: event.rollback,
+			}); err != nil {
+				return err
+			}
+		default:
+			return protocolFailure(
+				"run ChainSync range builder",
+				s.config.Host,
+				errors.New("invalid ChainSync event"),
+			)
+		}
+	}
+}
+
+func (s *Session) enqueueJob(ctx context.Context, job fetchJob) error {
+	started := time.Now()
+	select {
+	case s.fetchJobs <- job:
+		s.fetchMetrics.observeJob(time.Since(started), len(s.fetchJobs))
+		return nil
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	}
+}
+
+func (s *Session) runFetchLoop(
+	ctx context.Context,
+	client rangeClient,
+) error {
+	if ctx == nil || client == nil {
+		return protocolFailure(
+			"run BlockFetch loop",
+			s.config.Host,
+			errors.New("context and range client are required"),
+		)
+	}
+	var previousRangeDone time.Time
+	for {
+		if ctx.Err() != nil {
+			return context.Cause(ctx)
+		}
+		var job fetchJob
+		select {
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		case job = <-s.fetchJobs:
+		}
+		switch job.kind {
+		case Rollback:
+			if len(job.headers) != 0 {
+				return protocolFailure(
+					"run BlockFetch loop",
+					s.config.Host,
+					errors.New("rollback job contains headers"),
+				)
+			}
+			if err := s.emit(job.rollback, false); err != nil {
+				return err
+			}
+			previousRangeDone = time.Time{}
+		case Forward:
+			if len(job.headers) == 0 {
+				return protocolFailure(
+					"run BlockFetch loop",
+					s.config.Host,
+					errors.New("fetch job has no headers"),
+				)
+			}
+			completed, err := s.fetchRange(
+				ctx,
+				client,
+				job,
+				previousRangeDone,
+			)
+			if err != nil {
+				return err
+			}
+			previousRangeDone = completed
+		default:
+			return protocolFailure(
+				"run BlockFetch loop",
+				s.config.Host,
+				errors.New("invalid relay job"),
+			)
+		}
+	}
+}
+
+func (s *Session) fetchRange(
+	ctx context.Context,
+	client rangeClient,
+	job fetchJob,
+	previousRangeDone time.Time,
+) (time.Time, error) {
+	requestStarted := time.Now()
+	state := &activeRange{
+		headers:        job.headers,
+		requestStarted: requestStarted,
+		headerCollect:  max(job.readyAt.Sub(job.headerStarted), 0),
+		done:           make(chan error, 1),
+	}
+	if !previousRangeDone.IsZero() {
+		state.hasPriorRange = true
+		state.interRangeIdle = max(
+			requestStarted.Sub(previousRangeDone),
+			0,
+		)
+		state.preparedBefore = !job.readyAt.After(previousRangeDone)
+	}
 	s.rangeMu.Lock()
 	if s.active != nil {
 		s.rangeMu.Unlock()
-		return protocolFailure(
+		return time.Time{}, protocolFailure(
 			"BlockFetch range",
 			s.config.Host,
 			errors.New("range already active"),
 		)
 	}
-	if len(s.pending) == 0 {
-		s.rangeMu.Unlock()
-		return nil
-	}
-	state := &activeRange{
-		headers: append([]expectedHeader(nil), s.pending...),
-		done:    make(chan error, 1),
-	}
-	s.pending = s.pending[:0]
 	s.active = state
 	s.rangeMu.Unlock()
 
-	client := s.currentRangeClient()
-	if client == nil {
-		err := protocolFailure(
-			"BlockFetch range",
-			s.config.Host,
-			errors.New("range client is unavailable"),
-		)
-		s.abortRange(state, err)
-		return err
-	}
 	start := toProtocolPoint(state.headers[0].point)
 	end := toProtocolPoint(state.headers[len(state.headers)-1].point)
+	getRangeStarted := time.Now()
 	if err := client.GetBlockRange(start, end); err != nil {
 		err = wrapFailure("request BlockFetch range", s.config.Host, err)
 		s.abortRange(state, err)
-		return err
+		return time.Time{}, err
 	}
+	state.getRangeWait = time.Since(getRangeStarted)
 
-	ctx := s.currentContext()
-	if ctx == nil {
-		err := protocolFailure(
-			"BlockFetch range",
-			s.config.Host,
-			errors.New("session context is unavailable"),
-		)
-		s.abortRange(state, err)
-		return err
-	}
 	select {
 	case err := <-state.done:
-		return err
+		if err != nil {
+			return time.Time{}, err
+		}
+		s.observeCompletedRange(state)
+		return state.completed, nil
 	case <-ctx.Done():
 		err := context.Cause(ctx)
 		s.abortRange(state, err)
-		return err
+		return time.Time{}, err
 	case <-client.DoneChan():
 		err := wrapFailure(
 			"BlockFetch range disconnected",
@@ -540,7 +770,7 @@ func (s *Session) flushPending() error {
 			protocol.ErrProtocolShuttingDown,
 		)
 		s.abortRange(state, err)
-		return err
+		return time.Time{}, err
 	}
 }
 
@@ -549,6 +779,7 @@ func (s *Session) onRawBlock(
 	blockType uint,
 	raw []byte,
 ) error {
+	observedAt := time.Now().UTC()
 	if len(raw) == 0 {
 		return s.callbackError(protocolFailure(
 			"BlockFetch raw block",
@@ -593,6 +824,11 @@ func (s *Session) onRawBlock(
 		return s.callbackError(err)
 	}
 	state.next++
+	if state.firstRaw.IsZero() {
+		state.firstRaw = observedAt
+	}
+	state.lastRaw = observedAt
+	state.rawBytes += uint64(len(raw))
 	s.rangeMu.Unlock()
 
 	event := Event{
@@ -603,7 +839,7 @@ func (s *Session) onRawBlock(
 		RawLength:  uint64(len(raw)),
 		Digest:     RawBlockDigest(blockType, raw),
 		Relay:      s.Identity(),
-		ObservedAt: time.Now().UTC(),
+		ObservedAt: observedAt,
 	}
 	rawReserved := false
 	if s.config.RelayIndex == 0 {
@@ -617,17 +853,21 @@ func (s *Session) onRawBlock(
 			s.abortRange(state, err)
 			return s.callbackError(err)
 		}
+		reserveStarted := time.Now()
 		if err := s.reserveRaw(ctx, int64(len(raw))); err != nil {
 			s.abortRange(state, err)
 			return s.callbackError(err)
 		}
+		state.rawBudgetWait += time.Since(reserveStarted)
 		rawReserved = true
 		event.RawCBOR = bytes.Clone(raw)
 	}
+	emitStarted := time.Now()
 	if err := s.emit(event, rawReserved); err != nil {
 		s.abortRange(state, err)
 		return s.callbackError(err)
 	}
+	state.eventSendWait += time.Since(emitStarted)
 	return nil
 }
 
@@ -655,6 +895,7 @@ func (s *Session) onBatchDone(_ blockfetch.CallbackContext) error {
 			),
 		)
 	}
+	state.completed = time.Now()
 	s.rangeMu.Unlock()
 	state.finish(err)
 	if err != nil {
@@ -690,6 +931,7 @@ func (s *Session) emit(event Event, rawReserved bool) error {
 	}
 	select {
 	case s.events <- event:
+		s.fetchMetrics.observeEventDepth(len(s.events))
 		return nil
 	case <-ctx.Done():
 		s.releaseRaw(event)
@@ -717,7 +959,9 @@ func (s *Session) reserveRaw(ctx context.Context, size int64) error {
 		s.rawMu.Lock()
 		if s.rawQueued <= s.config.RawQueueBytes-size {
 			s.rawQueued += size
+			queued := s.rawQueued
 			s.rawMu.Unlock()
+			s.fetchMetrics.observeRawDepth(queued)
 			return nil
 		}
 		s.rawMu.Unlock()
@@ -761,12 +1005,6 @@ func (s *Session) currentContext() context.Context {
 	s.runMu.Lock()
 	defer s.runMu.Unlock()
 	return s.runCtx
-}
-
-func (s *Session) currentRangeClient() rangeClient {
-	s.runMu.Lock()
-	defer s.runMu.Unlock()
-	return s.rangeClient
 }
 
 func selectIntersection(

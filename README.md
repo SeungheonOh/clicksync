@@ -113,8 +113,8 @@ on-chain blocks; it does not fabricate a synthetic initial UTxO distribution.
 | Variable | Default |
 |---|---:|
 | `CLICKHOUSE_OPEN_CONNS` | `16` |
-| `CLICKSYNC_HEADER_BATCH_SIZE` | `512` |
-| `CLICKSYNC_PROTOCOL_QUEUE_SIZE` | `512` |
+| `CLICKSYNC_BLOCKFETCH_RANGE_BLOCKS` | `512` |
+| `CLICKSYNC_BLOCKFETCH_QUEUE_SIZE` | `512` |
 | `CLICKSYNC_RELAY_QUEUE_SIZE` | `256` |
 | `CLICKSYNC_AGREED_QUEUE_SIZE` | `256` |
 | `CLICKSYNC_AGREED_QUEUE_BYTES` | `256 MiB` |
@@ -132,6 +132,10 @@ All raw-data boundaries have item and byte bounds. ClickHouse uses native LZ4
 with synchronous acknowledged inserts. Independent populated fact tables are
 sent concurrently, followed by one adoption insert; ordinary roll-forward
 performs no ClickHouse reads.
+
+ChainSync always uses gOuroboros's maximum safe RequestNext pipeline. The
+configurable BlockFetch range is independent of the 512-message BlockFetch
+receive queue.
 
 ## Shutdown and progress
 

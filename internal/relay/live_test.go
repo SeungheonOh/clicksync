@@ -34,16 +34,16 @@ func TestLiveHandshakeAndRange(t *testing.T) {
 	}
 	session, err := New(
 		Config{
-			RelayIndex:        0,
-			Host:              host,
-			Operator:          "live-test",
-			NetworkMagic:      config.MainnetMagic,
-			ProtocolQueueSize: 16,
-			HeaderBatchSize:   1,
-			RelayQueueSize:    2,
-			RawQueueBytes:     16 << 20,
-			DialTimeout:       10 * time.Second,
-			BlockTimeout:      30 * time.Second,
+			RelayIndex:            0,
+			Host:                  host,
+			Operator:              "live-test",
+			NetworkMagic:          config.MainnetMagic,
+			BlockFetchRangeBlocks: 1,
+			BlockFetchQueueSize:   16,
+			RelayQueueSize:        2,
+			RawQueueBytes:         16 << 20,
+			DialTimeout:           10 * time.Second,
+			BlockTimeout:          30 * time.Second,
 		},
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)

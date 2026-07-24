@@ -13,10 +13,11 @@ Ouroboros mini-protocol multiplexing.
 The implementation order is:
 
 1. decouple BlockFetch range length from gOuroboros receive-queue length;
-2. measure larger ranges on the same actual historical block span;
-3. move BlockFetch out of the ChainSync callback;
-4. prepare one bounded range of headers while the current range body streams;
-5. issue sequential BlockFetch ranges back-to-back on the same connection.
+2. run ChainSync at its maximum supported RequestNext pipeline;
+3. make ChainSync callbacks enqueue-only;
+4. batch the ordered header stream in a dedicated range builder;
+5. issue sequential BlockFetch ranges from an independent worker;
+6. measure range sizes on the same actual historical block span.
 
 There will be no worker pool, connection striping, duplicate connection per
 operator, or configuration for multiple BlockFetch connections.
@@ -113,6 +114,24 @@ After the scheduling bubble is removed, a relay, route, or single TCP flow may
 become the next ceiling. Clicksync will measure and report that ceiling; it
 will not open more connections to bypass it.
 
+### 2.5 gOuroboros ChainSync pipeline ceiling
+
+Clicksync configures gOuroboros v0.189.1 with its advertised maximum
+`PipelineLimit` of 100. Its generic sender currently drains at most 20 messages
+per wire cohort and waits for that cohort's state transitions before draining
+the next 20. The effective outstanding `MsgRequestNext` window is therefore 20,
+not 100.
+
+At approximately 200 ms relay round-trip time, that implementation ceiling
+predicts roughly 100 headers/second. Calling `SendMessage` from a second
+Clicksync goroutine cannot bypass the sender gate and would corrupt the
+client's private outstanding-request accounting. Clicksync will use
+`ChainSync.Client.Sync` exactly once and keep its callbacks enqueue-only.
+
+A true sliding 100-request window requires a gOuroboros change. That belongs in
+an upstream release or a separately reviewed pinned fork, not a copied
+ChainSync state machine or patched module cache inside Clicksync.
+
 ## 3. Correcting the 512 assumption
 
 `blockfetch.MaxRecvQueueSize == 512` is a gOuroboros receive-message queue
@@ -133,9 +152,13 @@ BlockFetch range:        number of consecutive headers covered by one request
 The implementation will separate them:
 
 ```text
-CLICKSYNC_PROTOCOL_QUEUE_SIZE        default 512, hard maximum 512
 CLICKSYNC_BLOCKFETCH_RANGE_BLOCKS    initial default selected by live A/B
+CLICKSYNC_BLOCKFETCH_QUEUE_SIZE      default 512, hard maximum 512
 ```
+
+ChainSync is not exposed as a tuning knob. Clicksync always uses
+`chainsync.MaxPipelineLimit` and `chainsync.MaxRecvQueueSize`; lowering either
+would reintroduce avoidable latency.
 
 The first live comparison will use 512, 1,024, 2,048, 4,096, and 8,192 blocks.
 The initial application hard cap will be 8,192. This is a memory and rollback
@@ -167,14 +190,23 @@ The refactor must preserve all of these:
 one N2N TCP connection per relay
   |
   +-- ChainSync mini-protocol
+  |     - gOuroboros RequestNext pipeline at maximum depth
   |     |
   |     +-- ordered callbacks
-  |           - append contiguous headers
-  |           - flush at range size or tip
-  |           - enqueue rollback after pending headers
+  |           - convert point
+  |           - enqueue header or rollback
   |                         |
   |                         v
-  |                 one ordered job slot
+  |                 bounded event FIFO
+  |                         |
+  |                         v
+  |                 one range builder
+  |                   - batch headers
+  |                   - flush at range size or tip
+  |                   - preserve rollback barriers
+  |                         |
+  |                         v
+  |                 one prepared fetch slot
   |                         |
   +-- BlockFetch mini-protocol
         |
@@ -195,40 +227,41 @@ one N2N TCP connection per relay
 client on the existing connection. It does not mean an additional connection
 or concurrent range request.
 
-### 5.1 ChainSync callback
+### 5.1 Pipelined ChainSync ingress
 
-gOuroboros invokes one ChainSync client's message callbacks in protocol order.
-Those callbacks therefore remain the single owner of the pending header slice.
-No header-coordinator goroutine or intermediate token queue is needed.
-
-The job type is:
-
-```go
-type sessionJob struct {
-    kind     jobKind // fetch or rollback
-    headers  []expectedHeader
-    rollback model.Point
-    tip      model.Point
-}
-```
+`chainsync.Client.Sync` owns the ChainSync request loop. With
+`chainsync.MaxPipelineLimit`, it sends multiple `MsgRequestNext` messages
+without waiting for each individual response. Clicksync must use that client
+loop rather than duplicating the ChainSync state machine.
 
 For a roll forward the callback:
 
 - derives the point and block type;
-- appends one expected header;
-- detaches the pending slice into an immutable fetch job when the configured
-  range is full or the header reaches the advertised tip;
-- sends that job to the one-slot FIFO; and
-- returns without calling or waiting for BlockFetch.
+- sends one compact header event to a bounded FIFO; and
+- returns without batching, calling BlockFetch, or waiting for publication.
 
-For a rollback the callback first enqueues any pending partial fetch job, then
-enqueues the rollback job. FIFO insertion is cancellation-aware. Blocking on a
-full slot is intentional bounded backpressure.
+Rollback callbacks enqueue to the same FIFO. The FIFO is sized to one complete
+ChainSync request pipeline, so callbacks normally return immediately. If all
+downstream stages fall behind, its cancellation-aware send deliberately
+propagates TCP backpressure.
 
-The callback never shares a mutable header slice with the fetch loop. It
-detaches the completed slice and starts a fresh one before returning.
+### 5.2 Range builder
 
-### 5.2 Sequential BlockFetch loop
+A single range-builder goroutine consumes the ChainSync FIFO. It is the sole
+owner of the mutable pending header slice. It:
+
+1. appends forward headers in callback order;
+2. detaches an immutable range when the configured size is reached or the
+   advertised tip arrives;
+3. flushes a partial range before a rollback;
+4. enqueues the rollback after that partial range; and
+5. continues batching post-rollback headers only after the barrier.
+
+The range builder and fetch worker communicate through one prepared-job slot.
+One slot is sufficient to keep sequential BlockFetch busy and prevents
+unbounded header prefetch.
+
+### 5.3 Sequential BlockFetch loop
 
 One new goroutine consumes the ordered job FIFO and is the sole caller of
 `GetBlockRange`.
@@ -254,7 +287,7 @@ Calling `GetBlockRange` concurrently or from `BatchDoneFunc` is forbidden.
 gOuroboros serializes the BlockFetch client with a busy lock, and the protocol
 allows a new request only after returning to `Idle`.
 
-### 5.3 Buffer bounds
+### 5.4 Buffer bounds
 
 Only headers are prefetched; raw bodies continue to stream through the existing
 byte budget.
@@ -263,15 +296,15 @@ Initial bounds:
 
 | Buffer | Bound |
 |---|---:|
-| Pending callback headers | one configured range |
-| Ordered jobs | one range/rollback job |
-| Active BlockFetch jobs | one range |
+| ChainSync callback events | 100 headers/rollbacks |
+| Pending range-builder headers | one configured range |
+| Prepared fetch jobs | one range/rollback |
+| Active BlockFetch range | one |
 | Relay output | existing 256 events |
 | Retained raw bytes | existing shared 256 MiB |
 
-At most roughly three ranges of small header metadata can exist between the
-ChainSync callback and active fetch. There is never an unbounded historical
-header list and never a full-range raw-body cache.
+There is never an unbounded historical header list or a full-range raw-body
+cache.
 
 ## 6. Ordering and rollback behavior
 
@@ -337,7 +370,7 @@ the bubble is gone, without adding a metrics framework.
 Per relay, the periodic structured progress log will expose:
 
 - headers received;
-- pending-header count and job-slot current/high-water;
+- ChainSync FIFO, pending-header, and fetch-slot current/high-water;
 - BlockFetch ranges and body blocks/bytes;
 - average range size;
 - average body-stream duration;
@@ -420,8 +453,9 @@ Selection rule:
 
 Requirements:
 
-- ChainSync callbacks create and enqueue ordered immutable range and rollback
-  jobs; they never invoke or wait for BlockFetch.
+- Configure gOuroboros ChainSync at its maximum supported RequestNext pipeline.
+- ChainSync callbacks enqueue ordered header and rollback events only.
+- One range builder owns batching and rollback barriers.
 - One fetch loop owns the one BlockFetch client.
 - One prepared range is allowed while one range streams.
 - Existing raw-byte ownership and relay event interfaces remain unchanged.
