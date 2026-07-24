@@ -16,7 +16,7 @@ agrees on invalid data, Clicksync records it.
 ## Architecture
 
 ```text
-N gOuroboros relay sessions
+N single-connection relay sessions
         ↓
 strict all-of-N point/type/raw-hash agreement
         ↓
@@ -133,9 +133,16 @@ with synchronous acknowledged inserts. Independent populated fact tables are
 sent concurrently, followed by one adoption insert; ordinary roll-forward
 performs no ClickHouse reads.
 
-ChainSync always uses gOuroboros's maximum safe RequestNext pipeline. The
-configurable BlockFetch range is independent of the 512-message BlockFetch
-receive queue.
+ChainSync uses the small internal driver in
+`internal/relay/chainsync_client.go`. It is built on gOuroboros's public mux,
+protocol, decoder, and message types; it does not fork gOuroboros. The
+outstanding `RequestNext` window is fixed at its hard maximum of 100. Initial
+and refill writes contain up to 20 requests; every 20 completed
+callbacks moves the window from 100 to 80 and refills it to 100.
+
+ChainSync ingress and the sequential BlockFetch worker run independently on
+the same N2N connection. The configurable BlockFetch range remains independent
+of the 512-message BlockFetch receive queue.
 
 ## Shutdown and progress
 
@@ -147,23 +154,29 @@ that ignores cancellation, this result is process-terminal: the CLI retains
 the database handle and lock until `os.Exit` instead of releasing the writer
 fence underneath possible in-flight work.
 
-Periodic JSON progress stays intentionally compact. It reports lifetime
-attempts, reconnects, agreed blocks/bytes, published blocks/batches,
-published rows, rollbacks, agreement calls/mismatches, and normalized blocks.
-It also reports lifetime-average agreement/publication rates, average
-agreement wait, normalization and publication duration, plus current and
-high-water agreed-queue items/bytes. Focused benchmarks and profiles provide
-deeper detail; the runtime does not carry a per-relay throughput or
-reorder/worker-utilization metrics framework.
+Periodic JSON progress reports lifetime attempts, reconnects, agreed and
+published work, agreement/normalization/publication timing, and agreed-queue
+occupancy. Each relay also emits a compact fetch record with header and body
+rates, range timing and duty, prepared-range overlap, and current/high-water
+queue use. These counters are owned by the relay session rather than a general
+metrics framework.
 
 ## Measured throughput
 
-A fresh live mainnet dataset committed 100,000 consecutive Conway blocks from
+Before the single-connection scheduling change, a fresh live mainnet dataset
+committed 100,000 consecutive Conway blocks from
 the IOG and Cardano Foundation relays, both negotiated at N2N v15. The exact
 range was block 10,781,331 through 10,881,330 and produced 12,552,027 fact
 rows with no duplicate identifiers, gaps, disagreement, or bad two-relay
 provenance. An uninterrupted 81,408-block portion committed at 104.69
 blocks/second; the agreed queue drained to zero between bursts.
+
+With the internal sliding ChainSync window and independent BlockFetch worker,
+an actual two-relay run writing to ClickHouse sustained about 545-585 agreed
+and published blocks/second, with no reconnects or mismatches in the measured
+run. A packet capture showed one 20-request refill write about every 29-31 ms.
+Public-relay conditions vary, so this is an observed range rather than a fixed
+service rate.
 
 The isolated ClickHouse writer published 100,352 generated-fact blocks at
 87,402 blocks/second and 786,614 fact rows/second. Public-relay intake—not
@@ -171,7 +184,7 @@ insertion—was the live bottleneck. See
 [Measured performance](docs/performance-results.md).
 
 The intake trace also identified a serialized ChainSync/BlockFetch range
-bubble. The approved follow-up keeps one N2N connection per relay, supports
+bubble. The implemented change keeps one N2N connection per relay, supports
 protocol-valid ranges larger than 512, and prefetches the next header range
 while the current body range streams. See the
 [single-connection BlockFetch throughput plan](docs/single-connection-blockfetch-plan.md).

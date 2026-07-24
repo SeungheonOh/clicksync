@@ -80,7 +80,7 @@ func New(config Config, logger *slog.Logger) (*Session, error) {
 		config:      config,
 		logger:      logger,
 		identity:    identity,
-		chainEvents: make(chan chainEvent, chainsyncQueueSize),
+		chainEvents: make(chan chainEvent, chainSyncMaxOutstanding),
 		fetchJobs:   make(chan fetchJob, 1),
 		events:      make(chan Event, config.RelayQueueSize),
 		ready:       make(chan struct{}),

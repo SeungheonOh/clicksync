@@ -7,8 +7,9 @@ They are evidence for the insertion-path goal, not a claim about public-relay
 speed.
 
 Completed coverage includes both a 100,352-block generated-fact publication
-run and a fresh 100,000-consecutive-block strict two-relay real-CBOR replay.
-The former isolates writer capacity; the latter measures variable public-relay
+run, a fresh 100,000-consecutive-block strict two-relay real-CBOR replay, and
+an optimized two-relay run using the sliding ChainSync request window. The
+first isolates writer capacity; the relay runs measure variable public-relay
 end-to-end behavior.
 
 ## Environment
@@ -72,6 +73,41 @@ active ClickHouse parts. The service remained running after the measurement.
 Because public relay throughput varies, 104.69 blocks/second is an observed
 deployment result rather than a deterministic benchmark.
 
+## Sliding-window ChainSync live run
+
+The optimized session retained one N2N connection per relay and a 512-block
+BlockFetch range. Its internal ChainSync driver kept at most 100
+`RequestNext` messages outstanding and refilled 20 requests after every 20
+completed callbacks. ChainSync ingress, range construction, BlockFetch, and
+publication remained independent bounded stages.
+
+After warm-up, actual two-relay intervals writing to ClickHouse reported:
+
+| Measure | Observed result |
+|---|---:|
+| Header delivery per relay | about 540-576 blocks/s |
+| Body delivery per relay | about 540-569 blocks/s |
+| Agreed and published throughput | about 545-585 blocks/s |
+| Raw ingress per relay | about 64 Mbit/s |
+| Reconnects / agreement mismatches | 0 / 0 |
+
+A six-second packet capture confirmed that each ChainSync refill mux segment
+contained exactly 20 `RequestNext` messages. The two relay connections emitted
+those refill writes about every 29-31 ms on average. They were distributed
+throughout the response stream rather than delayed until all 100 responses
+had arrived.
+
+During the continued integrity run, one snapshot contained 436,358 block rows
+and 436,358 unique block hashes across the inclusive block-number span
+10,781,331 through 11,217,688, with no malformed two-operator provenance.
+The service remained on its first attempt with no reported rollback.
+
+This was an actual-network observation, not a controlled same-span A/B:
+public-relay routing and block density changed between the baseline and
+optimized runs. It nevertheless verifies that ClickHouse publication stayed
+with relay intake and that the previous roughly 100-block/s scheduling ceiling
+was removed.
+
 ## Crash and query contract
 
 The tagged integration test passed against the disposable ClickHouse:
@@ -127,8 +163,8 @@ block CBOR range, so it measures publication only. ClickHouse physical-row
 counts confirmed the warm-up and timed publications were materialized.
 
 The result exceeds the 1,000 blocks/s publication gate by roughly 87x and the
-measured strict-relay intake by more than 800x. On this host, table insertion
-is not the live bottleneck.
+optimized strict-relay intake by roughly 150x. On this host, table insertion is
+not the live bottleneck.
 
 ## Normalization
 
@@ -159,9 +195,9 @@ optimization target if real relay intake exceeds worker capacity.
 
 - The live range arrived from public relays; it is not a fixed local CBOR
   corpus suitable for deterministic A/B performance comparisons.
-- Per-relay byte rates were not added to the runtime metrics. Docker network
-  totals and aggregate agreed bytes show the broad network bound without
-  creating a larger telemetry subsystem.
+- Per-relay header/body rates, byte rates, range timings, and bounded-queue
+  occupancy are session-local runtime counters; TCP RTT/cwnd/retransmission
+  data still requires focused packet or host instrumentation.
 - The background service had not yet reached the current mainnet tip at the
   measurement cutoff.
 

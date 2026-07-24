@@ -55,13 +55,15 @@ func TestLiveHandshakeAndRange(t *testing.T) {
 	go func() {
 		runDone <- session.Run(ctx, []model.Point{candidate})
 	}()
-	event, err := session.Next(ctx)
-	if err != nil {
-		cancel()
-		t.Fatalf("read live relay event: %v", err)
+	var event Event
+	for event.Kind != Forward {
+		event, err = session.Next(ctx)
+		if err != nil {
+			cancel()
+			t.Fatalf("read live relay event: %v", err)
+		}
 	}
-	if event.Kind != Forward ||
-		len(event.RawCBOR) == 0 ||
+	if len(event.RawCBOR) == 0 ||
 		event.RawLength != uint64(len(event.RawCBOR)) ||
 		event.Digest != RawBlockDigest(event.BlockType, event.RawCBOR) {
 		cancel()

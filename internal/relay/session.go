@@ -30,8 +30,6 @@ type rangeClient interface {
 	DoneChan() <-chan struct{}
 }
 
-const chainsyncQueueSize = chainsync.MaxPipelineLimit
-
 type expectedHeader struct {
 	point     model.Point
 	tip       model.Point
@@ -188,14 +186,16 @@ func (s *Session) Run(ctx context.Context, candidates []model.Point) (retErr err
 		return wrapFailure("configure protocols", s.config.Host, err)
 	}
 	asyncErrors := make(chan error, 16)
+	chainSyncErrors := make(chan error, 1)
 	conn, err := ouroboros.NewConnection(
 		ouroboros.WithNetworkMagic(s.config.NetworkMagic),
 		ouroboros.WithNodeToNode(true),
 		ouroboros.WithKeepAlive(true),
+		ouroboros.WithDelayMuxerStart(true),
+		ouroboros.WithDelayProtocolStart(true),
 		ouroboros.WithErrorChan(asyncErrors),
 		ouroboros.WithLogger(s.logger),
 		ouroboros.WithBlockFetchConfig(blockConfig),
-		ouroboros.WithChainSyncConfig(chainConfig),
 	)
 	if err != nil {
 		return wrapFailure("create connection", s.config.Host, err)
@@ -207,19 +207,40 @@ func (s *Session) Run(ctx context.Context, candidates []model.Point) (retErr err
 		return wrapFailure("connect", s.config.Host, err)
 	}
 	blockFetch := conn.BlockFetch()
-	chainSync := conn.ChainSync()
-	if blockFetch == nil || blockFetch.Client == nil ||
-		chainSync == nil || chainSync.Client == nil {
+	if blockFetch == nil || blockFetch.Client == nil || conn.Muxer() == nil {
 		return protocolFailure(
 			"initialize protocols",
 			s.config.Host,
 			errors.New("required mini-protocol was not initialized after handshake"),
 		)
 	}
+	chainSync, err := newChainSyncClient(protocol.ProtocolOptions{
+		ConnectionId: conn.Id(),
+		Muxer:        conn.Muxer(),
+		Logger:       s.logger,
+		ErrorChan:    chainSyncErrors,
+		Mode:         protocol.ProtocolModeNodeToNode,
+		Role:         protocol.ProtocolRoleClient,
+	}, chainConfig)
+	if err != nil {
+		return wrapFailure("initialize ChainSync", s.config.Host, err)
+	}
+	chainSync.Start()
+	defer chainSync.Stop()
+	blockFetch.Client.Start()
 	miniProtocolDone = []<-chan struct{}{
-		chainSync.Client.DoneChan(),
+		chainSync.DoneChan(),
 		blockFetch.Client.DoneChan(),
 	}
+	if keepAlive := conn.KeepAlive(); keepAlive != nil &&
+		keepAlive.Client != nil {
+		keepAlive.Client.Start()
+		miniProtocolDone = append(
+			miniProtocolDone,
+			keepAlive.Client.DoneChan(),
+		)
+	}
+	conn.Muxer().Start()
 	s.captureNegotiatedIdentity(conn)
 
 	closeWatcherDone := make(chan struct{})
@@ -253,7 +274,7 @@ func (s *Session) Run(ctx context.Context, candidates []model.Point) (retErr err
 		return s.runFetchLoop(runCtx, blockFetch.Client)
 	})
 
-	chosen, err := selectIntersection(chainSync.Client, candidates)
+	chosen, err := selectIntersection(chainSync, candidates)
 	if err != nil {
 		return wrapFailure("intersect", s.config.Host, err)
 	}
@@ -261,7 +282,7 @@ func (s *Session) Run(ctx context.Context, candidates []model.Point) (retErr err
 	s.intersection = chosen
 	s.hasIntersect = true
 	s.runMu.Unlock()
-	if err := chainSync.Client.Sync(
+	if err := chainSync.Sync(
 		[]pcommon.Point{toProtocolPoint(chosen)},
 	); err != nil {
 		return wrapFailure("start ChainSync", s.config.Host, err)
@@ -279,7 +300,9 @@ func (s *Session) Run(ctx context.Context, candidates []model.Point) (retErr err
 			err = protocol.ErrProtocolShuttingDown
 		}
 		return wrapFailure("peer protocol", s.config.Host, err)
-	case <-chainSync.Client.DoneChan():
+	case err := <-chainSyncErrors:
+		return wrapFailure("ChainSync protocol", s.config.Host, err)
+	case <-chainSync.DoneChan():
 		if cause := context.Cause(runCtx); cause != nil {
 			return wrapFailure("run", s.config.Host, cause)
 		}
@@ -434,7 +457,7 @@ func (s *Session) protocolConfigs() (
 	blockConfig.SkipBlockValidation = true
 
 	chainConfig := chainsync.NewConfig(
-		chainsync.WithPipelineLimit(chainsync.MaxPipelineLimit),
+		chainsync.WithPipelineLimit(chainSyncMaxOutstanding),
 		chainsync.WithRecvQueueSize(chainsync.MaxRecvQueueSize),
 		chainsync.WithIntersectTimeout(s.config.DialTimeout),
 		chainsync.WithBlockTimeout(s.config.BlockTimeout),

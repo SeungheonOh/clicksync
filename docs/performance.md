@@ -15,6 +15,20 @@ multi-relay intake rate on the same host.
 Blocks/second alone is not sufficient because era and transaction density
 vary. Every result also reports raw MiB/second and fact rows/second.
 
+The current relay path keeps one N2N connection per relay. Its internal
+ChainSync driver uses gOuroboros's public mux, protocol, decoder, and message
+types without a dependency fork. It permits at most 100 outstanding
+`RequestNext` messages, writes initial and refill groups of at most 20, and at
+the fixed maximum refills from 80 to 100 after each 20 completed callbacks.
+ChainSync ingress and the sequential BlockFetch worker run independently.
+
+In an actual two-relay run writing to ClickHouse, this path sustained about
+545-585 agreed and published blocks/second, compared with the earlier roughly
+100 blocks/second. The measured run had no reconnects or mismatches, and a
+packet capture showed one 20-request refill write about every 29-31 ms. Public
+relay and block-span variability make this an observed range, not a fixed
+throughput guarantee.
+
 ## 2. Performance invariants
 
 Ordinary roll-forward must have:
@@ -37,9 +51,10 @@ exception paths.
 
 The always-on runtime metrics stay deliberately small: lifetime agreement and
 publication rates/counters, average agreement/normalization/publication
-duration, and current/high-water agreed-queue occupancy. This is enough to
-show whether intake or downstream commit is falling behind without adding a
-per-relay or worker-utilization subsystem.
+duration, and current/high-water agreed-queue occupancy. Relay sessions also
+report header/body rates, range timing and duty, prepared-range overlap, and
+current/high-water bounded queues. These are focused session counters, not a
+general worker-utilization subsystem.
 
 For a focused benchmark or bottleneck investigation, measure these phases
 independently with benchmark hooks, Go profiles, and ClickHouse diagnostics:
@@ -95,9 +110,9 @@ publication-only benchmark and the variable public-relay replay.
 ### Live relay run
 
 Run at least two independently operated public relays with strict all-of-N
-agreement. Report aggregate agreed bytes, agreement wait, and the exact relay
-identities; collect separate per-relay rates only in focused instrumentation.
-Do not use the public run alone to judge insertion capacity.
+agreement. Report aggregate agreed bytes, agreement wait, exact relay
+identities, and the session-local per-relay fetch rates. Do not use the public
+run alone to judge insertion capacity.
 
 ## 5. Acceptance gates
 
@@ -145,20 +160,22 @@ each change.
 ## 7. Initial settings to validate
 
 ```text
-BlockFetch range:          512 blocks
-per-relay event queue:     256
-agreed/reorder window:     256 blocks / 256 MiB
-normalizer workers:        GOMAXPROCS
-publication max blocks:    1,024
-publication max raw bytes: 128 MiB
-publication max fact rows: 2,000,000
-publication max age:       1 second
-ClickHouse open conns:     16
+ChainSync outstanding:        100 requests
+BlockFetch range:             512 blocks
+BlockFetch receive queue:     512 messages
+per-relay event queue:        256
+agreed/reorder window:        256 blocks / 256 MiB
+normalizer workers:           GOMAXPROCS
+publication max blocks:       1,024
+publication max raw bytes:    128 MiB
+publication max fact rows:    2,000,000
+publication max age:          1 second
+ClickHouse open conns:        16
 ```
 
-These are starting hypotheses, not permanent magic numbers. Hard safety caps
-belong in configuration validation; defaults may change only with benchmark
-evidence.
+These are starting hypotheses, not permanent magic numbers. Configurable
+defaults may change only with benchmark evidence. The ChainSync maximum is
+fixed by the protocol.
 
 ## 8. Expected improvement sources
 

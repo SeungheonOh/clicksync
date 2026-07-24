@@ -1,28 +1,28 @@
 # Single-connection BlockFetch throughput plan
 
-Status: architecture approved for implementation
+Status: implemented and measured with actual relays
 
 Scope: one N2N connection per configured relay; no multi-connection mode
 
 ## 1. Decision
 
-Clicksync will keep exactly one node-to-node TCP connection to each configured
-relay. That connection will carry ChainSync and BlockFetch concurrently through
+Clicksync keeps exactly one node-to-node TCP connection to each configured
+relay. That connection carries ChainSync and BlockFetch concurrently through
 Ouroboros mini-protocol multiplexing.
 
-The implementation order is:
+The implemented shape is:
 
 1. decouple BlockFetch range length from gOuroboros receive-queue length;
-2. run ChainSync at its maximum supported RequestNext pipeline;
+2. maintain a bounded sliding ChainSync `RequestNext` window;
 3. make ChainSync callbacks enqueue-only;
 4. batch the ordered header stream in a dedicated range builder;
 5. issue sequential BlockFetch ranges from an independent worker;
 6. measure range sizes on the same actual historical block span.
 
-There will be no worker pool, connection striping, duplicate connection per
+There is no worker pool, connection striping, duplicate connection per
 operator, or configuration for multiple BlockFetch connections.
 
-## 2. Why the current process stops near 100 blocks/second
+## 2. Baseline: why the previous process stopped near 100 blocks/second
 
 ### 2.1 Publication is already independent
 
@@ -30,7 +30,7 @@ The relay sessions, agreement producer, ordered normalizers, batch builder, and
 ClickHouse publisher already run independently. A raw block can wait for
 publication only after every bounded downstream queue fills.
 
-The live run does not show that condition:
+The baseline live run did not show that condition:
 
 | Signal | Live observation |
 |---|---:|
@@ -41,12 +41,12 @@ The live run does not show that condition:
 | Publication average | about 40-50 ms/batch |
 | Reconnects / disagreements | 0 / 0 |
 
-Published blocks repeatedly catch agreed blocks. ClickHouse and normalization
-are therefore not holding BlockFetch at the current rate.
+Published blocks repeatedly caught agreed blocks. ClickHouse and normalization
+were therefore not holding BlockFetch at the baseline rate.
 
-### 2.2 ChainSync currently waits for each complete BlockFetch range
+### 2.2 ChainSync waited for each complete BlockFetch range
 
-The current relay session has this control flow:
+The baseline relay session had this control flow:
 
 ```text
 ChainSync callback
@@ -91,10 +91,10 @@ attempt:
 
 The projection is not a promised result. Continuous operation will be limited
 by the slower of header production and body delivery. It does show that the
-current body stream can deliver much faster than the end-to-end rate and then
+baseline body stream could deliver much faster than the end-to-end rate and then
 sits without another ready request for most of the cycle.
 
-### 2.4 The host network is not the present ceiling
+### 2.4 The host network was not the baseline ceiling
 
 During the same live sync:
 
@@ -111,26 +111,27 @@ that every route to every relay can sustain 605 Mbit/s, but it rules out the
 host's access link as the reason Clicksync is receiving only about 26 Mbit/s.
 
 After the scheduling bubble is removed, a relay, route, or single TCP flow may
-become the next ceiling. Clicksync will measure and report that ceiling; it
-will not open more connections to bypass it.
+become the next ceiling. Clicksync measures that boundary but does not open
+more connections to bypass it.
 
-### 2.5 gOuroboros ChainSync pipeline ceiling
+### 2.5 ChainSync request scheduling
 
-Clicksync configures gOuroboros v0.189.1 with its advertised maximum
-`PipelineLimit` of 100. Its generic sender currently drains at most 20 messages
-per wire cohort and waits for that cohort's state transitions before draining
-the next 20. The effective outstanding `MsgRequestNext` window is therefore 20,
-not 100.
+The baseline used gOuroboros's general ChainSync client with a configured
+pipeline limit of 100. Its sender advanced in cohorts of at most 20, yielding
+an effective request cadence close to the observed 100 headers/second on these
+relay paths.
 
-At approximately 200 ms relay round-trip time, that implementation ceiling
-predicts roughly 100 headers/second. Calling `SendMessage` from a second
-Clicksync goroutine cannot bypass the sender gate and would corrupt the
-client's private outstanding-request accounting. Clicksync will use
-`ChainSync.Client.Sync` exactly once and keep its callbacks enqueue-only.
+Clicksync now owns a small ChainSync driver in
+`internal/relay/chainsync_client.go`. It uses the public gOuroboros mux,
+`protocol.Protocol`, state/message decoders, and ChainSync message types; no
+gOuroboros fork or module-cache patch is involved. The driver has an exact
+hard maximum of 100 outstanding `RequestNext` messages.
 
-A true sliding 100-request window requires a gOuroboros change. That belongs in
-an upstream release or a separately reviewed pinned fork, not a copied
-ChainSync state machine or patched module cache inside Clicksync.
+Initial and refill writes contain up to 20 requests. Every 20 completed
+callbacks lowers the outstanding count from 100 to 80,
+then one refill write restores it to 100. This preserves a sliding 100-request
+window while keeping wire writes bounded. ChainSync ingress and the BlockFetch
+loop are independent workers on the same muxed N2N connection.
 
 ## 3. Correcting the 512 assumption
 
@@ -142,34 +143,33 @@ protocol state remains in `Streaming` until `BatchDone`, and the receive loop
 drains messages continuously. A range may therefore contain more than 512
 blocks.
 
-Clicksync currently conflates these independent limits:
+The baseline implementation conflated these independent limits:
 
 ```text
 protocol receive queue: capacity for messages waiting for callbacks
 BlockFetch range:        number of consecutive headers covered by one request
 ```
 
-The implementation will separate them:
+The implementation separates them:
 
 ```text
-CLICKSYNC_BLOCKFETCH_RANGE_BLOCKS    initial default selected by live A/B
+CLICKSYNC_BLOCKFETCH_RANGE_BLOCKS    default 512, application maximum 8192
 CLICKSYNC_BLOCKFETCH_QUEUE_SIZE      default 512, hard maximum 512
 ```
 
-ChainSync is not exposed as a tuning knob. Clicksync always uses
-`chainsync.MaxPipelineLimit` and `chainsync.MaxRecvQueueSize`; lowering either
-would reintroduce avoidable latency.
+The ChainSync receive queue and outstanding-request window always use
+gOuroboros's supported maximum of 100.
 
-The first live comparison will use 512, 1,024, 2,048, 4,096, and 8,192 blocks.
-The initial application hard cap will be 8,192. This is a memory and rollback
-responsiveness bound, not a protocol limit.
+Range-size comparisons may use 512, 1,024, 2,048, 4,096, and 8,192 blocks.
+The 8,192 application cap is a memory and rollback-responsiveness bound, not a
+protocol limit.
 
-The old `CLICKSYNC_HEADER_BATCH_SIZE` name will be removed rather than kept as
+The old `CLICKSYNC_HEADER_BATCH_SIZE` name was removed rather than retained as
 an ambiguous alias.
 
 ## 4. Required invariants
 
-The refactor must preserve all of these:
+The implementation preserves all of these:
 
 1. Exactly one N2N connection exists per configured relay.
 2. Each logical relay remains exactly one vote in strict agreement.
@@ -184,13 +184,15 @@ The refactor must preserve all of these:
     existing outer attempt restart from durable state.
 11. No ledger, body, signature, transaction, or semantic validation is added.
 
-## 5. Target architecture
+## 5. Implemented architecture
 
 ```text
 one N2N TCP connection per relay
   |
   +-- ChainSync mini-protocol
-  |     - gOuroboros RequestNext pipeline at maximum depth
+  |     - internal sliding RequestNext window
+  |     - at most 100 outstanding
+  |     - initial/refill writes of at most 20 requests
   |     |
   |     +-- ordered callbacks
   |           - convert point
@@ -229,10 +231,16 @@ or concurrent range request.
 
 ### 5.1 Pipelined ChainSync ingress
 
-`chainsync.Client.Sync` owns the ChainSync request loop. With
-`chainsync.MaxPipelineLimit`, it sends multiple `MsgRequestNext` messages
-without waiting for each individual response. Clicksync must use that client
-loop rather than duplicating the ChainSync state machine.
+`internal/relay/chainsync_client.go` owns the ChainSync request schedule. It is
+an independent internal driver built from gOuroboros's public mux, protocol,
+decoder, and message APIs, rather than a fork of the dependency.
+
+The outstanding window is fixed at the protocol maximum of 100. Startup fills
+it with writes of at most 20 encoded `MsgRequestNext` messages. Each completed
+roll-forward or rollback callback earns one refill credit; every
+20 credits trigger one 20-request write, taking the window from 80 back to
+100. A capture from the optimized live run observed one such write about
+every 29-31 ms.
 
 For a roll forward the callback:
 
@@ -263,7 +271,7 @@ unbounded header prefetch.
 
 ### 5.3 Sequential BlockFetch loop
 
-One new goroutine consumes the ordered job FIFO and is the sole caller of
+One goroutine consumes the ordered job FIFO and is the sole caller of
 `GetBlockRange`.
 
 For each fetch job it:
@@ -292,11 +300,12 @@ allows a new request only after returning to `Idle`.
 Only headers are prefetched; raw bodies continue to stream through the existing
 byte budget.
 
-Initial bounds:
+Bounds and defaults:
 
 | Buffer | Bound |
 |---|---:|
-| ChainSync callback events | 100 headers/rollbacks |
+| Outstanding ChainSync requests | fixed at 100 |
+| ChainSync callback events | 100 |
 | Pending range-builder headers | one configured range |
 | Prepared fetch jobs | one range/rollback |
 | Active BlockFetch range | one |
@@ -364,32 +373,42 @@ durable state. There is no in-session range retry.
 
 ## 7. Minimal performance instrumentation
 
-The implementation needs enough evidence to select a range size and prove that
-the bubble is gone, without adding a metrics framework.
+The implementation exposes enough evidence to select a range size and check
+whether the bubble remains, without adding a general metrics framework.
 
-Per relay, the periodic structured progress log will expose:
+Per relay, the structured fetch-progress log exposes:
 
 - headers received;
 - ChainSync FIFO, pending-header, and fetch-slot current/high-water;
 - BlockFetch ranges and body blocks/bytes;
 - average range size;
 - average body-stream duration;
-- average gap from one `BatchDone` to the next request's `StartBatch`;
+- average inter-range idle time and `GetBlockRange` call time;
 - prepared-job availability when the fetch loop becomes idle;
 - BlockFetch active duty cycle;
 - callback time blocked on downstream backpressure.
+
+gOuroboros does not expose a `StartBatch` callback. The measured
+`get_range_wait_avg` is wall time around `GetBlockRange`, which returns after
+the library handles `StartBatch`; it is the nearest available proxy, not an
+exact wire timestamp.
 
 Interpretation:
 
 | Observation | Limiter |
 |---|---|
 | No prepared job when BlockFetch becomes idle | ChainSync/header production |
-| Prepared job exists but request-start gap is high | local scheduler bug |
+| Prepared job exists but inter-range idle is high | local scheduling |
+| Inter-range idle is low but `GetBlockRange` wait is high | relay/path/single-flow response |
 | BlockFetch duty near 100%, low host ingress | relay/path/single-flow ceiling |
 | Relay/agreed queues remain full | downstream backpressure |
 | Agreed queue drains and publisher stays caught up | relay intake |
 
-## 8. Work items
+## 8. Work items and repeatable checks
+
+WI-01, WI-02, WI-04, and WI-05 describe the implemented path. WI-03 and WI-06
+remain the repeatable procedure for changing defaults or comparing relay
+conditions.
 
 ### WI-01: Separate range length from receive-queue length
 
@@ -399,7 +418,7 @@ Requirements:
 - Remove the false `range <= blockfetch.MaxRecvQueueSize` rule.
 - Keep protocol receive queue validation in `1..512`.
 - Add an application range bound in `1..8192`.
-- Keep the current default at 512 until actual-data comparison completes.
+- Keep the default at 512 unless an actual-data comparison supports a change.
 
 Verification:
 
@@ -412,8 +431,8 @@ Verification:
 
 Requirements:
 
-- Time header collection, request-to-`StartBatch`, body streaming, inter-range
-  gap, and downstream callback blocking.
+- Time header collection, the `GetBlockRange` call, body streaming, inter-range
+  idle, and downstream callback blocking.
 - Attribute observations by configured relay index.
 - Add no per-block logging.
 
@@ -453,7 +472,9 @@ Selection rule:
 
 Requirements:
 
-- Configure gOuroboros ChainSync at its maximum supported RequestNext pipeline.
+- Use the internal ChainSync driver with at most 100 outstanding
+  `RequestNext` messages and writes of at most 20.
+- Refill 20 requests after each 20 completed callbacks.
 - ChainSync callbacks enqueue ordered header and rollback events only.
 - One range builder owns batching and rollback barriers.
 - One fetch loop owns the one BlockFetch client.
@@ -517,6 +538,13 @@ If the final single connection is continuously busy and the relay/path is the
 remaining limit, document that result and stop. Multiple N2N connections are
 not a permitted follow-up.
 
+An initial optimized run using the two configured relays and ClickHouse
+sustained about 545-585 agreed and published blocks/second, compared with the
+earlier roughly 100 blocks/second. It recorded no reconnects or mismatches. A
+packet capture showed a 20-request ChainSync refill write about every 29-31 ms.
+This result demonstrates the scheduling improvement on that run; it does not
+replace the fixed-span procedure when changing range defaults.
+
 ## 9. Test policy
 
 Testing stays deliberately small:
@@ -549,10 +577,11 @@ Performance gates:
 - CPU, ClickHouse, and queues do not replace the network as bottleneck;
 - chosen range is supported by actual same-span A/B evidence.
 
-The 416.3 blocks/second no-gap figure is a diagnostic upper projection from the
-measured span, not a release requirement. The achieved rate will be the slower
-of continuous ChainSync header production and continuous BlockFetch body
-delivery on the single relay connection.
+The 416.3 blocks/second no-gap figure above was a diagnostic projection from
+the baseline span, not a fixed ceiling or release requirement. The optimized
+two-relay run sustained about 545-585 agreed and published blocks/second with
+no reconnects or mismatches; different block spans and public-relay conditions
+make the two figures directional rather than a controlled A/B result.
 
 ## Appendix A: live range timing query
 

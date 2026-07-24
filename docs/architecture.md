@@ -36,7 +36,7 @@ The intended package boundaries are:
 |---|---|
 | `internal/config` | Parse immutable environment configuration and reject unusable process settings. |
 | `internal/model` | SQL-facing facts, points, relay identity, agreed events, and publication batches. |
-| `internal/relay` | One gOuroboros ChainSync + raw BlockFetch session per relay. No cross-peer policy. |
+| `internal/relay` | One N2N session per relay, with an internal ChainSync driver and raw gOuroboros BlockFetch. No cross-peer policy. |
 | `internal/agreement` | Align one next event from every relay and compare it. |
 | `internal/normalize` | Decode one agreed raw block and project SQL facts. |
 | `internal/pipeline` | Concurrent normalization, ordered delivery, bounded queues, and rollback barriers. |
@@ -59,7 +59,7 @@ A relay session:
 
 1. negotiates node-to-node with the configured network magic;
 2. finds one of the supplied durable intersection candidates;
-3. starts maximally pipelined ChainSync from that exact point;
+3. starts a bounded sliding ChainSync request window from that exact point;
 4. puts ordered headers and rollbacks on a bounded session FIFO;
 5. batches headers in one range-builder worker;
 6. requests ranges from one independent, sequential BlockFetch worker;
@@ -67,8 +67,15 @@ A relay session:
 8. computes a content digest without decoding or validating the block;
 9. emits ordered `Forward` or `Rollback` events to its bounded channel.
 
-ChainSync and BlockFetch share the one N2N connection but never wait on each
-other directly. A one-slot fetch FIFO keeps one range prepared while one range
+The ChainSync driver is implemented in `internal/relay/chainsync_client.go`
+using gOuroboros's public mux, protocol, decoder, and ChainSync message types.
+It is not a dependency fork. It permits at most 100 outstanding `RequestNext`
+messages. Initial and refill writes contain up to 20 requests; with the default
+window of 100, each 20 completed callbacks changes the outstanding count from
+100 to 80 and then refills it to 100.
+
+ChainSync ingress and BlockFetch use independent workers on the shared N2N
+connection. A one-slot fetch FIFO keeps one range prepared while one range
 streams. If downstream processing falls behind, the fixed queues eventually
 apply backpressure to ChainSync and then the socket.
 
@@ -204,6 +211,7 @@ Initial defaults:
 
 | Boundary | Default |
 |---|---:|
+| outstanding ChainSync requests / callback events | 100 / 100 |
 | gOuroboros BlockFetch receive queue | 512 messages |
 | headers per BlockFetch range | 512 initially; this is not a protocol maximum |
 | per-relay emitted events | 256 |
@@ -212,13 +220,17 @@ Initial defaults:
 | normalization reorder window | 256 blocks / 256 MiB |
 | pending publication | 1,024 blocks / 128 MiB / 2,000,000 fact rows / 1 second |
 
-Configuration may lower these values. Raising hard limits requires benchmark
-and memory evidence.
+Configurable boundaries may be lowered. Raising hard limits requires benchmark
+and memory evidence; the ChainSync request maximum is a protocol limit.
 
-The approved single-connection throughput refactor separates receive-queue
+The implemented single-connection throughput path separates receive-queue
 capacity from BlockFetch range length and overlaps ChainSync header prefetch
-with sequential BlockFetch on the same N2N connection. Multiple connections
-per relay are explicitly out of scope. See
+with sequential BlockFetch on the same N2N connection. In an actual
+two-relay run with ClickHouse, agreed and published throughput sustained about
+545-585 blocks/second, compared with the earlier roughly 100 blocks/second.
+A capture showed one 20-request ChainSync refill write about every 29-31 ms;
+the measured run had no reconnects or mismatches. Multiple connections per
+relay remain out of scope. See
 [Single-connection BlockFetch throughput plan](single-connection-blockfetch-plan.md).
 
 Backpressure is end-to-end. When ClickHouse is slower, publication fills,
@@ -345,8 +357,7 @@ process resources.
 
 ## 12. Observability
 
-Structured logs and an in-process metrics snapshot deliberately expose a small
-operational set:
+Structured logs and in-process counters expose a small operational set:
 
 - lifetime attempts and whole-set reconnects;
 - lifetime agreed blocks and raw bytes;
@@ -355,13 +366,15 @@ operational set:
 - current and high-water agreed-queue items and retained bytes;
 - lifetime-average agreed and published blocks/second;
 - average agreement wait, normalization time, and publication-batch time.
+- per-relay header/body rates, range timing and duty, prepared-range overlap,
+  and bounded-queue occupancy.
 
 These values show whether intake is below publication, whether the agreed
 queue is accumulating, where agreement/normalization/publication is spending
-time, and whether commits are progressing. They identify the broad bottleneck without
-building per-relay throughput/timing or reorder/worker-utilization
-instrumentation. Focused benchmarks, Go profiles, and ClickHouse query logs
-provide deeper decode or insert detail when needed.
+time, whether ranges are prepared before the active range finishes, and
+whether commits are progressing. The relay counters are session-local rather
+than a general worker-utilization framework. Focused benchmarks, Go profiles,
+packet capture, and ClickHouse query logs provide deeper detail when needed.
 
 Logs never include raw block CBOR or database credentials.
 
