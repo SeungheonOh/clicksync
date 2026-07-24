@@ -3,7 +3,6 @@ package model
 type AtPoint struct {
 	Tip       bool
 	BlockHash *Hash32
-	Event     *uint64
 }
 
 type InputRole string

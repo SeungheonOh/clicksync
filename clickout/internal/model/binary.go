@@ -9,11 +9,61 @@ import (
 )
 
 var (
-	ErrInvalidHash32   = errors.New("expected a 32-byte lowercase hexadecimal hash")
-	ErrInvalidPolicyID = errors.New("expected a 28-byte lowercase hexadecimal policy id")
-	ErrInvalidUTxORef  = errors.New("expected TX_HASH#INDEX")
-	ErrInvalidAsset    = errors.New("expected ada or POLICY_HEX.ASSET_NAME_HEX")
+	ErrInvalidDatasetID = errors.New("expected a 16-byte lowercase hexadecimal dataset id")
+	ErrInvalidHash32    = errors.New("expected a 32-byte lowercase hexadecimal hash")
+	ErrInvalidPolicyID  = errors.New("expected a 28-byte lowercase hexadecimal policy id")
+	ErrInvalidUTxORef   = errors.New("expected TX_HASH#INDEX")
+	ErrInvalidAsset     = errors.New("expected ada or POLICY_HEX.ASSET_NAME_HEX")
 )
+
+type DatasetID [16]byte
+
+func ParseDatasetID(value string) (DatasetID, error) {
+	var result DatasetID
+	if len(value) != hex.EncodedLen(len(result)) || value != strings.ToLower(value) {
+		return result, ErrInvalidDatasetID
+	}
+	decoded, err := hex.DecodeString(value)
+	if err != nil {
+		return result, ErrInvalidDatasetID
+	}
+	copy(result[:], decoded)
+	return result, nil
+}
+
+func DatasetIDFromBytes(value []byte) (DatasetID, error) {
+	var result DatasetID
+	if len(value) != len(result) {
+		return result, fmt.Errorf(
+			"%w: got %d bytes",
+			ErrInvalidDatasetID,
+			len(value),
+		)
+	}
+	copy(result[:], value)
+	return result, nil
+}
+
+func (value DatasetID) String() string {
+	return hex.EncodeToString(value[:])
+}
+
+func (value DatasetID) MarshalJSON() ([]byte, error) {
+	return json.Marshal(value.String())
+}
+
+func (value *DatasetID) UnmarshalJSON(data []byte) error {
+	var text string
+	if err := json.Unmarshal(data, &text); err != nil {
+		return err
+	}
+	parsed, err := ParseDatasetID(text)
+	if err != nil {
+		return err
+	}
+	*value = parsed
+	return nil
+}
 
 // Hash32 remains binary throughout query execution. Hex is only its stable
 // command-line and JSON rendering.

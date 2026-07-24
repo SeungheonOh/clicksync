@@ -1,0 +1,70 @@
+clicksync canonical fresh UTxO-flow dataset contract
+
+This descriptor is the immutable content identity of a freshly created
+dataset. Any semantic change below requires a new hash. There is no in-place
+upgrade path: a dataset whose stored hash differs must fail closed.
+
+dataset_manifest is an append-only MergeTree ordered by
+(manifest_key, revision), with index_granularity 64 and a client-verified
+previous-row/row-digest chain. Its bounded singleton head carries immutable
+dataset, mainnet genesis, start, and contract identity; physical, effective,
+servable-floor, checked, and last-agreed event-points; trust basis/status;
+visibility generation; and crash-recoverable pending operations.
+
+Peer-derived trust evidence has a unique check ID plus stable agreement group
+and increasing attempt. Eligible peer_observations receive contiguous,
+writer-assigned evidence_ordinal values and are ordered by
+(check_id, evidence_ordinal, observation_id). A logical-ID projection is
+ordered by (check_id, observation_id, evidence_ordinal). Each logical ordinal
+permits at most eight byte-identical physical replays; conflicts, ordinal
+gaps, duplicate logical IDs, and a ninth replay fail closed. The evidence
+commitment is SHA-256 over the domain separator and each canonical
+(big-endian ordinal, observation ID, observation digest) tuple.
+
+Evidence admission is manifest-authorized and append-only. An open check
+records committed prefix count/digest C. Before inserting the next row, the
+manifest reserves its canonical payload, digest, writer, and ordinal. Startup
+accepts only exact C or exact C+the reserved tuple, proves the old prefix
+digest, replays the reserved row idempotently, then commits the new
+count/digest. Finalization freezes the commitment before evaluation.
+
+Every observation persists its proof method. source_change diagnostics use
+none, ordinal zero, unavailable/quarantined result, and no verification/source
+flags. chain_sync_singleton and paired_chain_sync_singleton agreements prove
+only exact point membership; failed attempts carry no proof flags.
+boundary_singleton_block_fetch agreements prove point and body, with selected
+source true only for the actual publication source. follow_block_fetch
+agreements prove selected source, point, and body. Parent proof is always
+false until a producer explicitly proves it. disagreement rows never agree.
+
+LastAgreedEvidence is a durable reference to the exact check/group/attempt,
+threshold, confirmed count, checked event-point, and frozen evidence
+count/digest that authorized LastAgreed. Starting another check cannot erase
+that authority. A permanent official-genesis exception uses the physical
+synthetic-genesis Origin event as both servable floor and LastAgreed, not
+event zero.
+
+A pending rollback retains its exact identity, target, old physical head,
+depth, observer arrays, check/group/attempt/checked event, threshold, writer,
+and frozen evidence count/digest. The physical rollback header repeats the
+same evidence count/digest. Reservation freezes C before invalidations;
+recovery and finalization re-evaluate exactly C, and final LastAgreedEvidence
+retains C after pending state is cleared. Ordinary reconciliation cannot adopt
+rollback headers or invalidations.
+
+blocks, transactions, inputs, outputs, datum_bodies, datum_observations,
+withdrawals, redeemers, and transaction_metadata are immutable physical facts.
+chain_events and rollbacks are append-only canonical membership events.
+writer_audit is operational history and is not writer authority.
+
+Visibility is the manifest effective event snapshot minus append-only,
+header-authorized invalidations. Raw transaction/block CBOR, script bodies,
+certificates, governance actions, votes, and proposals are outside this
+dataset.
+
+Trust sampling occurs every 512 primary blocks. A primary-only physical suffix
+may contain at most 767 blocks and remains anchored to retained sampled-peer or
+official-genesis authority. checking and disputed states clamp visibility.
+Availability and range failures retry indefinitely with capped per-attempt
+backoff and context cancellation; only deterministic peer-data/correctness
+violations quarantine.

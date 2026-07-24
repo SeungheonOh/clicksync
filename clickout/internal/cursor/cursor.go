@@ -1,42 +1,46 @@
 package cursor
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-)
+	"io"
 
-const version = 1
+	"github.com/clicksync-project/clickout/internal/model"
+)
 
 var ErrInvalid = errors.New("invalid or corrupted cursor")
 
 type Value struct {
-	Version       uint8  `json:"v"`
-	Scope         string `json:"scope"`
-	SnapshotEvent uint64 `json:"snapshot_event"`
-	LastKey       string `json:"last_key"`
+	Scope    string         `json:"scope"`
+	Snapshot model.Snapshot `json:"snapshot"`
+	LastKey  string         `json:"last_key"`
 }
 
 type wireValue struct {
-	Value
-	Checksum string `json:"checksum"`
+	Scope    string         `json:"scope"`
+	Snapshot model.Snapshot `json:"snapshot"`
+	LastKey  string         `json:"last_key"`
+	Checksum string         `json:"checksum"`
 }
 
 func Encode(value Value) (string, error) {
-	if value.Scope == "" || value.LastKey == "" {
+	if value.Scope == "" || value.LastKey == "" || !value.Snapshot.Valid() {
 		return "", fmt.Errorf("%w: incomplete value", ErrInvalid)
 	}
-	value.Version = version
 	payload, err := json.Marshal(value)
 	if err != nil {
 		return "", err
 	}
 	sum := sha256.Sum256(payload)
 	wire, err := json.Marshal(wireValue{
-		Value:    value,
+		Scope:    value.Scope,
+		Snapshot: value.Snapshot,
+		LastKey:  value.LastKey,
 		Checksum: base64.RawURLEncoding.EncodeToString(sum[:]),
 	})
 	if err != nil {
@@ -45,32 +49,55 @@ func Encode(value Value) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(wire), nil
 }
 
-func Decode(encoded string, expectedScope string, snapshotEvent uint64) (Value, error) {
-	result, err := DecodePinned(encoded, expectedScope)
-	if err != nil || result.SnapshotEvent != snapshotEvent {
-		return Value{}, ErrInvalid
-	}
-	return result, nil
-}
-
-func DecodePinned(encoded string, expectedScope string) (Value, error) {
-	var result wireValue
+func Decode(encoded string, expectedScope string) (Value, error) {
 	wire, err := base64.RawURLEncoding.DecodeString(encoded)
-	if err != nil || json.Unmarshal(wire, &result) != nil {
+	if err != nil ||
+		base64.RawURLEncoding.EncodeToString(wire) != encoded {
 		return Value{}, ErrInvalid
 	}
-	if result.Version != version || result.Scope != expectedScope || result.LastKey == "" {
+	var decoded wireValue
+	decoder := json.NewDecoder(bytes.NewReader(wire))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&decoded) != nil {
 		return Value{}, ErrInvalid
 	}
-	payload, err := json.Marshal(result.Value)
+	if err := requireJSONEOF(decoder); err != nil {
+		return Value{}, ErrInvalid
+	}
+	canonical, err := json.Marshal(decoded)
+	if err != nil || !bytes.Equal(canonical, wire) {
+		return Value{}, ErrInvalid
+	}
+	value := Value{
+		Scope:    decoded.Scope,
+		Snapshot: decoded.Snapshot,
+		LastKey:  decoded.LastKey,
+	}
+	if value.Scope != expectedScope ||
+		value.LastKey == "" ||
+		!value.Snapshot.Valid() {
+		return Value{}, ErrInvalid
+	}
+	payload, err := json.Marshal(value)
 	if err != nil {
 		return Value{}, ErrInvalid
 	}
 	sum := sha256.Sum256(payload)
-	expected, err := base64.RawURLEncoding.DecodeString(result.Checksum)
-	if err != nil || len(expected) != len(sum) ||
-		subtle.ConstantTimeCompare(expected, sum[:]) != 1 {
+	checksum, err := base64.RawURLEncoding.DecodeString(decoded.Checksum)
+	if err != nil ||
+		base64.RawURLEncoding.EncodeToString(checksum) != decoded.Checksum ||
+		len(checksum) != len(sum) ||
+		subtle.ConstantTimeCompare(checksum, sum[:]) != 1 {
 		return Value{}, ErrInvalid
 	}
-	return result.Value, nil
+	return value, nil
+}
+
+func requireJSONEOF(decoder *json.Decoder) error {
+	var extra any
+	err := decoder.Decode(&extra)
+	if errors.Is(err, io.EOF) {
+		return nil
+	}
+	return ErrInvalid
 }

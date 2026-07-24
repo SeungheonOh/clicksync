@@ -13,7 +13,11 @@ import (
 
 func activeArguments(snapshot model.Snapshot, extra ...any) []any {
 	result := make([]any, 0, 2+len(extra))
-	result = append(result, snapshot.Event, snapshot.PublicationWatermark)
+	result = append(
+		result,
+		snapshot.QueryHead.EventSeq,
+		snapshot.Cutoff.PublicationID,
+	)
 	return append(result, extra...)
 }
 
@@ -24,7 +28,8 @@ func (store *Store) UTxO(
 ) (model.OutputState, []model.PartialHistoryBoundary, error) {
 	output, err := store.outputByRef(ctx, snapshot, ref)
 	if err != nil {
-		if errors.Is(err, ErrNotFound) && !snapshot.CompleteHistory {
+		if errors.Is(err, ErrNotFound) &&
+			!snapshot.Identity.CompleteHistory {
 			return model.OutputState{}, []model.PartialHistoryBoundary{{
 				UTxO:   ref,
 				Reason: "source output is outside this partial-history dataset",
@@ -219,7 +224,7 @@ func (store *Store) Transaction(
 	}
 	transaction.Inputs = inputs
 	transaction.Outputs = outputs
-	if snapshot.CompleteHistory {
+	if snapshot.Identity.CompleteHistory {
 		boundaries = nil
 	}
 	return transaction, boundaries, nil

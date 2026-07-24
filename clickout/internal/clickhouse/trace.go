@@ -42,6 +42,31 @@ func validateHyperedgeResources(edge model.FlowHyperedge, maxNodes uint32) error
 	return nil
 }
 
+func rewrapTraceAddressContinuation(
+	encoded string,
+	address []byte,
+	direction repository.TraceDirection,
+	asset model.AssetSelector,
+	snapshot model.Snapshot,
+) (string, string, error) {
+	value, err := cursor.Decode(
+		encoded,
+		addressScope(address, "history"),
+	)
+	if err != nil || !value.Snapshot.SamePin(snapshot) {
+		return "", "", cursor.ErrInvalid
+	}
+	continuation, err := cursor.Encode(cursor.Value{
+		Scope:    TraceAddressScope(address, direction, asset),
+		Snapshot: snapshot,
+		LastKey:  value.LastKey,
+	})
+	if err != nil {
+		return "", "", err
+	}
+	return value.LastKey, continuation, nil
+}
+
 func (store *Store) TraceSeeds(
 	ctx context.Context,
 	snapshot model.Snapshot,
@@ -51,7 +76,8 @@ func (store *Store) TraceSeeds(
 	if query.Seed.UTxO != nil {
 		output, err := store.outputByRef(ctx, snapshot, *query.Seed.UTxO)
 		if err != nil {
-			if errors.Is(err, ErrNotFound) && !snapshot.CompleteHistory {
+			if errors.Is(err, ErrNotFound) &&
+				!snapshot.Identity.CompleteHistory {
 				return repository.TraceSeedResult{}, []model.PartialHistoryBoundary{{
 					UTxO:   *query.Seed.UTxO,
 					Reason: "trace seed is outside this partial-history dataset",
@@ -111,19 +137,22 @@ func (store *Store) TraceSeeds(
 			if page.Cursor == "" {
 				break
 			}
-			continuation = page.Cursor
+			nextKey, rewrapped, err := rewrapTraceAddressContinuation(
+				page.Cursor,
+				query.Seed.Address,
+				query.Direction,
+				query.Asset,
+				snapshot,
+			)
+			if err != nil {
+				return repository.TraceSeedResult{}, nil, err
+			}
+			continuation = rewrapped
 			if len(seeds) == int(limit) {
 				truncated = true
 				break
 			}
-			value, err := cursor.DecodePinned(
-				page.Cursor,
-				addressScope(query.Seed.Address, "history"),
-			)
-			if err != nil || value.SnapshotEvent != snapshot.Event {
-				return repository.TraceSeedResult{}, nil, cursor.ErrInvalid
-			}
-			lastKey = value.LastKey
+			lastKey = nextKey
 			if window == maxTraceSeedWindows-1 {
 				truncated = true
 			}
@@ -984,7 +1013,7 @@ ORDER BY o.tx_hash, o.body_ordinal, o.output_index, o.publication_id`)
 		if _, exists := found[ref.String()]; exists {
 			continue
 		}
-		if snapshot.CompleteHistory {
+		if snapshot.Identity.CompleteHistory {
 			return nil, nil, ErrNotFound
 		}
 		boundaries = append(boundaries, model.PartialHistoryBoundary{

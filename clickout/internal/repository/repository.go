@@ -55,6 +55,8 @@ type ExpansionResult struct {
 // snapshot captured for the enclosing request.
 type Reader interface {
 	Snapshot(context.Context, model.AtPoint) (model.Snapshot, error)
+	ValidateSnapshotBeforeRead(context.Context, model.Snapshot) (model.Snapshot, error)
+	FinishSnapshot(context.Context, model.Snapshot) (model.Snapshot, error)
 	UTxO(context.Context, model.Snapshot, model.UTxORef) (model.OutputState, []model.PartialHistoryBoundary, error)
 	Transaction(context.Context, model.Snapshot, model.Hash32) (model.Transaction, []model.PartialHistoryBoundary, error)
 	Address(context.Context, model.Snapshot, AddressQuery) (model.AddressPage, []model.PartialHistoryBoundary, error)

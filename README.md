@@ -9,12 +9,15 @@ node and does not persist blocks, transactions, or scripts as raw CBOR.
 The root binary is ingestion-only. Independent querying and bounded fund-flow
 traversal live in the separately buildable `clickout` Go module.
 
-## Safety status
+## Validation status
 
-The implementation is still undergoing bounded validation. Do not begin an
-unbounded Origin backfill. The current host has no hard filesystem quota, and
-the binding capacity gate requires a conservative settled-data projection at
-or below 70 GiB before full-history ingestion is authorized.
+The implementation is still undergoing validation. The 100 GB development
+allocation is a soft planning target only: Clicksync has no storage quota,
+threshold, warning, or publication pause. Normal synchronization is
+storage-unbounded and continues until external shutdown or a fail-closed
+correctness/non-recoverable ClickHouse error. Transient peer transport and
+corroboration unavailability retry indefinitely with capped backoff. Operators
+provision and monitor their ClickHouse storage externally.
 
 Writer exclusion is explicitly single-host: every supported writer must mount
 the same `clicksync-state` volume and hold its advisory lock for process
@@ -23,7 +26,11 @@ lifetime. Remote or multi-host writers are unsupported.
 ## Build and test
 
 ```sh
-docker build -t clicksync:local .
+test -z "$(git status --porcelain)"
+export CLICKSYNC_BUILD_ID="$(git rev-parse HEAD)"
+docker build \
+  --build-arg CLICKSYNC_BUILD_ID="$CLICKSYNC_BUILD_ID" \
+  -t clicksync:local .
 docker run --rm --network none clicksync:local peers
 ```
 
@@ -36,17 +43,36 @@ docker run --rm --network none \
   go test -mod=readonly ./...
 ```
 
-## Bounded runtime
+## First run
 
-Copy `.env.example` to `.env`, replace the password, and keep a bounded stop
-mode during validation:
+Copy `.env.example` to `.env` and replace the password. The example starts at
+the corroborated post-van-Rossem/PV11 point
+`193253841:e98663bea810a45b59bf2783e40dbd2c69f79e1594b4cd0e160646a3f587eb13`.
+Clicksync BlockFetches that boundary and derives its height; the resulting
+dataset is correctly reported as partial history.
+
+Build from a clean, committed tree so the image carries the exact source
+identity, migrate once, then start continuous ingestion:
 
 ```sh
+test -z "$(git status --porcelain)"
+export CLICKSYNC_BUILD_ID="$(git rev-parse HEAD)"
+docker compose build
 docker compose run --rm clicksync migrate
-CLICKSYNC_MAX_BLOCKS=10 docker compose up --abort-on-container-exit
+docker compose up
 ```
 
-The supported root commands are `migrate`, `sync`, `status`, `peers`,
-`storage`, and `lease`. See `docs/schema-contract.md` for the Clickout-facing
+Clicksync has no cumulative block-count, tip, time, or storage stop. For a
+bounded validation run, an external harness may poll `clicksync status`, send
+`SIGTERM` after enough committed blocks, and verify the final staged prefix was
+flushed. That harness policy is not part of the Clicksync runtime.
+
+For a complete-history backfill, set `CLICKSYNC_START=origin`, leave
+`CLICKSYNC_START_POINT` empty, and run `clicksync sync`. There is no block,
+tip, elapsed-time, or storage ceiling; operators provision and monitor their
+ClickHouse storage externally.
+
+The supported root commands are `migrate`, `sync`, `status`, `peers`, and
+`writer`. See `docs/schema-contract.md` for the Clickout-facing
 snapshot contract and `docs/direct-p2p-utxo-plan.md` for binding acceptance
 requirements.

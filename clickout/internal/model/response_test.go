@@ -4,15 +4,55 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 )
+
+func validSnapshotForTest() Snapshot {
+	point := Point{
+		Slot:        41,
+		Hash:        Hash32{1},
+		BlockNumber: 39,
+	}
+	return Snapshot{
+		Identity: SnapshotIdentity{
+			DatasetID:              DatasetID{1},
+			SchemaContractHash:     Hash32{2},
+			NetworkMagic:           764824073,
+			NetworkName:            "mainnet",
+			ByronGenesisID:         Hash32{3},
+			ByronGenesisJSONHash:   Hash32{4},
+			ShelleyGenesisID:       Hash32{5},
+			ShelleyGenesisJSONHash: Hash32{6},
+			Start: Point{
+				Slot:        1,
+				Hash:        Hash32{7},
+				BlockNumber: 1,
+			},
+			TrustMode:       TrustPeerObserved,
+			CreatedAt:       time.Date(2026, 7, 23, 1, 2, 3, 0, time.UTC),
+			CompleteHistory: false,
+		},
+		VisibilityGeneration: 9,
+		AuthorityEffective:   Head{EventSeq: 41, Point: point},
+		QueryHead:            Head{EventSeq: 41, Point: point},
+		Cutoff: Cutoff{
+			AdoptionEventSeq: 41,
+			PublicationID:    39,
+		},
+		Selector: SnapshotSelector{Mode: SnapshotAtTip},
+		Diagnostics: SnapshotDiagnostics{
+			Physical:    Head{EventSeq: 43, Point: point},
+			TrustStatus: "agreed",
+			TrustBasis:  "partial_boundary",
+		},
+	}
+}
 
 func TestEveryResponseCarriesRequiredDatasetSemantics(t *testing.T) {
 	t.Parallel()
-	snapshot := Snapshot{
-		Event:                41,
-		PublicationWatermark: 39,
-		CompleteHistory:      false,
-		TrustMode:            TrustPeerObserved,
+	snapshot := validSnapshotForTest()
+	if !snapshot.Valid() {
+		t.Fatal("fixture snapshot is invalid")
 	}
 	response := NewResponse(snapshot, struct {
 		OK bool `json:"ok"`
@@ -23,8 +63,13 @@ func TestEveryResponseCarriesRequiredDatasetSemantics(t *testing.T) {
 	}
 	text := string(encoded)
 	for _, required := range []string{
-		`"event":41`,
-		`"publication_watermark":39`,
+		`"dataset_id":"01000000000000000000000000000000"`,
+		`"visibility_generation":9`,
+		`"authority_effective":{"event_seq":41`,
+		`"query_head":{"event_seq":41`,
+		`"cutoff":{"adoption_event_seq":41,"publication_id":39}`,
+		`"selector":{"mode":"tip"`,
+		`"physical":{"event_seq":43`,
 		`"complete_history":false`,
 		`"trust_mode":"peer_observed_structurally_verified"`,
 		`"truncated":false`,
@@ -40,18 +85,243 @@ func TestEveryResponseCarriesRequiredDatasetSemantics(t *testing.T) {
 	}
 }
 
-func TestOriginSnapshotZeroIsValid(t *testing.T) {
+func TestSnapshotValidSelectorAndHistoryRules(t *testing.T) {
 	t.Parallel()
-	origin := Snapshot{
-		Event:           0,
-		CompleteHistory: false,
-		TrustMode:       TrustPeerObserved,
+	valid := validSnapshotForTest()
+	block := valid
+	hash := block.QueryHead.Point.Hash
+	point := block.QueryHead.Point
+	block.Selector = SnapshotSelector{
+		Mode:                  SnapshotAtBlock,
+		RequestedBlockHash:    &hash,
+		SelectedPublicationID: block.Cutoff.PublicationID,
+		SelectedPoint:         &point,
 	}
-	if !origin.Valid() {
-		t.Fatal("origin/no-event snapshot must be valid")
+	if !block.Valid() {
+		t.Fatal("valid AtBlock snapshot rejected")
 	}
-	origin.CompleteHistory = true
-	if origin.Valid() {
-		t.Fatal("complete history cannot exist before a committed genesis adoption")
+
+	partialBoundary := valid
+	partialBoundary.AuthorityEffective = Head{
+		Point: partialBoundary.Identity.Start,
+	}
+	partialBoundary.QueryHead = partialBoundary.AuthorityEffective
+	partialBoundary.Cutoff = Cutoff{}
+	if !partialBoundary.Valid() {
+		t.Fatal("partial non-Origin event-zero snapshot rejected")
+	}
+
+	completeOrigin := valid
+	completeOrigin.Identity.Start = Point{Origin: true}
+	completeOrigin.Identity.CompleteHistory = true
+	completeOrigin.AuthorityEffective = Head{
+		Point: completeOrigin.Identity.Start,
+	}
+	completeOrigin.QueryHead = completeOrigin.AuthorityEffective
+	completeOrigin.Cutoff = Cutoff{}
+	completeOrigin.Diagnostics.Physical = Head{
+		EventSeq: 1,
+		Point: Point{
+			Slot:        1,
+			Hash:        Hash32{8},
+			BlockNumber: 1,
+		},
+	}
+	if completeOrigin.Valid() {
+		t.Fatal("complete-history event-zero snapshot accepted")
+	}
+}
+
+func TestSnapshotValidRejectsIdentityAndShapeMutations(t *testing.T) {
+	t.Parallel()
+	tests := map[string]func(*Snapshot){
+		"zero dataset": func(value *Snapshot) {
+			value.Identity.DatasetID = DatasetID{}
+		},
+		"zero schema": func(value *Snapshot) {
+			value.Identity.SchemaContractHash = Hash32{}
+		},
+		"zero network magic": func(value *Snapshot) {
+			value.Identity.NetworkMagic = 0
+		},
+		"empty network name": func(value *Snapshot) {
+			value.Identity.NetworkName = " "
+		},
+		"zero genesis": func(value *Snapshot) {
+			value.Identity.ShelleyGenesisJSONHash = Hash32{}
+		},
+		"invalid start": func(value *Snapshot) {
+			value.Identity.Start = Point{}
+		},
+		"wrong trust mode": func(value *Snapshot) {
+			value.Identity.TrustMode = "other"
+		},
+		"zero created at": func(value *Snapshot) {
+			value.Identity.CreatedAt = time.Time{}
+		},
+		"history/start mismatch": func(value *Snapshot) {
+			value.Identity.CompleteHistory = true
+		},
+		"partial cutoff": func(value *Snapshot) {
+			value.Cutoff.PublicationID = 0
+		},
+		"cutoff beyond head": func(value *Snapshot) {
+			value.Cutoff.AdoptionEventSeq++
+		},
+		"tip head mismatch": func(value *Snapshot) {
+			value.QueryHead.EventSeq--
+		},
+		"tip requested block": func(value *Snapshot) {
+			hash := Hash32{9}
+			value.Selector.RequestedBlockHash = &hash
+		},
+		"invalid diagnostics": func(value *Snapshot) {
+			value.Diagnostics.TrustStatus = ""
+		},
+	}
+	for name, mutate := range tests {
+		name, mutate := name, mutate
+		t.Run(name, func(t *testing.T) {
+			value := validSnapshotForTest()
+			mutate(&value)
+			if value.Valid() {
+				t.Fatal("mutated snapshot accepted")
+			}
+		})
+	}
+}
+
+func TestSnapshotSamePinComparesEveryImmutableAndQueryField(t *testing.T) {
+	t.Parallel()
+	base := validSnapshotForTest()
+	diagnostics := base
+	diagnostics.Diagnostics.Physical.EventSeq += 10
+	diagnostics.Diagnostics.Physical.Point = Point{
+		Slot:        99,
+		Hash:        Hash32{99},
+		BlockNumber: 99,
+	}
+	diagnostics.Diagnostics.TrustStatus = "checking"
+	diagnostics.Diagnostics.TrustBasis = "primary_only"
+	diagnostics.Diagnostics.TrustReason = "changed"
+	if !base.SamePin(diagnostics) {
+		t.Fatal("refreshable diagnostics changed the pin")
+	}
+	sameInstant := base
+	sameInstant.Identity.CreatedAt = base.Identity.CreatedAt.In(
+		time.FixedZone("same", -5*60*60),
+	)
+	if !base.SamePin(sameInstant) {
+		t.Fatal("CreatedAt.Equal representation changed the pin")
+	}
+
+	tests := map[string]func(*Snapshot){
+		"dataset ID": func(value *Snapshot) {
+			value.Identity.DatasetID[0]++
+		},
+		"schema hash": func(value *Snapshot) {
+			value.Identity.SchemaContractHash[0]++
+		},
+		"network magic": func(value *Snapshot) {
+			value.Identity.NetworkMagic++
+		},
+		"network name": func(value *Snapshot) {
+			value.Identity.NetworkName += "-other"
+		},
+		"Byron ID": func(value *Snapshot) {
+			value.Identity.ByronGenesisID[0]++
+		},
+		"Byron JSON": func(value *Snapshot) {
+			value.Identity.ByronGenesisJSONHash[0]++
+		},
+		"Shelley ID": func(value *Snapshot) {
+			value.Identity.ShelleyGenesisID[0]++
+		},
+		"Shelley JSON": func(value *Snapshot) {
+			value.Identity.ShelleyGenesisJSONHash[0]++
+		},
+		"start": func(value *Snapshot) {
+			value.Identity.Start.Hash[0]++
+		},
+		"trust mode": func(value *Snapshot) {
+			value.Identity.TrustMode += "-other"
+		},
+		"created at": func(value *Snapshot) {
+			value.Identity.CreatedAt =
+				value.Identity.CreatedAt.Add(time.Nanosecond)
+		},
+		"complete history": func(value *Snapshot) {
+			value.Identity.CompleteHistory =
+				!value.Identity.CompleteHistory
+		},
+		"generation": func(value *Snapshot) {
+			value.VisibilityGeneration++
+		},
+		"authority effective": func(value *Snapshot) {
+			value.AuthorityEffective.EventSeq++
+		},
+		"query head": func(value *Snapshot) {
+			value.QueryHead.EventSeq++
+		},
+		"cutoff": func(value *Snapshot) {
+			value.Cutoff.PublicationID++
+		},
+		"selector": func(value *Snapshot) {
+			value.Selector.Mode = SnapshotAtBlock
+		},
+	}
+	for name, mutate := range tests {
+		name, mutate := name, mutate
+		t.Run(name, func(t *testing.T) {
+			changed := base
+			mutate(&changed)
+			if base.SamePin(changed) {
+				t.Fatal("changed field was ignored")
+			}
+		})
+	}
+}
+
+func TestSnapshotSamePinComparesAtBlockOptionalSelectorValues(t *testing.T) {
+	t.Parallel()
+	base := validSnapshotForTest()
+	requested := Hash32{44}
+	selected := base.QueryHead.Point
+	base.Selector = SnapshotSelector{
+		Mode:                  SnapshotAtBlock,
+		RequestedBlockHash:    &requested,
+		SelectedPublicationID: base.Cutoff.PublicationID,
+		SelectedPoint:         &selected,
+	}
+	tests := map[string]func(*Snapshot){
+		"requested hash": func(value *Snapshot) {
+			changed := *value.Selector.RequestedBlockHash
+			changed[0]++
+			value.Selector.RequestedBlockHash = &changed
+		},
+		"requested presence": func(value *Snapshot) {
+			value.Selector.RequestedBlockHash = nil
+		},
+		"publication": func(value *Snapshot) {
+			value.Selector.SelectedPublicationID++
+		},
+		"point": func(value *Snapshot) {
+			changed := *value.Selector.SelectedPoint
+			changed.Hash[0]++
+			value.Selector.SelectedPoint = &changed
+		},
+		"point presence": func(value *Snapshot) {
+			value.Selector.SelectedPoint = nil
+		},
+	}
+	for name, mutate := range tests {
+		name, mutate := name, mutate
+		t.Run(name, func(t *testing.T) {
+			changed := base
+			mutate(&changed)
+			if base.SamePin(changed) {
+				t.Fatal("changed selector field was ignored")
+			}
+		})
 	}
 }

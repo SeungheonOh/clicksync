@@ -1,0 +1,118 @@
+{
+  "captured_at": "2026-07-23T16:24:41Z",
+  "result": "pass",
+  "process_exit_code": 0,
+  "scope": "bounded one-block partial-tail proof",
+  "claims": {
+    "complete_history": false,
+    "trust_mode": "peer_observed_structurally_verified",
+    "trust_description": "peer-observed, structurally verified Cardano chain data",
+    "continuous_sync_proven": false,
+    "origin_sync_proven": false,
+    "node_or_ogmios_used": false
+  },
+  "source": {
+    "network": "mainnet",
+    "network_magic": 764824073,
+    "selected_peer": "backbone.cardano.iog.io:3001",
+    "n2n_version": 15,
+    "corroborated_peers": [
+      "backbone.cardano.iog.io:3001",
+      "backbone.mainnet.cardanofoundation.org:3001"
+    ],
+    "block_hash": "312f8ce34de042e65d303d26667e7006af59fc23732c7799bdc68b311f7ff7cc",
+    "slot": 193257546,
+    "block_number": 13715607
+  },
+  "stored_rows": {
+    "block_publications": 1,
+    "flow_transactions": 7,
+    "effective_spends": 17,
+    "effective_outputs": 20,
+    "datum_bodies": 7,
+    "datum_observations": 7,
+    "publication_events": 1
+  },
+  "selected_hyperedge": {
+    "from": {
+      "tx_hash": "318f78d8780b9f02160a1412b34d28ae7abc97175b6319fb558837a5188cba84",
+      "output_index": 2
+    },
+    "transaction_hash": "05eded9d0a7789e24e0f8d31c3e92ba2db52be987dd02ec044f474dd58d96960",
+    "to": {
+      "tx_hash": "05eded9d0a7789e24e0f8d31c3e92ba2db52be987dd02ec044f474dd58d96960",
+      "output_index": 0
+    },
+    "present_in_forward": true,
+    "present_in_reverse": true
+  },
+  "query_wall_ms": {
+    "point": 17.173,
+    "address": 16.444,
+    "forward_bfs": 14.442,
+    "reverse_bfs": 28.115,
+    "datum": 19.975
+  },
+  "clickhouse_query_summary": {
+    "point": {
+      "read_rows": 39,
+      "read_bytes": 4920,
+      "elapsed_ns": 10032367
+    },
+    "address": {
+      "read_rows": 39,
+      "read_bytes": 5472,
+      "elapsed_ns": 8246913
+    },
+    "forward": {
+      "read_rows": 40,
+      "read_bytes": 2265,
+      "elapsed_ns": 5768041
+    },
+    "reverse": {
+      "read_rows": 61,
+      "read_bytes": 3187,
+      "elapsed_ns": 14152754
+    },
+    "datum": {
+      "read_rows": 41,
+      "read_bytes": 2966,
+      "elapsed_ns": 12074611
+    }
+  },
+  "explain_indexes": {
+    "address": "PrimaryKey Condition:true; 1/1 part and 1/1 granule scanned (full scan at proof scale)",
+    "forward_seed": "effective_spends(source_tx_hash,source_index) PrimaryKey binary search; joined effective_outputs side 1/1 granule",
+    "reverse_seed": "effective_outputs(tx_hash,output_index) PrimaryKey binary search; joined effective_spends side 1/1 granule",
+    "projection_added": false
+  },
+  "storage": {
+    "active_database_bytes": 21430,
+    "mutable_data_and_server_log_bytes": 38240256,
+    "mutable_footprint_exact": true,
+    "warning_bytes": 64424509440,
+    "publication_pause_bytes": 75161927680,
+    "rollback_stop_bytes": 102005473280,
+    "budget_bytes": 107374182400
+  },
+  "artifacts": {
+    "helper_image_id": "sha256:f6f3714e92b8d5e32e73f8e978c28319794c0849d1d5650ae6be80e909114904",
+    "clickhouse_image": "clickhouse/clickhouse-server@sha256:1f7cd090d5c4e2b8bfe0ea5d8ae6125937e1d932c6371b4d25fbd6088829dc9c",
+    "database": "clicksync_utxo_v2_e2e",
+    "database_retained_for_review": true
+  },
+  "isolation": {
+    "compose_project": "clicksync-p2p-v2",
+    "container": "clicksync-p2p-v2-clickhouse",
+    "container_id": "3398dfb2574633606bd1c1af753a30fba1ffe521f98c9e7045d914c34f035a5f",
+    "network_id": "11a1097f66563021434d0d106072e40c3ceb0666f43dd989d4ad1cc8961cf30f",
+    "http_binding": "127.0.0.1:18123",
+    "restart_policy": "no",
+    "cpu_limit": 2,
+    "memory_bytes": 3221225472,
+    "pids_limit": 2048,
+    "docker_log_driver": "none",
+    "scope_label": "p2p-v2",
+    "no_cardano_node_or_ogmios_process_observed": true
+  }
+}

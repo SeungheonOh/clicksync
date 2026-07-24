@@ -1,131 +1,259 @@
-# Direct-P2P UTxO Clicksync: Steering Plan and Decision Log
+# Clicksync Direct-P2P UTxO Indexer: Steering Plan and Decision Record
 
-Status: accepted for implementation, subject to the hard gates in this document  
-Decision date: 2026-07-23  
-Steering owner: root agent  
-Implementation ownership: delegated agents only
+Status: binding implementation plan
+Last steering revision: 2026-07-23
+Steering owner: root agent
+Implementation ownership: delegated manager and worker agents only
 
-## 1. Objective
+## 1. Goal
 
-Build Clicksync as a narrowly scoped Cardano UTxO-flow indexer that:
+Replace the repository with one clean Go ingestion service that:
 
-1. connects directly to remote Cardano relays over the node-to-node (N2N)
-   Ouroboros protocols;
-2. does not require a local `cardano-node`, Ogmios, Dolos, Oura, DB Sync, or a
-   second persistent copy of the chain;
-3. decodes block bodies in bounded memory and immediately discards block and
-   transaction CBOR;
-4. stores only the facts necessary to reconstruct historical, ledger-effective
-   UTxO flow, native-asset sources/sinks, and datum content;
-5. supports bounded forward and reverse graph traversal in ClickHouse; and
-6. stays within a 100 GiB project budget or stops safely without deleting
-   canonical history.
+1. connects directly to remote Cardano relays using the Ouroboros node-to-node
+   mini-protocols;
+2. continuously follows the peer-observed chain without a local Cardano node,
+   protocol bridge, or second persistent chain store;
+3. decodes block bodies in bounded memory and writes compact, queryable
+   historical UTxO and Plutus-transaction facts directly to ClickHouse;
+4. handles restart, rollback, re-adoption, peer failover, and append-only
+   ClickHouse publication correctly;
+5. retains datum, withdrawals, redeemers with resolved purposes, and metadata
+   needed for normal Plutus dApp/fund-flow analysis;
+6. excludes full block/transaction CBOR, script bodies, and unrelated ledger
+   state;
+7. is storage-unbounded at runtime while measuring the current workspace
+   experiment against a non-enforcing 100 GB planning target; and
+8. proves fund-origin forward and reverse traversal using a completely
+   independent analysis module.
 
-The immediate proof is deliberately smaller than a full mainnet backfill. It
-must retrieve real blocks from public peers, put real UTxO facts into
-ClickHouse, and demonstrate correct forward and reverse traversal. Full
-mainnet ingestion is allowed only after the measured storage gate passes.
+The persistent goal is recorded in the agent goal system. It is complete only
+after adversarial reviewers independently confirm the live direct-P2P
+ingestion and fund-origin query demonstration.
 
-## 2. Non-goals
+## 2. User overrides and rejected prototype decisions
 
-Clicksync will not store or serve:
+The following decisions supersede the earlier prototype:
 
-- raw block CBOR;
-- raw transaction CBOR;
-- validator, minting-policy, native, or reference-script bytes;
-- redeemers or execution units;
-- transaction metadata;
-- certificates, stake delegation, pools, rewards, or epoch state;
-- withdrawals as an independent accounting subsystem;
-- governance proposals, votes, constitutions, ratification, or enactment;
-- transaction signatures and witnesses other than datum bodies;
-- reference inputs, because they observe rather than consume a UTxO;
-- mempool data, transaction submission, block production, or ledger queries;
-- a fabricated input-to-output allocation for multi-input transactions; or
-- independent Cardano consensus or ledger validation in the first version.
+- There is no legacy runtime, compatibility path, migration mode, or parallel
+  generation of the application.
+- The TypeScript/Node implementation is deleted.
+- The old bridge-based source, broad schema, dependencies, tests, container
+  profile, and documentation are deleted.
+- The temporary Go-to-TypeScript NDJSON helper boundary is deleted.
+- Go owns networking, normalization, publication, rollback, schema migration,
+  and direct ClickHouse insertion in one service.
+- Clicksync has no application storage ceiling, quota setup, warning threshold,
+  high-water pause, or capacity gate. The user's 100 GB allocation is a soft
+  planning target for this development run, not product behavior.
+- The database has one current schema and one database name. Normal schema
+  migration bookkeeping is allowed; duplicated product generations are not.
+- `clicksync` contains ingestion only. Fund tracing and every other analytical
+  command live in a separately buildable Go module that does not import
+  Clicksync code.
+- Transaction context now includes withdrawals, redeemers, and metadata.
 
-Governance-era and future-era blocks must still yield their UTxO effects. An
-unknown UTxO-bearing era fails closed; it must never be silently skipped.
+The prior bounded mixed-runtime proof may inform private reconstruction work,
+but its source, commands, database/container names, generated artifacts, and
+evidence files are not retained in the final tree. Final evidence is generated
+only by the replacement Go ingestion path and uses no product-generation
+suffixes.
 
-## 3. Terminology and honesty requirements
+## 3. Final repository contract
 
-### 3.1 Peer-observed chain
-
-N2N ChainSync reproduces a remote peer's candidate chain. ChainSync does not
-perform chain selection and structural hash checks do not prove ledger or
-consensus validity. Until Clicksync reuses a complete consensus and ledger
-implementation, the indexed chain is always described as:
-
-> peer-observed, structurally verified Cardano chain data
-
-It must not be described as trustless, consensus-validated, or independently
-ledger-validated.
-
-### 3.2 Complete-history and partial-tail datasets
-
-A dataset beginning at Origin and including deterministic genesis seeding may
-be marked `complete_history=true` after all completeness checks pass.
-
-A dataset beginning at a recent peer point must be marked
-`complete_history=false`. Its old inputs may be unresolved and its apparent
-current UTxO is only current relative to the indexed slice. The CLI and query
-results must expose this condition; no default may conceal it.
-
-### 3.3 Transaction hypergraph
-
-Cardano records a set of consumed UTxOs and a set of produced UTxOs for a
-transaction. It does not record which particular input funded which particular
-output.
-
-The exact graph is therefore bipartite:
+The final repository contains only these product surfaces:
 
 ```text
-UTxO output -> consuming transaction -> produced UTxO outputs
+clicksync/
+  cmd/clicksync/          ingestion CLI only
+  internal/               P2P, decoding, sync, publication, persistence
+  migrations/             the sole ClickHouse schema
+  config/                 peer/network/ClickHouse configuration
+  clickout/               independent Go module and analysis CLI
+  testdata/               bounded era/protocol fixtures
+  docs/                   architecture, runbook, evidence, decisions
+  compose.yaml            ClickHouse + Go clicksync only
+  Dockerfile              Go clicksync image
+  go.mod
+  go.sum
 ```
 
-Reverse traversal follows the same graph backward. Poison, FIFO, proportional,
-haircut, or other taint-allocation models may be added later as explicitly
-named heuristics. They are not ledger facts and will not be persisted as exact
-edges.
+`clickout/` has its own:
 
-## 4. Accepted decisions
+```text
+clickout/go.mod
+clickout/go.sum
+clickout/cmd/clickout/
+clickout/internal/
+clickout/Dockerfile
+```
 
-### D-001: Use direct N2N ChainSync and BlockFetch
+The analysis module:
 
-Decision: accepted.
+- has no `replace` directive pointing to the root module;
+- imports no root Clicksync package;
+- communicates only through ClickHouse's documented schema;
+- can be copied and built outside this repository; and
+- is not linked into the `clicksync` binary or image.
 
-ChainSync supplies headers, points, tips, and rollback instructions. BlockFetch
-supplies the corresponding block bodies. A correct client must run handshake,
-ChainSync, BlockFetch, and KeepAlive over one multiplexed TCP connection.
-PeerSharing is optional and is not an identity or trust mechanism.
+Final hygiene gates fail if any of the following remain outside `.git` history:
 
-The client must:
+- TypeScript or JavaScript product/test files;
+- `package.json`, npm lockfiles, Node container stages, or `node_modules`;
+- bridge-client dependencies or source adapters;
+- old schema/runtime directories;
+- duplicate Compose files for old/new paths;
+- database/table names carrying generation suffixes; or
+- default commands that do anything except direct-P2P Go ingestion.
 
-- negotiate the configured network magic and an explicitly supported protocol
-  version;
-- intersect from stored canonical points, with Origin as the final fallback;
-- fetch the body for every selected roll-forward header;
-- verify the fetched body's point/header hash and body commitment;
-- verify previous-hash continuity, block-number continuity, and legal slot
-  progression;
-- explicitly support Byron epoch-boundary blocks;
-- handle inclusive block ranges, `NoBlocks`, timeouts, disconnects, and peer
-  rotation;
-- recompute transaction IDs and datum hashes;
-- bound all message, CBOR, queue, and timeout sizes; and
-- discard raw block/transaction bytes immediately after normalization.
+## 4. Product boundaries
 
-Primary protocol references:
+### 4.1 Clicksync owns
+
+- N2N handshake, KeepAlive, ChainSync, and BlockFetch client behavior;
+- peer selection, health, failover, and corroboration;
+- ChainSync intersection and continuous cursor management;
+- bounded block-body CBOR decoding in memory;
+- era-aware normalization;
+- genesis UTxO seeding;
+- ClickHouse migrations and direct native inserts;
+- append-only adoption/rollback publication;
+- writer exclusion and non-authoritative audit handling;
+- status and operational metrics; and
+- no cumulative block-count, tip, time, or storage stop in the shipped
+  ingestion process. A bounded acceptance sample is controlled externally by
+  polling committed state and sending `SIGTERM`; shutdown must flush the final
+  staged prefix.
+
+Acceptance tests and one-shot experiments stop the otherwise continuous
+process from outside Clicksync. The harness polls committed state, sends
+`SIGTERM`, and verifies the graceful-shutdown flush; Clicksync has no internal
+test-range, block-count, tip, elapsed-time, or capacity stop condition.
+
+### 4.2 Clicksync does not own
+
+- fund tracing, BFS, address exploration, taint heuristics, or reports;
+- dashboards or public APIs;
+- transaction submission or mempool;
+- block production;
+- independent wallet/provider APIs;
+- a local N2C socket;
+- consensus/ledger-state queries;
+- script execution;
+- rewards, epoch stake, pools, delegation state, ADA pots, or enacted
+  governance state; or
+- off-chain metadata fetching.
+
+### 4.3 Clickout owns
+
+- UTxO, transaction, address, datum, redeemer, withdrawal, and metadata reads;
+- snapshot-pinned forward/reverse traversal;
+- bounded fund-origin queries;
+- optional clearly named taint/allocation heuristics; and
+- output rendering/decoding for analysts.
+
+## 5. Trust model
+
+### Architecture selection: reuse protocol machinery, not cardano-db-sync
+
+The selected implementation is a clean Go indexer, not a fork of
+`cardano-db-sync` and not a from-scratch Ouroboros implementation.
+
+`cardano-db-sync` remains a useful semantic reference, but it is the wrong
+runtime boundary for this product. Its documented architecture:
+
+- connects to a locally running `cardano-node` through a Unix socket;
+- maintains ledger state while following the chain;
+- writes a highly normalized PostgreSQL database; and
+- covers substantially more Cardano state than historical UTxO-flow
+  analysis needs.
+
+Replacing only its PostgreSQL layer with ClickHouse would therefore retain
+the local-node and Haskell ledger/runtime dependency graph while also
+invalidating storage assumptions built around relational updates,
+foreign-key relationships, and transaction-oriented rollback handling. A
+partial fork that removes those layers would be a larger and harder-to-audit
+rewrite than this narrow service.
+
+The parts of db-sync's model that remain applicable are treated as behavioral
+requirements rather than copied runtime layers:
+
+- era-aware transaction decoding;
+- deterministic genesis UTxO creation;
+- ordered chain adoption and rollback;
+- preservation of datum, metadata, withdrawals, and redeemer context; and
+- resolution of redeemer indices to their semantic transaction targets.
+
+Implementing the entire Ouroboros transport and hard-fork codecs from scratch
+would remove a dependency at the cost of creating a new unaudited networking
+and serialization stack. That is not a sensible trade for an analytics
+indexer. Clicksync instead pins gOuroboros behind a small internal adapter and
+tests its behavior against real era blocks and live public relays. Clicksync
+itself owns peer supervision, continuity checks, normalization, publication,
+and rollback facts.
+
+This boundary deliberately changes the assurance level. A local
+`cardano-node` plus ledger validation can establish stronger chain validity;
+the selected lightweight path observes and structurally verifies remote
+peers. The dataset must expose that distinction rather than imply equivalent
+consensus validation.
+
+Decision matrix:
+
+| Candidate | Local node | Runtime/storage baggage | Protocol risk | Fit |
+|---|---:|---|---|---|
+| Fork db-sync and swap PostgreSQL | Required by inherited architecture | Haskell ledger/db-sync stack and broad schema | Low transport risk, high invasive-fork risk | Rejected |
+| Reimplement Ouroboros in Clicksync | No | Small nominal dependency graph | Unacceptably high mux/codec/era risk | Rejected |
+| Go Clicksync with pinned gOuroboros adapter | No | One ingestion binary plus ClickHouse | Contained by pinning, fixtures, and live gates | Selected |
+
+References:
+
+- <https://github.com/IntersectMBO/cardano-db-sync>
+- <https://github.com/blinklabs-io/gouroboros/releases/tag/v0.189.1>
+- <https://github.com/blinklabs-io/gouroboros/blob/v0.189.1/protocol/chainsync/client.go>
+
+### D-001: Peer-observed, not independently consensus-validated
+
+Accepted.
+
+N2N ChainSync reproduces a remote peer's candidate chain. It does not perform
+chain selection. Block/header/body/transaction/datum verification detects
+corruption and decoder mistakes, but it does not prove ledger or consensus
+validity.
+
+Every dataset and status response uses:
+
+```text
+peer_observed_structurally_verified
+```
+
+It must never claim `trustless`, `consensus_validated`, or
+`ledger_validated`.
+
+Mitigations:
+
+- independently operated bootstrap relays;
+- stable checkpoint agreement from at least two operators;
+- recent-tip and unexpected/deep-rollback corroboration;
+- peer/version/checkpoint provenance persisted in ClickHouse;
+- known hash-pinned network/genesis configuration;
+- fail-closed disagreement clamping plus malformed-peer quarantine; and
+- exact completeness/trust fields available to Clickout.
+
+Independent trustlessness would require complete Cardano consensus and ledger
+validation and is deliberately outside this lightweight indexer's scope.
+
+References:
 
 - <https://developers.cardano.org/docs/developers/curriculum/production/network-protocol/>
 - <https://ouroboros-network.cardano.intersectmbo.org/pdfs/network-spec/network-spec.pdf>
 
-### D-002: Isolate gOuroboros behind a small Go helper
+### D-002: Pinned gOuroboros networking and decoding
 
-Decision: accepted for the first live proof.
+Accepted, subject to live compatibility gates.
 
-Use Blink Labs gOuroboros:
+Pin:
 
+- module: `github.com/blinklabs-io/gouroboros`;
 - release: `v0.189.1`;
 - commit: `9293adc2c94e390ca0545e870e5272ab9ac969fa`;
 - module checksum:
@@ -133,672 +261,1433 @@ Use Blink Labs gOuroboros:
 - `go.mod` checksum:
   `h1:n1NCfwdivyiavSvEa+hZoNWWSUNc3m6Lqw4WH16GQbQ=`.
 
-This version advertises N2N v7-v15 and Byron-through-Dijkstra transaction
-decoding. Those source-code claims are not an acceptance substitute: current
-wire compatibility and Dijkstra semantics must pass live and fixture gates.
+This 0.x dependency remains isolated behind internal adapter interfaces. The
+build uses a digest-pinned Go toolchain image. The release's
+Byron-through-current-Conway and N2N-v15 claims must be proven by
+fixtures/live traffic rather than repeated from its README. A future-era
+fixture proves only the documented fail-closed boundary unless Clicksync
+actually implements that era's semantics.
 
-The helper is built in a digest-pinned Go multi-stage container because the
-host has no Go toolchain. Only the narrow networking/ledger packages required
-for decoding may be imported. The implementation records its module graph,
-SBOM, vulnerability scan, upstream tag, commit, checksums, builder digest, and
-license.
+The production BlockFetch configuration keeps
+`SkipBlockValidation=false`. In the pinned dependency this causes each
+decoded block to recompute and compare its body hash before the adapter can
+label it structurally verified. The rule applies identically to a one-block
+request and a streamed range. A corrupt-body fixture must be rejected by the
+range path; merely matching the requested point or successfully decoding
+CBOR is insufficient. This is structural integrity only and does not change
+the peer-observed trust boundary in D-001.
 
-Rejected for the first proof:
+The final dependency audit includes:
 
-- implementing the mux, handshake, and hard-fork codecs from scratch;
-- importing the Haskell node/consensus dependency graph before proving the
-  index;
-- running Dolos, which would retain an additional ledger/archive store;
-- using Oura as another long-running pipeline layer;
-- Pallas/Oura as the production decoder before current Dijkstra/v15 and
-  phase-2 semantics pass the same gates; and
-- a full Go rewrite, which would discard already tested ClickHouse
-  publication and rollback work before N2N ingestion is proven.
+- `go mod graph`;
+- module checksums;
+- builder/runtime image digests;
+- SBOM;
+- license inventory;
+- `govulncheck`;
+- `go version -m` on the shipped binary; and
+- an explanation of any validation/execution dependency pulled transitively.
 
-Upstream reference:
+No mux, handshake, or hard-fork wire codec is reimplemented from scratch.
 
-- <https://github.com/blinklabs-io/gouroboros/releases/tag/v0.189.1>
+## 6. Direct P2P synchronization
 
-### D-003: Preserve one TypeScript commit coordinator
+### D-003: One Go process speaks the complete required N2N bundle
 
-Decision: accepted for the first proof.
+Accepted.
 
-The TypeScript process remains the sole owner of:
+One TCP bearer multiplexes:
 
-- ClickHouse schema migration;
-- publication/event sequence allocation;
-- facts-first/adoption-last commit ordering;
-- rollback membership/rollback-header ordering;
-- resume-point selection;
-- disk high-water decisions; and
-- BFS snapshot tokens.
+- handshake;
+- KeepAlive;
+- ChainSync client;
+- BlockFetch client; and
+- optional PeerSharing discovery.
 
-The Go helper must never allocate ClickHouse sequence numbers and must never
-write ClickHouse directly in this phase.
+Transaction submission and inbound responder/listener behavior remain
+disabled. The service makes outbound connections only.
 
-The deployed application container contains both the Node runtime and a static
-`clicksync-p2p` helper. No P2P sidecar service or inbound application port is
+For each selected roll-forward:
+
+1. receive and decode the header/point;
+2. request the block body by point or bounded inclusive range;
+3. reject `NoBlocks`, wrong point, wrong network, body/header commitment
+   mismatch, parent discontinuity, or impossible height/slot ordering;
+4. decode the era-specific body in bounded memory;
+5. recompute transaction IDs and relevant content hashes;
+6. normalize accepted facts;
+7. publish facts, then the adoption commit event;
+8. update the committed tip/event metadata;
+9. release all block/transaction CBOR bytes; and
+10. request/acknowledge more work only when the bounded publication window has
+    capacity.
+
+Origin backfill does not issue one BlockFetch request per historical header.
+The source accumulates a bounded sequential header window, requests one
+inclusive BlockFetch range, and streams each returned body through the same
+header/body checks and bounded publication queue. The window flushes when it
+reaches 32 headers or the callback header equals the advertised tip; the
+one-block case is the normal live-tip fallback.
+
+The ChainSync callback that starts a range remains blocked until the expected
+bodies and `BatchDone` arrive. Consequently a subsequent ChainSync rollback
+cannot overtake an in-flight body range. Returned body count, order, points,
+and heights must exactly match the buffered headers; `NoBlocks`, partial,
+extra, reordered, or mismatched batches fail closed. Only a bounded number of
+decoded bodies may wait behind ClickHouse backpressure.
+
+Byron epoch-boundary blocks are part of chain continuity even when they
+contain no transaction facts.
+
+### D-004: Continuous ChainSync is required
+
+Accepted.
+
+The former one-tip probe is not sufficient. Production sync must:
+
+- start at Origin for complete history;
+- continuously request next headers through `Await`;
+- fetch every body selected for the dataset;
+- process live roll-forwards and rollbacks;
+- reconnect classified transport/corroboration unavailability indefinitely
+  with capped exponential backoff, peer rotation, and prompt shutdown
+  cancellation—there is no arbitrary retry-count ceiling or busy loop;
+- resume using ClickHouse-derived intersections;
+- preserve dense recent intersection points plus geometrically spaced
+  historical candidates and Origin;
+- reconcile local committed tip with the peer intersection;
+- handle re-adoption without duplicating visible facts; and
+- run continuously until shutdown or a real dependency/validation failure;
+  test orchestration bounds samples externally and verifies graceful final
+  microbatch publication.
+
+Only deterministic malformed or contradictory protocol data quarantines an
+operator. An unavailable exact range, `NoBlocks`, a short response caused by
+a chain race, DNS/TCP/EOF/timeout failure, or insufficient reachable
+corroborators is availability evidence, not proof of bad data. Clicksync
+rotates/reprobes and retries those conditions indefinitely with a capped time
+backoff and prompt context cancellation; neither repeated identical responses
+nor any attempt count promotes them to permanent quarantine. If a
+deterministic data-integrity quarantine leaves fewer independent operators
+than the configured threshold, Clicksync stops fail-closed. That integrity
+failure is distinct from retryable network unavailability.
+
+An empty recent-tail demonstration may use a two-peer-recognized point, but
+the manifest and every query must show `complete_history=false`. It is never
+called a complete current UTxO set.
+
+#### Restart intersection algorithm
+
+The pinned gOuroboros `Client.Sync` waits for `IntersectFound`, but its public
+return value does not expose the peer-selected point. Passing many candidates
+to `Sync` is therefore insufficient for reconciling the local committed
+branch.
+
+Clicksync uses this exact sequence:
+
+1. load only locally committed/adopted points, newest first, using a dense
+   recent tail plus geometrically spaced older points;
+2. call `Client.GetAvailableBlockRange` with exactly one candidate at a time;
+3. treat `nil` as proof that the input candidate is on the peer's current
+   chain and `chainsync.ErrIntersectNotFound` as rejection;
+4. select the first accepted input candidate, or Origin when none is accepted;
+5. append and commit any required rollback from the local tip through the
+   selected point before publishing new branch facts; and
+6. call `Client.Sync` again with exactly the selected point to begin normal
+   callbacks.
+
+The range helper's returned `start` is deliberately ignored for intersection
+identity. On a non-tip match, gOuroboros internally requests one item and
+returns the first block *after* the intersection; at the exact peer tip it
+returns an empty range with `nil`. During this probe the library diverts that
+first roll-forward away from the configured application callback. The
+subsequent singleton `Sync` performs a new `FindIntersect`, so the probed block
+is fetched and published normally rather than skipped.
+
+Required tests cover an accepted tip, a rejected point, descending candidate
+selection, Origin fallback, zero publication during probing, and a live
+disconnect/reconnect that resumes from the expected stored candidate.
+
+Candidate generation itself is a bounded query path. It uses the committed
+tip plus a bounded recent/event-sequence sample and geometrically older event
+targets, then resolves membership only for those candidate publications. It
+must not sort the hash-ordered `blocks` table by height or materialize the
+global active history. A manifest cache may supply safe hints, but restart
+must still recover when that cache lags a committed adoption/rollback.
+`EXPLAIN`/`read_rows` evidence and a crash-with-stale-descendants fixture are
 required.
 
-### D-004: Use a versioned, backpressured process contract
+Every non-Origin candidate carries its stored block number in Clicksync's
+internal transport contract even though the wire `Point` contains only
+slot/hash. After intersection, the first fetched header must extend that
+height, whether it is a Byron epoch-boundary block (EBB), and every subsequent
+header must extend its predecessor.
 
-Decision: accepted.
+Candidates are probed one at a time and only the selected singleton is passed
+to `FindIntersect` for following. Therefore a valid immediate Byron
+successor/EBB fallback pair is retained even though both points share a slot:
+newest-to-oldest it must be exactly a non-EBB at height `N + 1`, followed by
+an EBB at height `N`. Every other equal-slot pair is rejected. This exception
+is necessary when a partial dataset starts at the EBB: if the committed
+successor is absent from a peer's selected chain, Clicksync must still be able
+to select and reconcile to its exact EBB boundary rather than discard the
+boundary or widen to Origin. Tests prove the pair is never transmitted as a
+multi-point candidate list. Across different slots, equal-height candidates
+are legal only for an EBB followed by its non-EBB predecessor; all other
+equal-height candidate shapes fail closed.
 
-The TypeScript parent spawns `/app/bin/clicksync-p2p`. Standard output is
-protocol-only NDJSON; standard error is bounded structured logging. The parent
-forwards termination signals, waits for child shutdown, and treats an
-unexpected child exit as a source failure. The child exits if the parent pipe
-closes.
+The mainnet rule follows the Intersect consensus/storage specification rather
+than the pinned library's more permissive generic/testnet envelope check:
 
-Every envelope includes:
+- an EBB has the same block number as its predecessor and a strictly later
+  slot;
+- every non-EBB has block number `previous + 1`;
+- slots strictly increase except that a non-EBB immediately following an EBB
+  may share the EBB's slot; and
+- Origin's first block is the only predecessor-free case.
 
-- `schema_version`;
-- `kind`: `ready`, `roll_forward`, `roll_backward`, `heartbeat`, or `fatal`;
-- `session_id`;
-- monotonically increasing `source_seq`;
-- network magic;
-- selected peer and negotiated N2N version;
-- chain point, parent point, and observed tip as applicable; and
-- a normalized UTxO-only payload for roll-forward.
+The EBB identity is derived only from a structurally verified decoded block
+type or its committed stored fact. It is carried durably through external
+start metadata, committed tips, intersection candidates, and exact rollback
+target resolution; it is never guessed from slot/height. Fixtures cover the
+Origin EBB, EBB same-height, EBB-to-main equal/later slot, restart/rollback on
+an EBB, same-slot successor rejection followed by EBB-boundary acceptance,
+and rejection of EBB `+1`, arbitrary height gaps, regular equal height, and
+all other equal-slot candidate/chain transitions. Parent hash and point/body
+hash are independently checked; height is never inferred from slot.
 
-The adapter rejects:
+Constructed blocks at the official epoch-zero point prove only
+publication/manifest logic. Release evidence separately performs
+validation-enabled N2N BlockFetch of the real mainnet epoch-zero EBB and its
+immediate main-block successor (plus the epoch-one transition when available),
+then pins test-only raw hashes and decoded point/height/parent metadata.
+Runtime tables retain none of those block CBOR bytes.
 
-- unknown schema versions or message kinds;
-- the wrong network magic;
-- sequence gaps;
-- a conflicting duplicate key;
-- malformed or oversized lines;
-- invalid binary encodings; and
-- facts whose computed identities disagree with the envelope.
+Primary references:
 
-The child has a small configurable unacknowledged window, initially one to
-eight blocks. TypeScript acknowledges only after ClickHouse publication. OS
-pipe flow control plus the acknowledgement window bounds memory. Restart
-state is reconstructed from ClickHouse, so delivery is at least once.
+- <https://ouroboros-consensus.cardano.intersectmbo.org/pdfs/report.pdf>
+- <https://ouroboros-consensus.cardano.intersectmbo.org/haddocks/ouroboros-consensus/Ouroboros-Consensus-Storage-ImmutableDB-API.html>
 
-NDJSON is accepted initially because Cardano production rate and ClickHouse
-insertion are expected to dominate. If measurement shows serialization/IPC
-above 20% of ingestion CPU, a binary framing format or direct Go writer may be
-proposed in a new decision.
+Origin is appended only for an Origin dataset. An intersection-start
+candidate list terminates at its exact verified external boundary. If every
+candidate down to that boundary is rejected, ingestion stops fail-closed; it
+does not quarantine peers merely for reporting valid negative membership. It
+must never probe/select Origin and silently cross the declared partial-history
+scope.
 
-### D-005: Use independently operated, pinned bootstrap peers
+#### Partial-history start boundary
 
-Decision: accepted.
+A Cardano ChainSync point contains a slot and hash but not its block number;
+Clicksync never substitutes the slot for height. Before creating a new
+intersection-start manifest, it BlockFetches that exact boundary from a
+corroborated peer with structural block validation enabled, verifies the
+returned slot/hash, and persists the decoded block number. Failure to fetch or
+verify the boundary aborts initialization.
 
-Initial mainnet seeds:
+The shipped sample configuration uses the independently corroborated,
+post-van-Rossem/PV11 point
+`193253841:e98663bea810a45b59bf2783e40dbd2c69f79e1594b4cd0e160646a3f587eb13`.
+It is a runnable partial-history example, not a hidden completeness claim.
+The sample contains no user-entered height; Clicksync derives block
+`13715435` through the verified boundary fetch. Complete history is an
+explicit `CLICKSYNC_START=origin` choice with no start point.
+
+Thereafter a rollback target must resolve either to that exact stored boundary
+or to a committed block already present in the dataset. A rollback below or
+outside an intersection-start dataset is quarantined and stops ingestion
+instead of fabricating a height or silently widening/changing the dataset.
+Origin remains the only boundary with null slot/hash/block number.
+
+ChainSync `RollBackward` also supplies only slot/hash. Before completing a
+non-Origin rollback callback or accepting another header, Clicksync performs
+one validation-enabled singleton BlockFetch of that exact target on the
+selected-peer connection. It requires exactly one body with the requested
+slot/hash, derives the block number, and installs a height-bearing parent.
+Fetching the target does not make an unknown rollback permissible: the store
+must still prove that it is the exact external boundary or a locally committed
+point before committing the rollback. A chain-race `NoBlocks`/short response
+causes peer rotation, fresh re-intersection, and indefinite capped-backoff
+retry. Repetition alone never turns availability into a peer-data violation.
+A wrong body, point, order, height, or other deterministic structural mismatch
+does. Origin is the only rollback target that does not require this height
+resolution.
+
+Pinned-source reference:
+<https://github.com/blinklabs-io/gouroboros/blob/v0.189.1/protocol/chainsync/client.go>
+
+### D-005: Peer corroboration and provenance are persisted
+
+Accepted.
+
+Initial documented mainnet seeds:
 
 - `backbone.cardano.iog.io:3001`;
-- `backbone.mainnet.emurgornd.com:3001`;
-- `backbone.mainnet.cardanofoundation.org:3001`.
+- `backbone.mainnet.cardanofoundation.org:3001`;
+- the officially documented EMURGO name, currently unhealthy and therefore
+  not counted until it resolves and passes handshake.
 
-Defaults are copied from dated official topology documentation and are user
-overridable. DNS answers are rotated and health-scored. Runtime PeerSharing may
-provide capacity later, but never supplies identity or trust.
+The 2026-07-23 proof observed the first two operators agreeing over N2N v15;
+the documented EMURGO name returned DNS `NXDOMAIN`.
 
-At least two independently operated peers must recognize stable checkpoints.
-Recent tips and any unexpected/deep rollback require corroboration. Persistent
-disagreement quarantines publication and reports the disagreement; it never
-selects a chain silently.
+Persist narrow peer observations:
 
-This is a trust mitigation, not independent Ouroboros chain selection.
+- peer hostname/resolved address/operator label;
+- negotiated N2N version and network magic;
+- observed tip/checkpoint point and height;
+- observation time;
+- agreement group/checkpoint identifier;
+- selected body source;
+- structural verification result; and
+- disagreement/quarantine reason.
 
-Reference:
+Do not write one provenance row per peer per block during a full backfill
+unless measurement justifies it. Persist stable sampled checkpoints, every
+live rollback, every disputed point, and negative follow/range availability
+diagnostics. A successful reconnect/source selection is not duplicated as a
+`peer_observations` row: each committed block already carries the actual
+source hostname, resolved address, normalized operator label, negotiated N2N
+version, and network magic. Thus source changes remain reconstructable from
+the block stream without a redundant success-diagnostic table path.
 
-- <https://developers.cardano.org/docs/get-started/infrastructure/node/topology/>
+Failure classes are explicit. DNS/TCP/EOF/timeout failures are retryable
+transport failures. Local normalization, publication, storage, and invariant
+failures are terminal. A body-hash failure, wrong point/order/height, extra
+body, wrong network, or impossible protocol message is a peer-data violation:
+persist the exact host/resolved-address/operator evidence, quarantine that
+operator for the run, and continue only if the remaining independent
+operators still meet the configured corroboration threshold. With the
+two-operator default, one quarantine therefore stops ingestion.
 
-### D-006: Support Origin mode and an honest live-proof mode
+Valid negative membership is not malformed data. An operator that rejects an
+exact checkpoint, rollback target, or branch-tip point contributes
+disagreement evidence; that can move branch selection or place the manifest
+in a clamped/disputed state, but it never permanently excludes the operator.
+Only an accepted response whose bytes/shape contradict the requested
+protocol object, or another deterministic protocol/data violation, is
+quarantined.
 
-Decision: accepted.
+`NoBlocks` or a short range can result from a chain change between ChainSync
+and BlockFetch. Record it, rotate/reconnect, re-intersect, and retry
+indefinitely with capped time backoff. Repeated failure for the same exact
+point remains availability evidence and is never an attempt-count quarantine.
+An unclassifiable upstream error fails terminal rather than being silently
+relabeled as a transient transport failure.
 
-Full history:
+### D-006: Unknown or unsupported UTxO semantics fail closed
 
-1. find intersection at Origin;
-2. consume headers in order;
-3. fetch every selected block body in bounded ranges;
-4. normalize and publish in order; and
-5. resume from dense recent plus geometrically spaced historical points.
+Accepted.
 
-Fast live proof:
+Current mainnet Conway, including the van Rossem protocol-version-11 intra-era
+hard fork enacted at slot `192844800` on 2026-07-18, must decode in a live
+post-boundary test. Dijkstra remains a future era as of this decision. A real
+Dijkstra fixture must prove decoding reaches normalization and that nested or
+otherwise unimplemented transaction semantics fail before publication.
+Dijkstra feature completeness is not claimed or required for the current
+mainnet goal. If the selected upstream API cannot expose any new transaction
+form losslessly, Clicksync stops before publishing that block and reports an
+unsupported-era error. It never drops an unknown child transaction and
+continues.
 
-1. obtain a recent candidate point from one official peer;
-2. require a second independently operated peer to recognize the point;
-3. publish blocks after that point; and
-4. mark the dataset incomplete.
+Current-era references:
 
-A second proof may freeze the initially observed tip, stream headers from
-Origin without fetching old bodies, and begin BlockFetch at `tip_height - N`.
-This remains a partial dataset and may take hours because every historical
-header is still traversed.
+- <https://intersectmbo.org/news/cardano-upgrade-van-rossem-hard-fork>
+- <https://docs.cardano.org/about-cardano/evolution/eras-and-phases>
 
-No external REST provider is required to obtain a working point.
+## 7. Exact transaction and UTxO scope
 
-### D-007: Store only ledger-effective UTxO facts
+### 7.1 Transaction identity
 
-Decision: accepted.
+Retain for every transaction occurrence:
 
-For a valid transaction:
+- block publication reference;
+- transaction hash and transaction order;
+- optional parent transaction hash and subtransaction index;
+- era;
+- phase-2 validity;
+- regular/collateral/genesis flow kind;
+- declared fee and ledger-effective fee where distinguishable;
+- effective mint/burn deltas;
+- presence/count summaries for inputs, outputs, withdrawals, redeemers,
+  metadata, and datum observations.
 
-- store regular consumed inputs;
-- store regular produced outputs;
-- store effective mint/burn;
-- ignore collateral inputs, collateral return, and reference inputs.
+Do not retain the full serialized transaction.
 
-For a phase-2-invalid transaction:
+For a phase-2-invalid transaction the effective ADA fee/collateral sink is the
+sum of resolved consumed collateral inputs minus the produced collateral
+return. A positive decoded `total_collateral` value is retained and
+cross-checked, but zero is not treated as proof of a zero fee: the pinned
+decoder represents an absent optional Babbage/Conway field as a non-null zero.
+If any consumed source output is outside a partial-history dataset, Clickout
+reports the sink as unresolved/incomplete instead of inventing a value.
 
-- store consumed collateral inputs only;
-- store collateral return only when the era/body provides it;
-- ignore regular inputs and outputs;
-- ignore mint/burn;
-- ignore reference inputs; and
-- mark the transaction flow as collateral.
+### 7.2 Inputs
 
-The implementation must independently test any upstream `Consumed()` and
-`Produced()` convenience methods rather than assuming their correctness.
-Collateral-return index rules and pre-Babbage behavior require golden vectors.
+Retain every UTxO reference in the transaction body with a role:
 
-### D-008: Datum CBOR is the only retained CBOR
+- regular;
+- collateral; or
+- reference.
 
-Decision: accepted.
+Also retain:
+
+- body ordinal;
+- whether it is ledger-consumed;
+- consuming transaction;
+- containing publication; and
+- whether its referenced output is resolved in this dataset.
+
+Fund traversal uses only `is_consumed=true`. Reference inputs and inactive
+regular/collateral references remain available for dApp context but never
+become value-flow edges.
+
+Valid transaction:
+
+- regular inputs are consumed;
+- collateral/reference inputs are not consumed.
+
+Phase-2-invalid transaction:
+
+- collateral inputs are consumed;
+- regular/reference inputs are not consumed.
+
+### 7.3 Outputs
+
+Retain ledger-produced outputs only:
+
+- UTxO transaction hash/index;
+- containing publication and block height;
+- regular/collateral-return/genesis kind;
+- raw address bytes;
+- lovelace;
+- sorted native-asset policy/name/quantity arrays;
+- datum kind and datum hash;
+- reference-script hash and language when derivable; and
+- no script body.
+
+For a valid transaction, ordinary outputs are produced. For an invalid
+transaction, only its collateral return is produced when present.
+
+### 7.4 Mint and burn
+
+Retain effective non-zero signed native-asset deltas on the transaction:
+
+- policy ID: raw 28 bytes;
+- asset name: raw 0-to-32 bytes;
+- quantity: signed 64-bit, with explicit overflow rejection.
+
+Invalid-transaction mint is not ledger-effective and is marked unapplied or
+omitted from effective deltas. Clickout renders mint as an asset source and
+burn as an asset sink.
+
+### 7.5 Datums
 
 Retain:
 
-- output datum kind: none, hash, or inline;
+- output datum kind: none/hash/inline;
 - datum hash;
-- inline datum body;
-- witness-map datum bodies; and
-- exact datum CBOR, deduplicated by its 32-byte content hash.
+- exact inline datum CBOR fragment;
+- exact witness datum CBOR fragments; and
+- publication-scoped observation provenance.
 
-The helper must extract or preserve the exact datum fragment required to
-recompute the ledger hash. Re-serializing a decoded datum is accepted only
-after golden vectors prove byte/hash equivalence.
+Store one hash-verified body in `datum_bodies` and narrow observations in
+`datum_observations`. A hash-only output may remain unresolved. A verified
+body first seen on an orphan branch may resolve the cryptographic content, but
+Clickout must separately report whether the datum was observed on the selected
+active chain.
 
-A hash-only datum whose body never appears on chain remains unresolved. The
-system must not claim otherwise.
+### 7.6 Withdrawals
 
-Do not retain the surrounding transaction CBOR, scripts, redeemers, or other
-witnesses.
+Retain one row per declared withdrawal:
 
-References:
+- transaction/publication;
+- raw reward-account bytes;
+- lovelace amount;
+- deterministic body ordinal;
+- `is_applied`; and
+- resolved reward credential/script hash when derivable.
 
-- <https://cips.cardano.org/cip/CIP-0032>
-- <https://cips.cardano.org/cip/CIP-0031>
-- <https://cips.cardano.org/cip/CIP-0040>
+Valid transaction withdrawals are applied. Phase-2-invalid transaction
+withdrawals remain transaction context but are not an effective ADA source.
+Clickout emits applied withdrawals as explicit external ADA sources.
 
-### D-009: Seed genesis deterministically
+No reward history, reward calculation, stake snapshots, or delegation state is
+stored.
 
-Decision: accepted; required before a dataset may claim complete history.
+### 7.7 Redeemers and resolved purposes
 
-ChainSync does not emit genesis distributions. Clicksync must:
+Retain every redeemer, including those in phase-2-invalid transactions:
 
-- ship or fetch hash-pinned official Byron and Shelley genesis
-  configurations;
-- verify their configured hashes;
-- synthesize the exact ledger-compatible genesis output references;
-- cover Byron redemption/distribution and Shelley `initialFunds` where used;
-- mark these publications synthetic and permanently canonical; and
-- compare total genesis supply and first-spend references against a trusted
-  reference fixture.
+- transaction/publication;
+- raw purpose tag and normalized purpose;
+- redeemer index;
+- exact redeemer Plutus-Data CBOR fragment;
+- execution-unit memory and steps;
+- `is_applied`;
+- resolution status; and
+- resolved target identity.
 
-A database without these rows is incomplete even if ChainSync began at Origin.
+Resolved targets:
 
-### D-010: Use a compact ClickHouse v2 database
+- spend: source transaction hash/output index;
+- mint: policy ID;
+- reward: withdrawal reward account;
+- certificate: body ordinal plus a purpose-tagged digest of the exact target
+  certificate and any derivable script credential;
+- vote: body ordinal plus the voter constructor/credential identity;
+- proposal: body ordinal plus a purpose-tagged digest of the exact target
+  proposal procedure and any derivable policy script;
+- future purpose: fail closed until explicitly modeled.
 
-Decision: accepted conceptually; physical settings remain subject to measured
-query plans.
+Store the resolved script/credential hash when it can be derived without
+retaining script bytes. Full source-output/address/datum context is joined by
+Clickout through the resolved UTxO reference rather than duplicated in the
+redeemer row. Certificate/proposal target bytes are hashed during
+normalization and then discarded; Clicksync does not persist their raw CBOR or
+governance state.
 
-Create a new v2 database. Do not mutate or drop the existing v1 schema until
-semantic comparison and review pass.
+The Clickout transaction/context response attaches each resolved
+regular/collateral/reference source output from a batched point lookup rather
+than discarding it after setting a boolean. Inline/source datum bodies are
+attached through a bounded batched hash lookup when present; an unresolved
+body or pre-boundary source remains explicit.
 
-Use one database per Cardano network. Store network magic and completeness in
-a small dataset manifest instead of repeating network magic on every fact.
-Store hashes and policy IDs as binary fixed-width values, addresses and asset
-names as raw bytes, and render hex/bech32 only at API boundaries.
+“Resolved” means mapped from the ledger's `(purpose,index)` pointer to its
+actual transaction target. Merely storing the numeric pair is not accepted.
+Resolution follows the ledger ordering for each purpose, not Go map iteration
+or the decoder's incidental wire order. In particular, spend targets use a
+transaction-ID/output-index ordered view of the input set while the separately
+stored input `body_ordinal` remains unchanged. Mint policies, withdrawals,
+voters, certificates, and proposals each receive ordering-oracle fixtures
+whose encoded/map order differs from their ledger pointer order.
 
-The TypeScript HTTP insertion path will accept bounded hex/base64 fields and
-decode them inside ClickHouse (for example with `unhex`) before inserting
-`FixedString`/binary columns. It must not corrupt arbitrary bytes by treating
-them as Unicode text.
+Withdrawal pointers follow `Map AccountAddress` ordering: network, then the
+script-before-key `Credential` constructor order, then credential hash. Raw
+reward-account byte ordering is not equivalent and must not be used.
+
+The voter ordering oracle is the ledger implementation's derived `Ord`:
+`Voter` orders committee, DRep, then stake-pool constructors, while
+`Credential` orders script then key constructors. This deliberately differs
+from the Conway wire tags. Primary references:
+
+- <https://cardano-api.cardano.intersectmbo.org/cardano-api/Cardano-Api-Ledger.html>
+- <https://cardano-ledger.cardano.intersectmbo.org/cardano-ledger-api/Cardano-Ledger-Api-Governance.html>
+
+### 7.8 Transaction metadata
+
+Retain on-chain transaction metadata, not an entire auxiliary-data envelope:
+
+- transaction/publication;
+- sorted top-level metadata labels;
+- exact metadata-map CBOR fragment; and
+- byte length/content hash for integrity and accounting.
+
+Auxiliary scripts are removed before persistence. Clickout may decode the
+metadata fragment for display. No off-chain URL fetch is performed.
+
+Metadata is retained for valid and phase-2-invalid transactions because it is
+part of the observed transaction, with transaction validity still explicit.
+
+### 7.9 Compact Plutus context retained without script bodies
+
+For normal dApp analysis also retain:
+
+- reference input UTxO references;
+- datum hashes/bodies as above;
+- output reference-script hash/language;
+- redeemer purpose target and execution units;
+- transaction validity and fees;
+- native assets/mint; and
+- withdrawals/metadata.
+
+Do not retain:
+
+- validator/minting/native/reference script CBOR;
+- full witness sets;
+- signatures;
+- raw block CBOR;
+- raw transaction CBOR;
+- full auxiliary-data CBOR containing scripts;
+- certificates except the minimal target ordinal needed to resolve a
+  redeemer;
+- governance proposal/vote bodies;
+- stake/reward/pool/epoch/treasury state; or
+- Plutus execution traces.
+
+### D-007: CBOR fragment policy
+
+Accepted.
+
+The only persisted CBOR is content explicitly required by the user:
+
+- datum Plutus Data;
+- redeemer Plutus Data; and
+- the transaction metadata map.
+
+These fragments are not full block/transaction/script CBOR. Each is
+length-bounded and tested. Raw incoming block bytes are never written to disk,
+logs, error evidence, or dead-letter files.
+
+## 8. ClickHouse schema
+
+### D-008: One database and one schema
+
+Accepted.
+
+The implementation destroys/replaces the old schema and uses the configured
+database name `clicksync` by default. There is no generation suffix in
+database, table, directory, CLI, Compose, environment, or type names.
+
+Normal ordered migration files may exist, but they evolve the sole schema.
+There is no compatibility migration from the deleted prototype database.
+Operators re-create the experimental database.
 
 Logical tables:
 
 1. `dataset_manifest`
-   - network magic, network name, schema version, genesis hashes;
-   - `complete_history`, start point, trust mode, source version;
-   - configured budget and high-water state.
-2. `block_publications`
-   - publication sequence, block/parent hashes, slot, block number, era,
-     transaction count, synthetic flag.
-3. `publication_events`
-   - publication sequence, event sequence, active state, optional rollback ID.
+   - network/genesis identity;
+   - trust/completeness/start point;
+   - committed tip/event sequence;
+   - writer/source build identity. Release/evidence images inject the exact
+     frozen source commit or content identifier; the placeholder
+     `development` value is never accepted for a live proof.
+2. `blocks`
+   - immutable block publication identity, point, parent, height, era,
+     transaction count, source peer, synthetic flag.
+3. `chain_events`
+   - append-only block adoption/invalidation events.
 4. `rollbacks`
-   - rollback commit/audit header and peer observations.
-5. `flow_transactions`
-   - publication sequence, transaction hash/order, optional parent/sub-index,
-     regular/collateral/genesis flow kind, effective fee, sorted mint/burn
-     arrays.
-6. `effective_spends`
-   - source UTxO reference, consuming transaction, ordinal, regular/collateral
-     kind, publication sequence.
-7. `effective_outputs`
-   - created UTxO reference, output kind, raw address, lovelace, datum
-     kind/hash, sorted native-asset arrays, publication sequence.
-8. `datums`
-   - datum hash, exact datum CBOR, source kind, last-seen sequence.
+   - rollback commit header, point, depth, peers, reason, writer, time.
+5. `transactions`
+   - compact transaction identity/effect/fee/mint/count fields.
+6. `inputs`
+   - regular/collateral/reference input facts and consumption status.
+7. `outputs`
+   - effective UTxO facts, assets, datum reference, reference-script hash.
+8. `datum_bodies`
+   - one exact body per datum hash.
+9. `datum_observations`
+   - publication/transaction/source-kind provenance.
+10. `withdrawals`
+    - reward accounts, amounts, applied state, credential hash.
+11. `redeemers`
+    - Plutus Data, execution units, applied state, resolved purpose target.
+12. `transaction_metadata`
+    - labels and metadata-map CBOR fragment.
+13. `peer_observations`
+    - checkpoint/source/corroboration/disagreement provenance.
+14. `writer_audit`
+    - current ingestion ownership and heartbeat metadata.
 
-No forbidden broad-data column may exist.
+Physical principles:
 
-Hashes use `FixedString(32)`, policy IDs `FixedString(28)`, quantities use
-unsigned 64-bit output values and signed 64-bit mint deltas, and asset names
-remain raw 0-to-32-byte strings. Empty asset names are legal. Parallel asset
-arrays must have identical lengths, deterministic `(policy,name)` ordering, no
-ADA entry, and no zero quantity.
+- one database per network;
+- raw `FixedString` hashes/policy IDs through the native Go driver;
+- raw address/reward-account/asset-name/CBOR bytes as binary `String`;
+- no hex doubling in storage;
+- sorted parallel asset/mint arrays with equal-length constraints;
+- coarse sealed block-height partitions;
+- primary ordering for block, transaction, source-UTxO, producing-transaction,
+  datum-hash, and transaction-metadata access;
+- dual input-edge access: the base `inputs` order serves
+  `(source_tx_hash, source_output_index)` spender lookup, while a measured
+  lightweight projection ordered by `(tx_hash, publication_id, body_ordinal)`
+  serves consuming-transaction context and reverse BFS;
+- measured projections only after `EXPLAIN indexes=1`;
+- ZSTD codecs on variable payloads;
+- no LowCardinality on high-cardinality hashes/addresses;
+- no input-by-output Cartesian edge table; and
+- no global `FINAL` query as the normal point/BFS path.
 
-Primary access:
+## 9. Publication, rollback, and writer safety
 
-- outputs by `(tx_hash, output_index)`;
-- spends by `(source_tx_hash, source_output_index)`;
-- transactions by `tx_hash`;
-- reverse spend lookup by `spending_tx_hash`;
-- address history by exact raw address; and
-- datums by datum hash.
+### D-009: Facts first, adoption last
 
-ClickHouse 26.3 lightweight `_part_offset` projections may be used for
-address-fingerprint and reverse-spender access only after `EXPLAIN indexes=1`
-and measured scan counts prove their use. Fingerprints are prefilters; exact
-binary equality is always required to eliminate collision errors.
+Accepted.
 
-Do not materialize input-by-output edges. Do not explode every output asset
-into a separate hot-table row in v2. A separate cold asset index may be
-proposed later if measured global asset search requires it.
+Logical publication remains one immutable fact bundle and one ordered event
+per block. Physical ClickHouse insertion uses bounded multi-block
+microbatches; emitting roughly ten independent parts per historical block is
+not a viable Origin backfill.
 
-### D-011: Preserve append-only, crash-safe publication
+For one microbatch:
 
-Decision: accepted.
+1. normalize sequential blocks and reserve one publication/event identity for
+   each under the writer lock;
+2. resolve sources against the committed snapshot and all earlier staged
+   outputs, using candidate-scoped publication membership rather than a
+   whole-history active-set scan;
+3. cap staged normalized bytes, fact rows, block count, and wall-clock age;
+4. insert each fact table once for all staged publication IDs;
+5. validate exact per-publication row counts/content digests;
+6. insert the ordered adoption rows in one final ClickHouse insert;
+7. read back the complete expected event set after any lost insert response
+   and fail fatally on a partial/conflicting set;
+8. update the manifest cache to the last committed event; and
+9. release the normalized batch and continue ChainSync.
 
-Facts for one immutable publication are inserted before its active adoption
-event. Without that final event the facts are invisible.
+Initial safe caps are at most 256 blocks, 32 MiB of normalized variable
+payload, and one second of batch age. A lower row/byte cap wins. The
+implementation may lower these values from measured memory/server limits but
+may not make any dimension unbounded.
 
-A rollback:
+Staging maintains row and encoded-byte counters incrementally; it does not
+re-encode the entire growing batch for every incoming block. Each normalized
+item is sized once, while `PublishBatch` retains one whole-batch defensive
+check. Rollback-prefix retention recomputes counters only for the retained
+prefix. This keeps batching work linear rather than quadratic at the 256-block
+or 32-MiB boundary.
 
-1. resolves active descendants at one captured sequence;
-2. appends inactive membership events carrying one rollback ID; and
-3. inserts the rollback header last as the commit marker.
+At the live tip, the age timer flushes a short batch. Backpressure stops
+accepting more decoded bodies when a batch is full or being written. A clean
+shutdown flushes only a fully verified pending prefix; an abrupt exit loses
+only uncommitted memory and the peer replays it from the ClickHouse-derived
+intersection.
 
-Rollback membership without its header is inert. A later re-adoption appends a
-newer active event.
+If ChainSync rolls back into a pending batch, staged descendants are discarded
+and the retained prefix is reconciled before new-branch blocks are accepted.
+If it rolls back at or below the committed tip, all pending descendants are
+discarded before the append-only committed rollback is processed. A pending
+block is never exposed through the manifest or Clickout.
 
-An already complete publication may be reused on re-adoption. A genuinely
-incomplete attempt may be retried as a new invisible publication. Orphan and
-incomplete bytes are monitored and bounded; they may never be deleted by
-frequent mutations or manual part removal. Sealed-partition rebuilding is an
-offline, separately reviewed maintenance operation.
+When the exact rollback target is already the authoritative committed tip,
+there are no active descendants to invalidate. Clicksync still appends a
+corroborated depth-zero rollback header, with `old_tip = rollback_to =`
+the current tip, after discarding the pending batch. This records the observed
+rollback instead of falsely acknowledging an unrecorded event. Empty
+descendants are rejected for every non-exact, unknown, or inactive target.
 
-Every multi-query traversal captures one `snapshot_event_seq` and applies it
-to every frontier layer and page. A traversal must observe either side of a
-rollback, never a mixture.
+A flush may make an earlier staged prefix authoritative while the current
+callback remains unaccepted or a subsequent rollback-header insert fails.
+The handler must return that exact committed prefix and its typed tail even
+with the terminal error; the supervisor counts/corroborates it but does not
+acknowledge the unaccepted callback or rollback. A successful rollback that
+first publishes a retained pending prefix reports both the committed block
+prefix and the separately authoritative rollback action. Fault tests cover
+adoption committed plus rollback pre-commit failure as well as the fully
+successful two-commit path.
 
-### D-012: Retain mint/burn and fee boundaries, but not non-UTxO state
+Facts without an adoption event are invisible. The selected implementation
+always allocates a fresh immutable publication for a retried or re-adopted
+block; it does not try to prove and reactivate an older bundle. The older
+publication remains inactive, so Clickout sees exactly one active copy. This
+costs a small amount of append-only storage on an actual fork but removes a
+complex bundle-reuse decision from the commit path.
 
-Decision: accepted.
+Allocation after startup is based on the maximum identity present in all raw
+fact/event tables, including uncommitted attempts, not only the manifest or
+largest committed snapshot. A retry must not reuse an orphan
+`publication_id`, `event_seq`, or rollback ID. This prevents a later commit
+record from accidentally making rows from an interrupted attempt visible.
 
-Native-asset mint and burn deltas are stored as sorted parallel arrays on the
-minimal transaction row, because otherwise asset traversal fabricates sources
-and sinks. A separate mint table is not initially justified.
+Content-addressed datum bodies are the exception to branch visibility, not to
+integrity. The single writer verifies hash, length, and byte equality before
+deduplicating a body already present. Physical duplicate rows after a crash
+must be query-equivalent, and `first_publication_id`/`first_seen_at` are read
+with minimum/`argMin` semantics; a `ReplacingMergeTree` version column must not
+be claimed to preserve the smallest first-seen value.
 
-Store the effective fee because it is a compact, useful ADA sink:
+### D-010: Rollback is append-only and committed by its header
 
-- valid transaction: declared fee;
-- invalid transaction: ledger-effective collateral fee.
+Accepted.
 
-ADA withdrawals, deposits/refunds, treasury effects, donations, and similar
-non-UTxO state are intentionally outside scope. Consequently, Clicksync does
-not claim total ADA conservation. If source values are locally resolvable, it
-may report:
+For a rollback:
+
+1. capture the latest committed event snapshot;
+2. resolve exact active descendants server-side;
+3. enforce configured depth and corroboration policy;
+4. insert inactive membership events with one rollback ID;
+5. insert the rollback header last;
+6. update the committed tip; and
+7. resume intersection/fetch.
+
+Membership rows without the header are inert. Clicksync has no disk
+high-water publication pause; rollback processing and fact publication use
+the same unbounded runtime policy.
+
+For the exact-tip depth-zero case, step 4 emits no membership rows, while the
+header remains the authoritative append-only event and advances the snapshot
+and manifest without changing the tip. Lost-response readback, restart
+reconciliation, Origin/partial-boundary handling, and Clickout snapshot logic
+must treat this as a real rollback event with no membership delta.
+
+Re-adoption publishes a fresh fact bundle and appends its newer active event;
+the previously invalidated publication stays inactive. A rolled-back spend
+disappears and therefore resurrects its source UTxO.
+
+### D-011: Enforced single-host writer gate
+
+Accepted after proving that a MergeTree row cannot provide atomic
+compare-and-swap or fencing.
+
+The supported deployment is explicitly single-host/single-writer. Clicksync
+holds an operating-system advisory `flock` for its entire process lifetime on
+a small shared `clicksync-state` volume. Compose mounts the same lock path into
+every supported writer and declares exactly one replica. The `writer_audit`
+ClickHouse table is audit/heartbeat state only; documentation and code must
+never claim it provides the lock.
+
+The implementation must prove:
+
+- two simultaneous processes sharing the state volume cannot both acquire;
+- the loser fails before allocating a sequence or writing a fact;
+- owner/build/start/heartbeat are visible in ClickHouse;
+- graceful exit releases the lock;
+- process death releases the lock automatically;
+- restart acquires without a manual stale takeover; and
+- lock-path/configuration errors fail closed.
+
+Multi-host or separately mounted writer instances are unsupported. They must
+not be enabled by a flag that pretends to be safe. A future multi-host design
+requires a real external coordinator with fencing, such as a correctly
+configured Keeper/etcd deployment, and a new reviewed decision.
+
+### D-012: Snapshot semantics
+
+Accepted.
+
+The authoritative snapshot is the largest committed adoption/rollback event,
+not the largest allocated number. Manifest state is a cache and is reconciled
+against committed events after restart.
+
+Every Clickout traversal captures one snapshot and threads it through every
+frontier/page. It observes one side of a rollback only.
+
+Two independently bounded physical access paths are required:
+
+1. publication membership by `(publication_id, event_seq)` for a supplied
+   candidate publication set; and
+2. committed event order by `event_seq` for acquiring or validating a
+   snapshot.
+
+The first remains the base `chain_events` ordering. The implementation may
+serve the second with a compact `event_seq`-ordered projection only if
+`EXPLAIN indexes=1` and `system.query_log.read_rows` prove that ClickHouse
+actually selects it. If that proof fails, publication changes to an explicit
+event-sequence-ordered adoption-header table: fact and membership rows are
+inserted first, the adoption header is the commit record inserted last, and
+rollback headers retain the same last-write rule. A manifest-only answer is
+not acceptable because it can lag or be lost after a committed insert.
+
+Snapshot correctness must not require materializing the active state of every
+historical publication for each point query. Point, transaction, and BFS
+paths first use fact-table order keys to obtain a bounded set of candidate
+publication IDs, then resolve committed membership only for those IDs at the
+pinned snapshot. Frontier membership checks are batched. The corresponding
+`chain_events` access is ordered by `(publication_id, event_seq)`.
+
+A global `GROUP BY publication_id` over the whole chain history is permitted
+for offline audit/reconciliation only, never as the normal Clickout point/BFS
+or writer input-resolution path. `EXPLAIN indexes=1` and query `read_rows`
+evidence must show that increasing unrelated chain history does not make a
+one-UTxO lookup scan that history. The same unrelated-history scale test
+applies to snapshot acquisition and pinned-event validation.
+
+## 10. Genesis
+
+### D-013: Complete history requires deterministic genesis outputs
+
+Accepted.
+
+ChainSync does not emit genesis distributions. Origin mode must:
+
+- use bundled, hash-pinned official Byron/Shelley genesis files rather than
+  fetching mutable configuration during normal sync;
+- verify configured hashes;
+- synthesize ledger-compatible genesis transaction/output references;
+- cover Byron distribution/redemption and Shelley `initialFunds` where used;
+- mark genesis facts synthetic and permanently active; and
+- match trusted first-spend and total-supply fixtures.
+
+Without this, the manifest remains `complete_history=false`.
+
+The pinned mainnet identity and fixture invariants are:
+
+| Item | Required value |
+|---|---|
+| network magic | `764824073` |
+| official Byron semantic genesis ID | `5f20df933584822601f9e3f8c024eb5eb252fe8cefb24d1317dc3d432e940ebb` |
+| exact downloaded Byron JSON BLAKE2b-256 | `dbbdaeab0ea4ea58225892d8b1294f178b417f4a9d1ed3bbf629c40d8f74e86b` |
+| Byron AVVM entries | `14,505` |
+| Byron non-AVVM entries | `0` |
+| Byron seeded supply | `31,112,484,745,000,000` lovelace |
+| official/raw Shelley genesis ID | `1a3be38bcbb7911969283716ad7aa550250226b76a61fc51cc9a9a35d9276d81` |
+| Shelley `initialFunds` entries/supply | `0` / `0` lovelace |
+| Shelley maximum supply | `45,000,000,000,000,000` lovelace |
+
+The shipped configuration is mainnet-only. It fails closed unless the network
+name/magic and all four semantic/raw genesis identities match this tuple.
+Supporting another network later requires a complete, separately pinned
+genesis tuple and fixtures; changing only `CARDANO_NETWORK_MAGIC` is never
+enough.
+
+The Byron ID in the official node configuration is a semantic/canonical
+genesis identifier; it is not the hash of the downloaded JSON byte stream.
+Clicksync records both identities and must not compare the raw-file digest to
+the semantic ID. Shelley happens to have equal official and raw-file values;
+the code still treats their meanings separately.
+
+Each genesis UTxO uses the ledger-compatible reference
+`BLAKE2b-256(address_bytes)#0`. Map iteration order is normalized before
+publication so the synthetic fact digest is deterministic. A successful
+Origin seed is idempotent: restart either proves the complete committed
+synthetic bundle identical or fails closed. It never creates a second visible
+genesis distribution.
+
+Primary references:
+
+- <https://book.world.dev.cardano.org/environments/mainnet/config.json>
+- <https://book.world.dev.cardano.org/environments/mainnet/byron-genesis.json>
+- <https://book.world.dev.cardano.org/environments/mainnet/shelley-genesis.json>
+- <https://github.com/blinklabs-io/gouroboros/blob/v0.189.1/ledger/byron/genesis.go>
+- <https://github.com/blinklabs-io/gouroboros/blob/v0.189.1/ledger/shelley/genesis.go>
+
+## 11. Storage behavior and host safety
+
+### D-014: The 100 GB allocation is a soft planning target
+
+Accepted by explicit user correction on 2026-07-23.
+
+The production contract is storage-unbounded. Clicksync contains none of the
+following:
+
+- a project-size, active-data, part-count, or free-space threshold;
+- a warning/pause/emergency-reserve state machine;
+- an application filesystem walker or disk-budget monitor;
+- quota/LVM/filesystem setup;
+- a pre- or post-publication capacity gate;
+- manifest columns that pretend capacity enforcement exists; or
+- a default stop condition based on estimated full-history size.
+
+No compatibility flags or dormant schema fields retain the deleted behavior.
+Clicksync keeps fetching and publishing until it is shut down or an actual
+fail-closed correctness or non-recoverable ClickHouse error occurs. Transient
+peer transport and corroboration unavailability retry indefinitely with capped
+backoff and context cancellation. If ClickHouse reports a real write failure,
+Clicksync fails without acknowledging the affected publication; it never drops
+facts to save space.
+
+The 100 GB supplied for this workspace is only an experimental resource
+target. The acceptance harness polls committed state and sends `SIGTERM` after
+collecting a useful sample so it does not consume the workspace gratuitously;
+Clicksync itself has no cumulative block, tip, time, or storage stop. Graceful
+shutdown must publish the final valid staged prefix before exit.
+
+Capacity controls, if an operator wants them, belong outside Clicksync (for
+example, a volume selected by the operator). Clicksync neither creates nor
+requires such controls. Documentation may report sizing observations and
+recommend provisioning; it must not describe those recommendations as
+runtime enforcement.
+
+Raw block and transaction CBOR still have zero disk retention because they are
+outside the data model, not because of a capacity gate. Logs redact secrets
+and payloads. Ordinary ClickHouse/log retention settings may prevent
+diagnostic logs from growing needlessly, but they must not prune canonical
+UTxO, datum, withdrawal, redeemer, or metadata facts.
+
+### D-015: Full-mainnet size is observed, never gated
+
+Accepted.
+
+The added metadata/redeemer/reference-input scope makes the final footprint
+uncertain. The acceptance work therefore ingests stratified era/activity
+samples and a contiguous recent range. After merges settle, evidence reports:
+
+- rows and bytes per table/column;
+- datum/redeemer/metadata payload distributions;
+- asset arrays;
+- indexes/projections;
+- part counts and merge behavior;
+- insert calls, created parts, and blocks/transactions per microbatch;
+- ChainSync headers, BlockFetch ranges/bodies, range fill ratio, and source
+  throughput;
+- logs/temp space; and
+- observed bytes per block/transaction/input/output.
+
+Those measurements answer the operator's system-requirement question and show
+how far a particular 100 GB workspace is likely to go. They do not authorize,
+pause, or prevent synchronization. If a statistically responsible
+full-history projection cannot be produced from the bounded evidence, the
+documentation says so rather than inventing a fit claim.
+
+### D-016: Shared Docker host isolation
+
+Accepted.
+
+- unique explicit Compose project/network/volume/container labels;
+- ClickHouse bound to a nonconflicting localhost port or internal-only;
+- no inbound Cardano listener;
+- no shipped CPU, memory, PID, storage, or runtime quota; measured resource
+  recommendations are documentation, and any operator-selected deployment
+  controls remain external to Clicksync;
+- bounded diagnostic-log rotation, which never removes canonical analytics
+  facts;
+- no experimental infinite restart loop;
+- no Docker prune/global cleanup/unrelated resource changes;
+- pre/post unrelated-container ID/status/restart fingerprint; and
+- only explicitly owned resources may be stopped or removed.
+
+## 12. Independent Clickout analysis module
+
+### D-017: Clicksync contains no analytical queries
+
+Accepted.
+
+The ingestion binary offers only operational commands such as:
 
 ```text
-sum(effective inputs) - sum(effective outputs) - fee
+clicksync migrate
+clicksync sync
+clicksync status
+clicksync peers
+clicksync writer
 ```
 
-as `excluded_non_utxo_ledger_delta`. It must not label that gap unexplained
-loss or infer governance/staking details.
+It does not expose `trace`, `utxo`, `address`, analytical SQL, or BFS code.
 
-### D-013: BFS is bounded, snapshot-pinned, and application-driven
+### D-018: Clickout performs bounded graph traversal
 
-Decision: accepted for the first version.
+Accepted.
 
-Commands:
+Independent commands:
 
 ```text
-clicksync utxo TX_HASH#INDEX [--at tip|BLOCK_HASH]
-clicksync address ADDRESS [--state current|history] [--limit N] [--cursor C]
-clicksync tx TX_HASH
-clicksync trace --direction forward|reverse \
+clickout utxo TX_HASH#INDEX [--at tip|BLOCK_HASH]
+clickout tx TX_HASH
+clickout address ADDRESS --state current|history [--limit N] [--cursor C]
+clickout datum DATUM_HASH
+clickout redeemers TX_HASH
+clickout metadata TX_HASH
+clickout withdrawals TX_HASH
+clickout trace --direction forward|reverse \
   (--utxo TX_HASH#INDEX|--tx TX_HASH|--address ADDRESS) \
   --max-depth N --max-nodes N [--asset ada|POLICY.NAME] --format jsonl
 ```
 
-Forward layer:
+Exact graph:
 
 ```text
-frontier UTxOs -> active effective spends -> consuming transactions
-               -> active effective outputs
+UTxO -> consuming transaction -> effective produced UTxOs
 ```
 
-Reverse layer:
+Reverse uses:
 
 ```text
-frontier UTxOs -> their creating transactions
-               -> active effective spends consumed by those transactions
+UTxO -> producing transaction -> effective consumed UTxOs
 ```
 
-Initial defaults:
+It never materializes or claims exact input-to-output allocation. Multi-input/
+multi-output transactions are hyperedges. Optional poison/FIFO/proportional
+models require explicit heuristic names.
 
-- maximum depth: 4;
-- maximum visited nodes: 10,000;
-- maximum seed outputs: 1,000;
-- maximum frontier batch: 10,000;
-- per-layer query time: 30 seconds.
+The node budget is request-global. Its known-UTxO set begins with every seed
+and grows with every hydrated input source and produced output reference,
+whether or not that reference points in the traversal direction. A hyperedge
+is admitted atomically only when its entire new-node union and the edge itself
+fit the remaining budgets. The repository repeats this check independently,
+and the application rejects an over-budget or unrelated repository result.
+An edge `a -> b` therefore fits a two-node budget and emits nothing under a
+one-node budget; it is never partially rendered.
 
-Hard MVP caps:
+Transaction and hyperedge hydration use one exact decoder under the same
+snapshot lease. It validates the persisted header counts against complete
+role-local input ordinal sets, output indexes/ordinals, withdrawals,
+redeemers, datum observations, and metadata presence. It also revalidates
+regular versus phase-2-invalid collateral flow, consumed flags, output kinds,
+fee/mint application, withdrawal/redeemer application, and resolved redeemer
+targets. A transaction response includes withdrawals, resolved redeemers,
+metadata-map CBOR, and datum context. A fund-flow hyperedge includes the
+compact transaction/Plutus context but treats only applied withdrawals as ADA
+sources.
+
+Defaults:
+
+- depth: 4;
+- known UTxOs: 10,000;
+- address seed page: 1,000;
+- frontier batch: 10,000;
+- per-layer time: 30 seconds.
+
+Hard demonstration caps:
 
 - depth: 32;
 - nodes: 100,000.
 
-Maintain visited UTxO and transaction sets, stream JSONL results, and return
-the snapshot token, `truncated` state, reason, and continuation frontier.
-Address seeds always require explicit current/history semantics and pagination.
-High-fanout/exchange addresses cannot expand without the same bounds.
+Every response includes:
 
-ClickHouse recursive CTEs may be benchmarked later, but are not required for
-correctness or the first proof.
+- snapshot event;
+- dataset completeness/trust mode;
+- truncation state/reason;
+- continuation frontier when bounded;
+- unresolved partial-history inputs; and
+- peer-observed disclaimer.
 
-### D-014: Treat 100 GiB as a hard operational budget
+Applied withdrawals are external ADA sources; fees are sinks; mint/burn are
+native-asset source/sink events. Unstored deposits/refunds/treasury effects are
+reported as excluded non-UTxO deltas, not invented flow.
 
-Decision: accepted.
+Because Clickout exposes address history and address-seeded tracing, address
+lookup is not allowed to remain a full output-history scan. A compact
+hash/offset projection may narrow candidates, but raw address bytes still
+perform the exact collision check. `EXPLAIN` and scaled `read_rows` must prove
+the access path, and the evidence reports its settled byte cost. If the access
+path is not demonstrably bounded by matching rows, the address seed/command is
+removed from the release surface rather than described as fast; UTxO and
+transaction seeds remain exact.
 
-Budget:
+### D-019: Clickout derives every snapshot from the append-only authority
 
-- 70 GiB: active ClickHouse data, including projections;
-- 20 GiB: ClickHouse merge/temp/free-space reserve;
-- 5 GiB: bounded logs, manifests, and zero-retention staging;
-- 5 GiB: emergency headroom.
+Accepted.
 
-Warn at 60 GiB. Pause new publication before active data reaches 70 GiB or
-total project footprint threatens the reserve. Never prune canonical flow or
-datum history automatically.
+Clickout is an independent schema consumer, but independence does not mean
+guessing authority from raw table maxima. It must not treat `max(event_seq)`,
+`argMax`, an unvalidated row count, or the newest fact publication as a
+committed snapshot. A raw fact or membership row may exist before its
+authorizing manifest transition, and rollback invalidations deliberately
+precede the rollback header and final manifest transition.
 
-The current host has approximately 226 GiB physically free but the project is
-authorized to use no more than 100 GiB. The host filesystem itself does not
-currently expose a project quota and noninteractive administrative mounting is
-unavailable. Therefore:
+The consumer therefore owns an independent implementation of the current
+schema descriptor, manifest canonical payload, row-digest verification, and
+evidence-set commitment. Producer and consumer parity is proved with one
+shared set of five generated golden states:
 
-- the first bounded proof uses application and ClickHouse high-water checks;
-- full mainnet is a no-go until either a dedicated capped filesystem/LV is
-  supplied or an equivalent independently tested hard quota exists;
-- ClickHouse `system.parts`, `system.parts_columns`, `system.disks`, settled
-  merge state, and `du -x` are measured;
-- logs have size/retention limits;
-- inserts are large enough to avoid excessive part/inode counts; and
-- no per-block files are written.
+- official synthetic genesis;
+- a sampled current-evidence head;
+- a pending evidence reservation;
+- a pending rollback; and
+- a finalized rollback.
 
-The application stops cleanly at the gate. It does not treat the 226 GiB host
-free space as authorization to continue.
+The root producer generates each state through its production canonicalization
+and digest functions. Clickout decodes the same wire values through its own
+types and independently recomputes the payload/digest. Mutation tests must
+fail on either side. This is a conformance oracle, not a second runtime module
+dependency: `clickout/go.mod` has no root import or `replace`.
 
-### D-015: Full-mainnet fit is a measured gate, not a promise
+For one authority load, Clickout:
 
-Decision: accepted.
+1. reads the latest manifest revision and its predecessor with a bounded
+   physical-replay sentinel;
+2. accepts at most eight byte-equivalent physical replays of a logical row,
+   rejects the ninth or any conflict, verifies the canonical row digest, and
+   verifies the predecessor digest plus immutable dataset identity;
+3. independently reads, groups, and hashes the exact current and last-agreed
+   evidence rows, including reserved-but-not-yet-written evidence crash cuts;
+4. binds the manifest trust status, check/group/attempt, checked point,
+   threshold, confirmed/disagreement outcome, and evidence prefix to those
+   rows;
+5. validates the exact current physical adoption or rollback artifact;
+6. validates any pending rollback reservation and its permitted crash cut;
+7. rejects every unreserved rollback header or invalidation, including an
+   artifact hidden in an allocator gap; and
+8. reloads the manifest head, retrying the whole read if either revision or
+   row digest changed while validation was in progress.
 
-Before full backfill, ingest stratified samples:
+Only an error observed against the same stable manifest head is returned as
+corruption. A concurrent valid writer transition causes a retry, not a false
+failure.
 
-- Byron;
-- Shelley/Allegra;
-- Mary and an asset/NFT-heavy range;
-- Alonzo;
-- Babbage;
-- Conway/current era; and
-- at least one contiguous, recent, high-activity range.
+Physical rollback validation follows the producer's append-only protocol but
+does not copy a runtime magic number into the schema consumer:
 
-After merges settle, record row counts, compressed/uncompressed bytes per table
-and column, projection bytes, parts, inodes, and query scan metrics. Fit bytes
-per block, transaction, input, output, asset, and datum byte, then extrapolate
-with at least 30% confidence/growth margin.
+- a rollback event is strictly greater than its old physical event; allocator
+  gaps are legal, so `event = old_event + 1` is not required;
+- the full persisted `UInt32` depth is accepted; there is no Clickout
+  hard-coded 2,160-depth authority cap;
+- parent-chain, membership, and invalidation rows are streamed with stable
+  keyset pagination and fixed per-query sentinels, never one
+  `depth * replay_limit` query and never `OFFSET`;
+- every walked publication has exactly one logical adoption followed by at
+  most one committed logical invalidation, with at most eight identical
+  physical replays per logical artifact;
+- nonzero depth walks the chain from the exact old active tip to the exact
+  target, with distinct nonzero publication identities, an exact first old
+  tip, and an exact descendant count;
+- depth zero requires old tip and target to be the same and requires no
+  invalidation rows;
+- Origin and a configured partial-history start are terminal boundaries, not
+  fabricated block facts; and
+- every invalidation must match the descendant point, rollback/event/writer
+  identity, and UTC-microcanonical recorded instant exactly.
 
-Full mainnet may start only if the conservative projection is at or below
-70 GiB active data. If it exceeds the gate, report the measured required
-capacity and renegotiate storage or scope. Do not weaken correctness or delete
-history to force a pass.
+A pending `reserved` rollback permits either no invalidations or the complete
+exact invalidation set. The latter is the real crash cut after the atomic batch
+insert but before the manifest stage marker. It never permits a partial set or
+a rollback header. `invalidations_written` requires the complete exact set and
+permits the exact rollback header to be either absent or present. A finalized
+rollback requires the exact header and set. Pending-event adoptions, later
+adoptions, same-event adoption/rollback collisions, and artifacts in
+`(Physical, Pending)` or after the authority barrier fail closed. More
+precisely, while a rollback is pending, every adoption after `Physical` is
+invalid: the sole writer captured that raw physical snapshot before reserving
+the rollback, so an intervening committed adoption would have changed the
+reservation's old-physical anchor. Without a pending rollback, an adoption
+after `Physical` may simply be the normal facts/adoption-before-manifest crash
+cut and is ignored until the manifest authorizes it.
 
-### D-016: Isolate experiments from the shared Docker host
+An accepted request pins:
 
-Decision: accepted.
+- dataset ID and the exact current schema-contract hash;
+- network magic/name and all pinned genesis identities;
+- visibility generation;
+- the selected effective event and point; and
+- the exact adoption event/publication pair used as its fact watermark.
 
-The host already runs unrelated containers. The implementation must:
+For a rollback snapshot, the fact watermark may identify an adoption that is
+inactive after the rollback. That is intentional: the watermark bounds facts,
+while event membership decides visibility. `--at BLOCK_HASH` may select only a
+publication that is active under the authoritative effective head and whose
+adoption event is no later than that head; it never selects a raw maximum.
 
-- use a unique explicit Compose project name, network, volume/bind path, port,
-  and labels;
-- bind ClickHouse administration to a nonconflicting localhost port or keep it
-  internal;
-- expose no P2P listener; all peer traffic is outbound;
-- set CPU, memory, PID, and JSON-log size limits;
-- avoid an experimental infinite restart loop;
-- record the existing-container baseline and verify it remains unchanged;
-- never run Docker prune, global cleanup, or delete unrelated volumes/images;
-  and
-- stop only its own explicitly named project resources.
+The request lease is checked again before returning. Ordinary adoption and
+manifest-revision progress is allowed, but dataset/schema/network identity and
+visibility generation must be unchanged, the effective authority must not
+move behind the pin, and the pinned adoption-to-watermark mapping must remain
+exact. Otherwise Clickout returns a typed unavailable/stale-snapshot error
+rather than mixing views.
 
-### D-017: Establish an audit boundary before code changes
+There is one current cursor encoding only. It has no version or `v` field and
+no legacy/fallback decoder. Its checksum covers the dataset ID, schema hash,
+network identity, visibility generation, effective event/point, exact fact
+watermark, query scope, and last physical key. A cursor from a different
+dataset, schema, network, rollback generation, or query scope is rejected.
 
-Decision: accepted.
+## 13. Required tests
 
-The workspace currently has no `.git` directory. Before implementation, the
-delegated lead will:
+### 13.1 Wire and peer tests
 
-1. inspect `.gitignore` for secrets and runtime data;
-2. initialize a local-only Git repository;
-3. record the untouched baseline in a baseline commit; and
-4. make staged implementation commits or otherwise preserve reviewable diffs.
-
-No remote push or publication is authorized.
-
-## 5. Required validation matrix
-
-### Protocol and peer behavior
-
-- correct and incorrect network magic;
-- accepted/refused N2N versions, including live v15 when available;
-- Origin intersection;
-- Byron main headers and EBBs;
-- BlockFetch single and bounded inclusive ranges;
-- `NoBlocks`, timeout, disconnect, DNS rotation, and failover;
-- slow-peer backpressure;
-- conflicting peers and quarantine;
+- correct/wrong magic;
+- v15 negotiation and refusal;
+- Origin and stored-point intersection;
+- verified partial-history boundary BlockFetch, exact-boundary rollback, and
+  below-boundary rejection;
+- continuous `RequestNext`/`Await`;
+- Byron main block and EBB;
+- single/range BlockFetch, exact streamed range order/count, tip flush, and
+  `NoBlocks`;
+- bounded range backpressure and no rollback overtaking an in-flight range;
+- timeouts, disconnect, DNS rotation, peer failover;
+- primary/secondary agreement and disagreement quarantine;
 - moving tip;
-- rollback, deep rollback, and rollback-to-Origin;
-- malformed/oversized CBOR; and
-- body/header/parent mismatch.
+- live rollback and re-adoption;
+- restart from ClickHouse intersection;
+- malformed/oversized CBOR;
+- body/header/parent/height mismatch; and
+- bounded backpressure.
 
-### Era and ledger-effective normalization
+### 13.2 Era and normalization tests
 
 - deterministic genesis and first spends;
-- Byron output/spend;
-- Shelley and Allegra ADA flows;
-- Mary assets plus mint and burn;
-- Alonzo valid and invalid phase-2 transactions;
-- Babbage inline datum, witness datum, hash-only datum, ignored reference input,
-  omitted reference script, collateral, and collateral return;
-- Conway transaction containing governance data while storing only its UTxO
-  effects;
-- current Dijkstra top-level/nested transaction behavior;
-- empty and 32-byte asset names;
-- maximum unsigned quantities and signed mint boundaries; and
-- unknown future era fails closed.
+- Byron, Shelley, Allegra;
+- Mary assets/mint/burn;
+- Alonzo valid and phase-2-invalid collateral;
+- Babbage collateral return, inline/witness/hash datum, reference input, and
+  reference-script hash without body;
+- Conway dApp transactions, including a post-van-Rossem/PV11 live block,
+  while excluding governance bodies;
+- a real future Dijkstra block whose unsupported nested semantics fail closed
+  before publication;
+- valid/invalid withdrawals;
+- spend/mint/reward/cert/vote/proposal redeemer resolution;
+- exact redeemer data and execution units;
+- metadata labels/types/large integers/bytes/nested maps/lists;
+- auxiliary scripts stripped from metadata storage;
+- empty/max-length asset names and integer boundaries; and
+- unknown future purpose/era fails closed.
 
-### Publication and recovery
+### 13.3 Publication/recovery tests
 
-- failure after each fact insert and before adoption;
-- failure during rollback membership and before rollback header;
-- duplicate block after lost acknowledgement;
-- restart intersection;
-- block re-adoption;
-- output creation, spend, rollback resurrection, and re-adoption;
-- orphan-byte monitoring; and
-- snapshot-pinned reads during rollback.
+- crash after every fact table and before adoption;
+- bounded multi-block flush by count, bytes, rows, age, and shutdown;
+- one physical insert per populated table per microbatch, not per block;
+- per-publication verification inside a microbatch;
+- exact all-or-none adoption-batch read-back after a lost response;
+- pending-prefix truncation on rollback and replay after process death;
+- lost response/duplicate replay;
+- incomplete attempt never reused as complete;
+- rollback membership before header is inert;
+- rollback header commits atomically at query semantics;
+- rollback resurrects spent source;
+- re-adoption;
+- committed-vs-allocated snapshot;
+- manifest-tip reconciliation;
+- server-side bounded descendants;
+- two-writer contention, audit staleness after process death, and lock loss;
+- insert-failure recovery without a falsely committed manifest.
 
-### Graph behavior
+### 13.4 ClickHouse/query tests
 
-- forward and reverse symmetry;
-- UTxO, transaction, and paginated address seeds;
-- multi-input/multi-output fan-in/fan-out without pair attribution;
-- converging paths and cycles;
-- high fanout;
-- mint source, burn sink, and fee sink;
-- asset-filtered traversal;
-- partial-tail unresolved boundary inputs;
-- deterministic node/depth/time truncation; and
-- continuation under one snapshot token.
+- raw binary round trips;
+- forbidden-column/schema audit;
+- current vs history;
+- source-spend, consuming-transaction input, and producing-transaction output
+  primary/projection plans, each with scaled `read_rows` evidence;
+- event-sequence-ordered snapshot acquisition and pinned-event validation,
+  with unrelated fact/membership history not reflected in `read_rows`;
+- candidate-scoped snapshot membership for point/forward/reverse queries,
+  with unrelated event-history scale not reflected in `read_rows`;
+- address point/history plan with unrelated output-history scale not
+  reflected in `read_rows`, or removal of the address command/seed if that
+  bounded access path cannot be proven;
+- datum body vs active observation provenance;
+- resolved redeemer joins;
+- withdrawal/metadata reads;
+- forward/reverse hypergraph symmetry;
+- rollback-pinned multi-layer traversal;
+- high fanout/cycles/convergence;
+- deterministic bounds/abort/timeouts;
+- partial-history unresolved boundary; and
+- rows/bytes/timing evidence.
 
-### Storage and performance
+### 13.5 Repository separation tests
 
-- no forbidden tables or columns;
-- binary round trips for hashes, addresses, asset names, and datum CBOR;
-- exact-equality checks after fingerprints;
-- merged bytes per table/column/projection;
-- warning/pause thresholds;
-- merge-space exhaustion simulation;
-- bounded log retention;
-- ClickHouse `EXPLAIN indexes=1` for both traversal directions and address
-  lookup;
-- part/inode growth; and
-- no impact to unrelated containers.
+- no old runtime/toolchain files;
+- no old dependencies or bridge names in executable configuration;
+- one schema/database path;
+- root Go binary contains no analytical commands/packages;
+- Clickout module builds/tests independently with root unavailable;
+- `go list -deps` for Clickout contains no Clicksync module;
+- each image contains only its intended binary/runtime; and
+- README/runbook default commands use direct P2P.
 
-Initial warm performance gates on representative data:
+## 14. Adversarial review gates
 
-- one UTxO or transaction point lookup: below 100 ms;
-- one address page of at most 1,000 rows: below 250 ms;
-- one 10,000-node traversal layer: below 2 seconds.
+At least three independent, read-only reviews occur after implementation:
 
-These are acceptance targets, not public performance claims. Cold behavior and
-bytes/rows scanned are recorded separately.
+1. protocol/era/normalization reviewer;
+2. ClickHouse/publication/rollback/schema reviewer; and
+3. repository-boundary/code-quality/host-safety goal reviewer.
 
-## 6. Staged execution plan
+Reviewers inspect code and rerun bounded evidence. They rank critical, high,
+medium, and low findings with file/line evidence.
 
-### Phase 0: audit safety
+All critical/high findings are fixed and re-reviewed. The final goal reviewer
+must answer explicitly:
 
-- establish local Git baseline;
-- record host/container/disk baseline;
-- pin toolchain and dependency artifacts;
-- create v2 schema alongside untouched v1; and
-- add the decision document to the implementation review checklist.
+- Is Clicksync one clean Go direct-P2P ingestion service?
+- Is there any legacy/mixed runtime left?
+- Is Clickout actually independent?
+- Did real peer UTxO/Plutus facts reach ClickHouse?
+- Do forward and reverse fund-origin queries work on those facts?
+- Are withdrawal/redeemer/metadata requirements met?
+- Are trust/completeness and measured sizing limitations stated honestly?
+- Is the 100 GB figure only a non-enforcing experiment/planning target, with
+  no Clicksync capacity gate or quota machinery?
 
-Exit: reviewable baseline with no runtime impact.
+The persistent goal is not marked complete without affirmative evidence.
 
-### Phase 1: protocol spike
+## 15. Manager-led implementation phases
 
-- build the minimal Go helper in a container;
-- handshake with all three official peers;
-- record version, magic, and tips;
-- ChainSync from Origin far enough to observe real Byron/EBB behavior;
-- BlockFetch and decode historical blocks;
-- fetch the same stable point from two independent peers;
-- fetch and decode live current-era blocks; and
-- emit normalized envelopes without ClickHouse.
+The root agent performs steering and decision-document maintenance only. A
+manager subagent owns implementation and delegates code to worker subagents.
 
-Exit: live, non-mock wire proof and current-era proof.
+### Phase A: destructive cleanup and Go foundation
 
-### Phase 2: compact schema and publication
+- preserve local Git baseline/history;
+- delete Node/TypeScript/bridge/old schema/runtime files;
+- move the proven N2N work into the root Go service;
+- create the independent Clickout module;
+- create one Compose/Docker/runtime path; and
+- add repository-hygiene tests.
 
-- implement v2 DDL;
-- implement safe binary insertion;
-- add publication/event/rollback barriers;
-- add datum deduplication and hash checks;
-- enforce forbidden-payload tests; and
-- implement high-water checks.
+Exit: one Go ingestion build, one independently buildable analysis module, no
+legacy files.
 
-Exit: golden fixtures publish atomically and contain only accepted facts.
+### Phase B: sole schema and direct Go writer
 
-### Phase 3: end-to-end bounded ingestion
+- implement migrations;
+- implement native binary inserts;
+- implement bounded multi-block, table-oriented publication;
+- implement manifest/fact/event/rollback tables;
+- implement transaction inputs/outputs/assets/datums;
+- implement withdrawals/redeemers/metadata;
+- implement peer observations and writer audit lifecycle; and
+- omit every application storage-limit/accounting gate and related schema
+  state.
 
-- connect the Go source adapter to TypeScript;
-- publish an Origin historical slice;
-- publish a peer-recognized live tail slice into a separately marked dataset;
-- exercise disconnect/restart and rollback/re-adoption; and
-- prove raw CBOR is not persisted.
+Exit: era fixtures publish atomically into the sole schema and a contiguous
+range produces bounded, merged parts rather than parts proportional to
+fact-table-count times block-count.
 
-Exit: real peer data exists in ClickHouse with explicit dataset completeness.
+### Phase C: continuous N2N source
 
-### Phase 4: query and BFS proof
+- Origin/stored intersection;
+- continuous ChainSync/BlockFetch;
+- bounded sequential BlockFetch ranges for backfill;
+- bounded pipelining/backpressure;
+- restart/failover;
+- rollback/re-adoption;
+- corroboration/provenance; and
+- genesis seeding/completeness.
 
-- implement point, transaction, address, forward, and reverse primitives;
-- pin every traversal to one event snapshot;
-- enforce all breadth/depth/time bounds;
-- locate a real in-slice spend;
-- demonstrate forward and reverse traversal; and
-- record `EXPLAIN` and timings.
+Exit: bounded continuous test follows multiple real blocks and survives
+disconnect/restart/rollback fixtures.
 
-Exit: the requested ClickHouse UTxO-flow demonstration works on real chain
-facts.
+### Phase D: independent Clickout
 
-### Phase 5: adversarial review and remediation
+- point/transaction/context reads;
+- current/history/address;
+- datum/redeemer/metadata/withdrawal reads;
+- bounded forward/reverse BFS; and
+- snapshot/completeness/trust output.
 
-Independent reviewers cover:
+Exit: module independence tests and real-data fund-origin demonstration pass.
 
-1. N2N/protocol/current-era correctness and trust labels;
-2. UTxO/collateral/datum/genesis/rollback semantics;
-3. ClickHouse storage/query plans and the 100 GiB gate; and
-4. code quality, dependency supply chain, process supervision, and host safety.
+### Phase E: adversarial remediation
 
-All critical/high findings are fixed or explicitly block completion. Reviewers
-rerun the affected gates after remediation.
+- protocol review;
+- schema/publication/query-plan review;
+- repository/goal/host review;
+- fix critical/high findings;
+- rerun all affected gates; and
+- produce exact evidence.
 
-### Phase 6: measured capacity decision
+### Phase F: non-enforcing capacity evidence
 
-- run stratified samples;
-- settle merges;
-- calculate conservative full-history projection;
-- document required disk and expected query behavior; and
-- either authorize full Origin backfill or stop at a measured no-go.
+- stratified samples;
+- settled ClickHouse measurement;
+- best-effort projected full-history size with stated uncertainty;
+- report what the current 100 GB workspace can likely hold; and
+- verify that no measurement is wired to a Clicksync warning, pause, or stop.
 
-Exit: evidence-backed full-history capacity decision.
+## 16. Immediate live acceptance demonstration
 
-## 7. Definition of the immediate requested proof
+The requested demonstration passes only when:
 
-The immediate proof is complete only when all of the following are present:
+1. the only running project services are Go Clicksync and ClickHouse;
+2. no local Cardano node or protocol bridge exists;
+3. Clicksync directly negotiates N2N and performs ChainSync + BlockFetch;
+4. two independent operators corroborate a stable point;
+5. multiple real blocks are published through the sole Go writer/schema;
+6. stored rows include real effective UTxO flows and, where present,
+   datum/redeemer/withdrawal/metadata facts;
+7. no full block/transaction/script CBOR is persisted;
+8. Clickout is built/run independently;
+9. a real source UTxO expands forward through its spending transaction;
+10. a produced UTxO expands backward to the transaction's effective inputs;
+11. query snapshot/completeness/trust fields are visible;
+12. restart/resume and rollback/re-adoption are demonstrated with live or
+    faithful protocol fixtures;
+13. the bounded experiment reports its observed storage/log footprint without
+    enforcing a product capacity gate;
+14. unrelated containers are unchanged; and
+15. adversarial reviewers explicitly accept the goal.
 
-1. no local `cardano-node`, Ogmios, Dolos, or Oura process;
-2. direct outbound N2N handshake, ChainSync, and BlockFetch against official
-   remote peers;
-3. the same stable block recognized by two independent operators;
-4. real decoded UTxO facts, including at least one real spend, stored in the v2
-   ClickHouse schema;
-5. no persisted block/transaction/script CBOR or forbidden broad data;
-6. datum body/hash handling demonstrated when the sample contains one, plus
-   golden datum tests regardless;
-7. a forward traversal from source UTxO through its consuming transaction to
-   outputs;
-8. the matching reverse traversal;
-9. rollback/re-adoption and crash visibility tests;
-10. explicit complete/partial dataset labeling;
-11. measured ClickHouse bytes, scanned rows/bytes, and query timings;
-12. the project remains below its gates and unrelated containers are
-    unchanged; and
-13. independent adversarial reviewers accept the result.
+## 17. Open evidence gates
 
-## 8. Open gates, not undecided scope
+These are evidence gates, not permission to weaken scope:
 
-The following are intentionally evidence gates:
+- current gOuroboros continuous ChainSync behavior across public relays;
+- future Dijkstra/nested semantics fail closed without partially publishing a
+  block;
+- exact metadata-map and redeemer-data CBOR extraction without retaining
+  auxiliary scripts/full transactions;
+- writer-audit activation/heartbeat/release tied to the real held `flock`,
+  without treating ClickHouse audit rows as fencing;
+- sustained Origin-history service from public relays;
+- full-mainnet compressed size after new dApp fields;
+- real filesystem-space availability while a continuous backfill runs; and
+- measured address/redeemer/metadata query plans.
 
-- whether gOuroboros v0.189.1 interoperates with the current live v15/Dijkstra
-  network exactly as advertised;
-- whether public bootstrap relays permit sustained Origin backfill;
-- whether the exact datum CBOR fragment can be recovered and hash-verified
-  through the selected decoder API;
-- whether ClickHouse's chosen projections are actually used;
-- whether NDJSON IPC stays below the 20% CPU reconsideration threshold;
-- whether a host-admin-provided hard 100 GiB filesystem can be supplied for
-  full backfill; and
-- whether full mainnet plus the required indexes projects to at most 70 GiB.
-
-A failed gate changes the implementation path or stops full backfill. It does
-not authorize silently broadening storage, weakening semantics, trusting one
-arbitrary peer, or consuming the host's ungranted free space.
-
+If a gate fails, the manager reports the blocker and safest alternative. It
+does not restore deleted legacy code, recreate multiple product generations,
+silently omit transaction data, trust one arbitrary peer, or introduce a
+Clicksync runtime capacity limit.

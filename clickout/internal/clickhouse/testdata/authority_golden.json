@@ -1,0 +1,35 @@
+{
+  "schema_contract_sha256": "437c68a948cd2a0e5cf4f9dca9068d6305d6d1a5c6776e682b16ea994ceae51e",
+  "rows": [
+    {
+      "name": "official_genesis",
+      "transition_id": "ba3358eb7c9a5583bf11cd92781e0cea",
+      "canonical_payload_sha256": "fa2e8bd8e30065c3ef181d8738482ec0bfa7cc41fa96420710ddc19988a5cb29",
+      "row_digest": "fa2e8bd8e30065c3ef181d8738482ec0bfa7cc41fa96420710ddc19988a5cb29"
+    },
+    {
+      "name": "sampled_current_evidence",
+      "transition_id": "0fc4c0d535b657b689a3369eb594cfe5",
+      "canonical_payload_sha256": "db9f32554e1d16a9a217fc431f532cbbbf833ea2ae01f743487acfe4f3f3c852",
+      "row_digest": "db9f32554e1d16a9a217fc431f532cbbbf833ea2ae01f743487acfe4f3f3c852"
+    },
+    {
+      "name": "pending_evidence",
+      "transition_id": "bccf494136595291b2034b6344fb19d1",
+      "canonical_payload_sha256": "b0580e95c4250991880800389e26e34963883d12a0fbb0a91a8081c40b6c1d3f",
+      "row_digest": "b0580e95c4250991880800389e26e34963883d12a0fbb0a91a8081c40b6c1d3f"
+    },
+    {
+      "name": "pending_rollback",
+      "transition_id": "a4c536ce6a89500689fe4dde663a3d50",
+      "canonical_payload_sha256": "800adb7e9f4a784dbc0302ed3e83c13ee863db422cbb60d21dffde549cdeaca6",
+      "row_digest": "800adb7e9f4a784dbc0302ed3e83c13ee863db422cbb60d21dffde549cdeaca6"
+    },
+    {
+      "name": "finalized_rollback",
+      "transition_id": "874b6114ebb95f62860dcc7c141bd496",
+      "canonical_payload_sha256": "9a988ca5a6c14e7158389a83a7bbb2976f9ae9e3b2f46fdcc4151fab00c0f887",
+      "row_digest": "9a988ca5a6c14e7158389a83a7bbb2976f9ae9e3b2f46fdcc4151fab00c0f887"
+    }
+  ]
+}

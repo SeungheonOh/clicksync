@@ -42,6 +42,16 @@ func AddressScope(address []byte, state string) string {
 	return addressScope(address, state)
 }
 
+func TraceAddressScope(
+	address []byte,
+	direction repository.TraceDirection,
+	asset model.AssetSelector,
+) string {
+	sum := sha256.Sum256(address)
+	return "trace/" + string(direction) + "/address/" +
+		hex.EncodeToString(sum[:]) + "/" + asset.String()
+}
+
 func encodeAddressKey(key addressKey) (string, error) {
 	data, err := json.Marshal(key)
 	if err != nil {
@@ -182,9 +192,9 @@ func (store *Store) Address(
 			return model.AddressPage{}, nil, err
 		}
 		page.Cursor, err = cursor.Encode(cursor.Value{
-			Scope:         addressScope(query.Address, query.State),
-			SnapshotEvent: snapshot.Event,
-			LastKey:       lastKey,
+			Scope:    addressScope(query.Address, query.State),
+			Snapshot: snapshot,
+			LastKey:  lastKey,
 		})
 		if err != nil {
 			return model.AddressPage{}, nil, err
@@ -297,7 +307,7 @@ func addressCandidateSQL(
 ) (string, []any, error) {
 	cursorFilter := ""
 	arguments := []any{
-		snapshot.PublicationWatermark,
+		snapshot.Cutoff.PublicationID,
 		string(address),
 		string(address),
 	}
@@ -447,7 +457,7 @@ ORDER BY
     o.tx_hash,
     o.output_index,
     o.publication_id`
-	arguments := append([]any{snapshot.PublicationWatermark}, values...)
+	arguments := append([]any{snapshot.Cutoff.PublicationID}, values...)
 	queryCtx, finish := store.instrumentPhase(
 		ctx,
 		"address_outputs",

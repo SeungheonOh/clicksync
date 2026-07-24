@@ -9,12 +9,30 @@ import (
 
 func TestBinaryRoundTrips(t *testing.T) {
 	t.Parallel()
+	datasetText := strings.Repeat("12", 16)
+	datasetID, err := ParseDatasetID(datasetText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(datasetID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decodedDatasetID DatasetID
+	if err := json.Unmarshal(encoded, &decodedDatasetID); err != nil {
+		t.Fatal(err)
+	}
+	if decodedDatasetID != datasetID ||
+		decodedDatasetID.String() != datasetText {
+		t.Fatalf("dataset ID round trip mismatch: %s", decodedDatasetID)
+	}
+
 	hashText := strings.Repeat("ab", 32)
 	hash, err := ParseHash32(hashText)
 	if err != nil {
 		t.Fatal(err)
 	}
-	encoded, err := json.Marshal(hash)
+	encoded, err = json.Marshal(hash)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,6 +87,19 @@ func TestUTxORefAndAssetParsing(t *testing.T) {
 
 func TestRejectsNonCanonicalBinaryText(t *testing.T) {
 	t.Parallel()
+	for _, value := range []string{
+		strings.Repeat("AB", 16),
+		strings.Repeat("00", 15),
+		strings.Repeat("0g", 16),
+		"12121212-1212-1212-1212-121212121212",
+	} {
+		if _, err := ParseDatasetID(value); err == nil {
+			t.Fatalf("accepted invalid dataset ID %q", value)
+		}
+	}
+	if _, err := DatasetIDFromBytes(make([]byte, 15)); err == nil {
+		t.Fatal("accepted a short dataset ID")
+	}
 	for _, value := range []string{
 		strings.Repeat("AB", 32),
 		strings.Repeat("00", 31),

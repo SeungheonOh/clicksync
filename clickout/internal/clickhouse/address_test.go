@@ -52,7 +52,7 @@ func TestAddressCandidateSQLUsesCompleteOrderingAndPhysicalSentinel(t *testing.T
 		PublicationID: 5,
 	}
 	sql, arguments, err := addressCandidateSQL(
-		model.Snapshot{PublicationWatermark: 99},
+		model.Snapshot{Cutoff: model.Cutoff{PublicationID: 99}},
 		address,
 		10,
 		key,

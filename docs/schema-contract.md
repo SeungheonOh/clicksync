@@ -105,8 +105,17 @@ GROUP BY publication_id
 HAVING argMax(active, event_seq);
 ```
 
+That whole-set expression defines semantics and is used for offline
+reconciliation/fixtures. It is not the normal point, transaction, BFS, or
+writer source-resolution plan. Those paths first use the relevant fact-table
+order key to collect candidate `publication_id` values, add a
+`publication_id IN (...)` restriction to the committed-membership query, and
+filter only that bounded candidate set. A traversal batches this restriction
+for each frontier. This preserves the same snapshot result without grouping
+unrelated chain history on every lookup.
+
 Facts join that set by `publication_id`. Readers do not use `FINAL`.
-`dataset_manifest` and `writer_lease` are cache/operational tables; readers
+`dataset_manifest` and `writer_audit` are cache/operational tables; readers
 select their latest rows with `argMax(..., revision)`. The manifest is
 reconciled from committed adoption/rollback records after restart and never
 defines snapshot authority.
@@ -179,12 +188,17 @@ validation.
 deterministic genesis seeding. Intersection/tail datasets remain incomplete.
 Clickout must return snapshot, trust mode, and completeness with every result.
 
-## Writer lease limitation
+## Writer authority and audit
 
-`writer_lease` exposes owner, heartbeat, build, expiry, and fencing metadata,
-but is audit state only. A plain ClickHouse MergeTree table does not provide
-atomic compare-and-swap/unique-row semantics, and an insert plus fact
-publication cannot form one transaction. Supported writers instead share and
-hold the single-host `clicksync-state` advisory lock for process lifetime.
+`writer_audit` records owner, build, process, activation, heartbeat, and
+graceful release history. It has no expiry or fencing semantics and is never
+consulted as authority. A plain ClickHouse MergeTree table does not provide
+atomic compare-and-swap/unique-row semantics, and an audit insert plus fact
+publication cannot form one transaction.
+
+Every supported writer instead shares and holds the single-host
+`clicksync-state` advisory `flock` for process lifetime. A killed process can
+therefore leave its last audit row looking active; the released operating
+system lock, not that stale row, permits the next process to start.
 Multi-host and separately mounted writers fail closed; there is no force or
 stale-takeover mode.

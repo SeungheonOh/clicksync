@@ -7,6 +7,7 @@ import (
 
 	"github.com/clicksync-project/clickout/internal/address"
 	"github.com/clicksync-project/clickout/internal/cli"
+	chstore "github.com/clicksync-project/clickout/internal/clickhouse"
 	"github.com/clicksync-project/clickout/internal/cursor"
 	"github.com/clicksync-project/clickout/internal/limits"
 	"github.com/clicksync-project/clickout/internal/metrics"
@@ -20,29 +21,50 @@ func (engine *Engine) trace(
 	invocation cli.Invocation,
 ) (any, error) {
 	seed := invocation.Trace.Seed
-	at := invocation.At
 	seedLastKey := ""
+	if invocation.Trace.SeedCursor != "" &&
+		invocation.Trace.Address == "" {
+		return nil, cursor.ErrInvalid
+	}
+	var (
+		snapshot   model.Snapshot
+		traceScope string
+	)
 	if invocation.Trace.Address != "" {
 		raw, err := address.Decode(invocation.Trace.Address)
 		if err != nil {
 			return nil, err
 		}
 		seed.Address = raw
+		traceScope = chstore.TraceAddressScope(
+			raw,
+			invocation.Trace.Direction,
+			invocation.Trace.Asset,
+		)
 		if invocation.Trace.SeedCursor != "" {
-			value, err := cursor.DecodePinned(
+			value, err := cursor.Decode(
 				invocation.Trace.SeedCursor,
-				addressScope(raw, "history"),
+				traceScope,
 			)
 			if err != nil {
 				return nil, err
 			}
-			at = model.AtPoint{Event: &value.SnapshotEvent}
+			snapshot, err = engine.validateSnapshotBeforeRead(
+				ctx,
+				value.Snapshot,
+			)
+			if err != nil {
+				return nil, err
+			}
 			seedLastKey = value.LastKey
 		}
 	}
-	snapshot, err := engine.reader.Snapshot(ctx, at)
-	if err != nil {
-		return nil, err
+	if invocation.Trace.SeedCursor == "" {
+		var err error
+		snapshot, err = engine.snapshotForRead(ctx, invocation.At)
+		if err != nil {
+			return nil, err
+		}
 	}
 	seedLimit := limits.DefaultAddressPage
 	if len(seed.Address) > 0 && invocation.Trace.Limits.MaxNodes < seedLimit {
@@ -266,8 +288,35 @@ func (engine *Engine) trace(
 	)
 	response.Truncation.LosslessResume = false
 	response.Data.Visited = uint32(len(visited))
-	response.QueryMetrics = collector.Snapshot()
-	return response, nil
+	return finalizeResponse(
+		ctx,
+		engine,
+		snapshot,
+		response.Data,
+		collector,
+		func(result *model.Response[model.Trace]) error {
+			result.Truncation = response.Truncation
+			result.UnresolvedPartialHistory =
+				response.UnresolvedPartialHistory
+			if result.Truncation.ContinuationCursor == "" {
+				return nil
+			}
+			if traceScope == "" {
+				return cursor.ErrInvalid
+			}
+			value, err := cursor.Decode(
+				result.Truncation.ContinuationCursor,
+				traceScope,
+			)
+			if err != nil || !value.Snapshot.SamePin(snapshot) {
+				return cursor.ErrInvalid
+			}
+			value.Snapshot = result.Snapshot
+			result.Truncation.ContinuationCursor, err =
+				cursor.Encode(value)
+			return err
+		},
+	)
 }
 
 func sortedEdgeHashes(seen map[string]struct{}) []model.Hash32 {
