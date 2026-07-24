@@ -711,17 +711,10 @@ func redeemerBundle(
 	if witnesses == nil || witnesses.Redeemers() == nil {
 		return nil, nil
 	}
-	type item struct {
-		key   lcommon.RedeemerKey
-		value lcommon.RedeemerValue
+	items, err := canonicalRedeemerItems(witnesses.Redeemers())
+	if err != nil {
+		return nil, err
 	}
-	var items []item
-	for key, value := range witnesses.Redeemers().Iter() {
-		items = append(items, item{key: key, value: value})
-	}
-	slices.SortFunc(items, func(a, b item) int {
-		return lcommon.CompareRedeemerKeys(a.key, b.key)
-	})
 	ret := make([]model.Redeemer, 0, len(items))
 	for _, item := range items {
 		body := item.value.Data.Cbor()
@@ -752,6 +745,76 @@ func redeemerBundle(
 		ret = append(ret, row)
 	}
 	return ret, nil
+}
+
+type redeemerItem struct {
+	key   lcommon.RedeemerKey
+	value lcommon.RedeemerValue
+}
+
+type legacyRedeemer struct {
+	cbor.StructAsArray
+	Tag     lcommon.RedeemerTag
+	Index   uint32
+	Data    lcommon.Datum
+	ExUnits lcommon.ExUnits
+}
+
+func canonicalRedeemerItems(
+	redeemers lcommon.TransactionWitnessRedeemers,
+) ([]redeemerItem, error) {
+	values := make(map[lcommon.RedeemerKey]lcommon.RedeemerValue)
+	rawSource, hasRawSource := redeemers.(interface{ Cbor() []byte })
+	raw := []byte(nil)
+	if hasRawSource {
+		raw = rawSource.Cbor()
+	}
+	if len(raw) > 0 && raw[0]&0xe0 == 0x80 {
+		var encoded []legacyRedeemer
+		consumed, err := cbor.Decode(raw, &encoded)
+		if err != nil {
+			return nil, fmt.Errorf("decode legacy redeemer array: %w", err)
+		}
+		if consumed != len(raw) {
+			return nil, errors.New("legacy redeemer array has trailing CBOR")
+		}
+		// cardano-ledger interprets this historical array encoding through
+		// Map.fromList. Preserve its last-wins semantics in original encoded
+		// order; Iter sorts first and cannot safely resolve equal keys.
+		for _, encodedRedeemer := range encoded {
+			key := lcommon.RedeemerKey{
+				Tag:   encodedRedeemer.Tag,
+				Index: encodedRedeemer.Index,
+			}
+			values[key] = lcommon.RedeemerValue{
+				Data:    encodedRedeemer.Data,
+				ExUnits: encodedRedeemer.ExUnits,
+			}
+		}
+	} else {
+		if len(raw) > 0 && raw[0]&0xe0 != 0xa0 {
+			return nil, fmt.Errorf(
+				"redeemers have unsupported top-level CBOR type 0x%02x",
+				raw[0],
+			)
+		}
+		for key, value := range redeemers.Iter() {
+			if _, duplicate := values[key]; duplicate {
+				return nil, errors.New(
+					"duplicate redeemer pointer lacks original encoded order",
+				)
+			}
+			values[key] = value
+		}
+	}
+	items := make([]redeemerItem, 0, len(values))
+	for key, value := range values {
+		items = append(items, redeemerItem{key: key, value: value})
+	}
+	slices.SortFunc(items, func(a, b redeemerItem) int {
+		return lcommon.CompareRedeemerKeys(a.key, b.key)
+	})
+	return items, nil
 }
 
 func resolveRedeemer(tx lcommon.Transaction, key lcommon.RedeemerKey, row *model.Redeemer) error {

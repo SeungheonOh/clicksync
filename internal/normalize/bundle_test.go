@@ -235,6 +235,108 @@ func TestSpendRedeemerRejectsDuplicateInputReference(t *testing.T) {
 	}
 }
 
+func TestMainnetLegacyRedeemerArrayCanonicalizesDuplicatePointer(t *testing.T) {
+	// Exact witness-set key 5 payload from canonical mainnet transaction
+	// 836a0975388c78b46eb4521689b117afde516bde9ef1a7735506e5ae1a296ace
+	// in Conway block 10781466. Its final two entries repeat mint(0).
+	raw, err := hex.DecodeString(
+		"83840002d879808219b3381a00fdf28e" +
+			"840100d87980821a000d8a0d1a10c32faf" +
+			"840100d87980821a000d8a0d1a10c32faf",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var redeemers conway.ConwayRedeemers
+	if err := redeemers.UnmarshalCBOR(raw); err != nil {
+		t.Fatal(err)
+	}
+	decodedEntries := 0
+	for range redeemers.Iter() {
+		decodedEntries++
+	}
+	if decodedEntries != 3 {
+		t.Fatalf("decoded witness entries = %d, want 3", decodedEntries)
+	}
+	tx := testConwayTransaction(t, true, txOptions{
+		inputs: []ledger.ShelleyTransactionInput{
+			ledger.NewShelleyTransactionInput(strings.Repeat("11", 32), 0),
+			ledger.NewShelleyTransactionInput(strings.Repeat("22", 32), 0),
+			ledger.NewShelleyTransactionInput(strings.Repeat("33", 32), 0),
+		},
+		outputs:   []ledger.BabbageTransactionOutput{testOutput(nil, 1)},
+		fee:       1,
+		mint:      testMint(),
+		redeemers: redeemers,
+	})
+	got, err := transactionBundle(tx, 0, "Conway", bundleDatumCollector{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Redeemers) != 2 {
+		t.Fatalf("canonical redeemers = %#v", got.Redeemers)
+	}
+	spend := got.Redeemers[0]
+	mint := got.Redeemers[1]
+	if spend.Purpose != "spend" || spend.Index != 2 ||
+		spend.ExUnitsMemory != 45880 || spend.ExUnitsSteps != 16642702 ||
+		mint.Purpose != "mint" || mint.Index != 0 ||
+		mint.ExUnitsMemory != 887309 || mint.ExUnitsSteps != 281227183 {
+		t.Fatalf("canonical redeemers = %#v", got.Redeemers)
+	}
+	wantData := []byte{0xd8, 0x79, 0x80}
+	wantHash, err := hex.DecodeString(
+		"923918e403bf43c34b4ef6b48eb2ee04babed17320d8d1b9ff9ad086e86f44ec",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(spend.DataCBOR, wantData) ||
+		!bytes.Equal(mint.DataCBOR, wantData) ||
+		!bytes.Equal(spend.DataHash[:], wantHash) ||
+		!bytes.Equal(mint.DataHash[:], wantHash) {
+		t.Fatalf("canonical redeemer data/hash = %#v", got.Redeemers)
+	}
+}
+
+func TestLegacyRedeemerArrayDuplicatePointerIsLastWins(t *testing.T) {
+	// Map.fromList semantics must follow original encoded order. These two
+	// spend(0) entries intentionally carry different data and execution units.
+	raw, err := hex.DecodeString("828400000082010284000001820304")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var redeemers conway.ConwayRedeemers
+	if err := redeemers.UnmarshalCBOR(raw); err != nil {
+		t.Fatal(err)
+	}
+	tx := testConwayTransaction(t, true, txOptions{
+		inputs: []ledger.ShelleyTransactionInput{
+			ledger.NewShelleyTransactionInput(strings.Repeat("11", 32), 0),
+		},
+		outputs:   []ledger.BabbageTransactionOutput{testOutput(nil, 1)},
+		fee:       1,
+		redeemers: redeemers,
+	})
+	got, err := transactionBundle(tx, 0, "Conway", bundleDatumCollector{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantHash, err := hex.DecodeString(
+		"ee155ace9c40292074cb6aff8c9ccdd273c81648ff1149ef36bcea6ebb8a3e25",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Redeemers) != 1 ||
+		!bytes.Equal(got.Redeemers[0].DataCBOR, []byte{0x01}) ||
+		!bytes.Equal(got.Redeemers[0].DataHash[:], wantHash) ||
+		got.Redeemers[0].ExUnitsMemory != 3 ||
+		got.Redeemers[0].ExUnitsSteps != 4 {
+		t.Fatalf("last-wins redeemer = %#v", got.Redeemers)
+	}
+}
+
 func TestVoterRedeemerOrderMatchesLedgerAndCDDLOracle(t *testing.T) {
 	if lcommon.VoterTypeConstitutionalCommitteeHotKeyHash != 0 ||
 		lcommon.VoterTypeConstitutionalCommitteeHotScriptHash != 1 ||
