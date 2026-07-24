@@ -21,7 +21,15 @@ type DB struct {
 }
 
 func Open(cfg config.Config) (*DB, error) {
-	conn, err := clickhouse.Open(&clickhouse.Options{
+	conn, err := clickhouse.Open(clickHouseOptions(cfg))
+	if err != nil {
+		return nil, fmt.Errorf("open ClickHouse: %w", err)
+	}
+	return &DB{conn: conn}, nil
+}
+
+func clickHouseOptions(cfg config.Config) *clickhouse.Options {
+	return &clickhouse.Options{
 		Addr: []string{net.JoinHostPort(cfg.ClickHouseHost, fmt.Sprint(cfg.ClickHousePort))},
 		Auth: clickhouse.Auth{
 			Database: "default",
@@ -31,15 +39,13 @@ func Open(cfg config.Config) (*DB, error) {
 		Protocol:    clickhouse.Native,
 		DialTimeout: 10 * time.Second,
 		Settings: clickhouse.Settings{
+			"async_insert":                           0,
 			"join_use_nulls":                         1,
 			"min_table_rows_to_use_projection_index": 0,
+			"wait_for_async_insert":                  1,
 		},
 		Compression: &clickhouse.Compression{Method: clickhouse.CompressionLZ4},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("open ClickHouse: %w", err)
 	}
-	return &DB{conn: conn}, nil
 }
 
 func (d *DB) Close() error {

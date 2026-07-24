@@ -115,6 +115,24 @@ func TestBlankIntersectionNeverFallsBackToOrigin(t *testing.T) {
 	}
 }
 
+func TestFullSyncDefaultsQueueCapacityToCompleteRange(t *testing.T) {
+	t.Setenv("CLICKHOUSE_PASSWORD", "secret")
+	t.Setenv("CLICKSYNC_START", "intersection")
+	t.Setenv("CLICKSYNC_START_POINT", "1:"+strings.Repeat("ab", 32))
+	t.Setenv("CLICKSYNC_QUEUE_CAPACITY", "")
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.QueueCapacity != 32 || cfg.HeaderBatchSize != 32 {
+		t.Fatalf(
+			"queue/header capacity = %d/%d, want 32/32",
+			cfg.QueueCapacity,
+			cfg.HeaderBatchSize,
+		)
+	}
+}
+
 func TestDatabaseConfigIgnoresUnrelatedCardanoSettings(t *testing.T) {
 	t.Setenv("CLICKHOUSE_PASSWORD", "secret")
 	t.Setenv("CARDANO_NETWORK_NAME", "not-mainnet")

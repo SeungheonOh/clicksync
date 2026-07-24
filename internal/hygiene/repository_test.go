@@ -276,6 +276,13 @@ func TestComposePublishesClickHousePortsAndConwayStart(t *testing.T) {
 	if !strings.Contains(string(example), "CLICKHOUSE_NATIVE_PORT=19000") {
 		t.Fatal("example must select the collision-free host native port 19000")
 	}
+	const queueDefault = `CLICKSYNC_QUEUE_CAPACITY: ${CLICKSYNC_QUEUE_CAPACITY:-32}`
+	if !strings.Contains(string(compose), queueDefault) {
+		t.Fatal("compose must default to one complete 32-block receive range")
+	}
+	if !strings.Contains(string(example), "CLICKSYNC_QUEUE_CAPACITY=32") {
+		t.Fatal("example must select one complete 32-block receive range")
+	}
 	const conwayPredecessor = "133660799:e757d57eb8dc9500a61c60a39fadb63d9be6973ba96ae337fd24453d4d15c343"
 	if !strings.Contains(string(compose), conwayPredecessor) {
 		t.Fatal("compose default must start at the Conway predecessor")

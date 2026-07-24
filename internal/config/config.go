@@ -156,7 +156,7 @@ func FromEnv() (Config, error) {
 	cfg.WriterCoordination = writer.WriterCoordination
 	cfg.DialTimeout = 10 * time.Second
 	cfg.ProtocolTimeout = 90 * time.Second
-	if cfg.QueueCapacity, err = envInt("CLICKSYNC_QUEUE_CAPACITY", 4); err != nil {
+	if cfg.QueueCapacity, err = envInt("CLICKSYNC_QUEUE_CAPACITY", 32); err != nil {
 		return Config{}, err
 	}
 	if cfg.HeaderBatchSize, err = envInt("CLICKSYNC_HEADER_BATCH_SIZE", 32); err != nil {
