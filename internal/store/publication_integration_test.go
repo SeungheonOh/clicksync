@@ -467,6 +467,47 @@ WHERE tx_hash = ?`, string(fourthTx[:])).Scan(&effectiveCollateralFee); err != n
 		state.OutputFactSeen || state.ActiveConsumption {
 		t.Fatalf("never-seen output state = %+v", state)
 	}
+	crossChunkRefs := make(
+		[]publication.OutputRef,
+		outputRefQueryChunkSize+3,
+	)
+	for index := range crossChunkRefs {
+		crossChunkRefs[index] = publication.OutputRef{
+			Hash:  hash32Fill(0x7a),
+			Index: uint32(index + 100),
+		}
+	}
+	crossChunkRefs[0] = firstOutputRef
+	crossChunkRefs[outputRefQueryChunkSize] = firstOutputRef
+	crossChunkRefs[len(crossChunkRefs)-1] = unknownRef
+	states, err = db.ResolveOutputStates(ctx, snapshot, crossChunkRefs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(states) != len(crossChunkRefs)-1 {
+		t.Fatalf(
+			"cross-chunk output states = %d, want %d",
+			len(states),
+			len(crossChunkRefs)-1,
+		)
+	}
+	if state := states[firstOutputRef]; state.State != publication.OutputKnownInactive ||
+		!state.OutputFactSeen || !state.ActiveConsumption {
+		t.Fatalf("first-chunk spent output state = %+v", state)
+	}
+	if state := states[unknownRef]; state.State != publication.OutputKnownInactive ||
+		state.OutputFactSeen || !state.ActiveConsumption {
+		t.Fatalf("last-chunk boundary consumption state = %+v", state)
+	}
+	for index, ref := range crossChunkRefs[1 : len(crossChunkRefs)-1] {
+		if index+1 == outputRefQueryChunkSize {
+			continue
+		}
+		if state := states[ref]; state.State != publication.OutputNeverSeen ||
+			state.OutputFactSeen || state.ActiveConsumption {
+			t.Fatalf("cross-chunk never-seen output %x#%d = %+v", ref.Hash, ref.Index, state)
+		}
+	}
 
 	firstPoint := publication.Point{
 		Slot:        firstBlock.Slot,
@@ -748,7 +789,7 @@ WHERE tx_hash = ?`, string(canonicalTx[:])); err != nil {
 	if _, err := db.ResolveOutputStates(
 		ctx,
 		snapshot,
-		[]publication.OutputRef{unknownRef},
+		crossChunkRefs,
 	); err == nil || !strings.Contains(err.Error(), "2 consumption facts") {
 		t.Fatalf("conflicting active consumption facts error = %v", err)
 	}

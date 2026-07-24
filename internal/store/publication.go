@@ -16,6 +16,15 @@ import (
 	"clicksync/internal/publication"
 )
 
+// ClickHouse's native driver expands array parameters into the SQL text before
+// sending the query. Binary transaction hashes can therefore consume several
+// escaped bytes per source reference. Keep each lookup comfortably below the
+// server's default 256 KiB max_query_size instead of relying on a larger server
+// setting.
+const outputRefQueryChunkSize = 256
+
+const candidatePublicationQueryChunkSize = 1024
+
 func (d *DB) CommittedSnapshot(ctx context.Context) (uint64, error) {
 	record, found, err := d.loadAuthoritativeManifest(ctx)
 	if err != nil {
@@ -107,22 +116,12 @@ func (d *DB) ResolveOutputStates(
 	if len(refs) == 0 {
 		return ret, nil
 	}
-	uniqueRefs := make([]publication.OutputRef, 0, len(refs))
-	requested := make(map[publication.OutputRef]struct{}, len(refs))
-	for _, ref := range refs {
-		if _, duplicate := requested[ref]; duplicate {
-			continue
-		}
-		requested[ref] = struct{}{}
-		uniqueRefs = append(uniqueRefs, ref)
-	}
-	hashes := make([]string, 0, len(uniqueRefs))
-	indexes := make([]uint32, 0, len(uniqueRefs))
+	uniqueRefs := uniqueOutputRefs(refs)
+	requested := make(map[publication.OutputRef]struct{}, len(uniqueRefs))
 	for _, ref := range uniqueRefs {
-		hashes = append(hashes, string(ref.Hash[:]))
-		indexes = append(indexes, ref.Index)
+		requested[ref] = struct{}{}
 	}
-	query := `
+	const query = `
 SELECT
     o.tx_hash,
     o.output_index,
@@ -140,95 +139,108 @@ WHERE (o.tx_hash, o.output_index) IN
         SELECT arrayJoin(arrayZip(?, ?)) AS ref
     )
 )`
-	rows, err := d.conn.Query(ctx, query, hashes, indexes)
-	if err != nil {
-		return nil, fmt.Errorf("query source output facts: %w", err)
-	}
-	defer rows.Close()
 	publicationOutputs := make(
 		map[uint64]map[publication.OutputRef][]publication.ResolvedOutput,
 	)
 	outputFactSeen := make(map[publication.OutputRef]struct{}, len(uniqueRefs))
 	candidateSet := make(map[uint64]struct{})
 	var candidateIDs []uint64
-	for rows.Next() {
-		var hash []byte
-		var index uint32
-		var publicationID uint64
-		var lovelace uint64
-		var credentialKind string
-		var credentialHashNull bool
-		var credentialHashBytes []byte
-		if err := rows.Scan(
-			&hash,
-			&index,
-			&publicationID,
-			&lovelace,
-			&credentialKind,
-			&credentialHashNull,
-			&credentialHashBytes,
-		); err != nil {
-			return nil, fmt.Errorf("scan active source output: %w", err)
-		}
-		converted, err := hash32(hash)
+	err := forEachOutputRefChunk(uniqueRefs, func(chunk []publication.OutputRef) error {
+		hashes, indexes := outputRefQueryParameters(chunk)
+		rows, err := d.conn.Query(ctx, query, hashes, indexes)
 		if err != nil {
-			return nil, err
+			return fmt.Errorf("query source output facts: %w", err)
 		}
-		ref := publication.OutputRef{Hash: converted, Index: index}
-		if _, requestedRef := requested[ref]; !requestedRef {
-			return nil, fmt.Errorf(
-				"output query returned unrequested fact %x#%d",
-				ref.Hash,
-				ref.Index,
-			)
-		}
-		outputFactSeen[ref] = struct{}{}
-		resolved := publication.ResolvedOutput{
-			Lovelace:              lovelace,
-			PaymentCredentialKind: credentialKind,
-		}
-		if credentialHashNull {
-			if credentialKind != "none" {
-				return nil, fmt.Errorf(
-					"active output %x#%d has %q credential without hash",
-					ref.Hash,
-					ref.Index,
-					credentialKind,
-				)
+		for rows.Next() {
+			var hash []byte
+			var index uint32
+			var publicationID uint64
+			var lovelace uint64
+			var credentialKind string
+			var credentialHashNull bool
+			var credentialHashBytes []byte
+			if err := rows.Scan(
+				&hash,
+				&index,
+				&publicationID,
+				&lovelace,
+				&credentialKind,
+				&credentialHashNull,
+				&credentialHashBytes,
+			); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan active source output: %w", err)
 			}
-		} else {
-			credentialHash, err := hash28(credentialHashBytes)
+			converted, err := hash32(hash)
 			if err != nil {
-				return nil, err
+				rows.Close()
+				return err
 			}
-			if credentialKind != "key" && credentialKind != "script" {
-				return nil, fmt.Errorf(
-					"active output %x#%d has hash for credential kind %q",
+			ref := publication.OutputRef{Hash: converted, Index: index}
+			if _, requestedRef := requested[ref]; !requestedRef {
+				rows.Close()
+				return fmt.Errorf(
+					"output query returned unrequested fact %x#%d",
 					ref.Hash,
 					ref.Index,
-					credentialKind,
 				)
 			}
-			resolved.PaymentCredentialHash = &credentialHash
+			outputFactSeen[ref] = struct{}{}
+			resolved := publication.ResolvedOutput{
+				Lovelace:              lovelace,
+				PaymentCredentialKind: credentialKind,
+			}
+			if credentialHashNull {
+				if credentialKind != "none" {
+					rows.Close()
+					return fmt.Errorf(
+						"active output %x#%d has %q credential without hash",
+						ref.Hash,
+						ref.Index,
+						credentialKind,
+					)
+				}
+			} else {
+				credentialHash, err := hash28(credentialHashBytes)
+				if err != nil {
+					rows.Close()
+					return err
+				}
+				if credentialKind != "key" && credentialKind != "script" {
+					rows.Close()
+					return fmt.Errorf(
+						"active output %x#%d has hash for credential kind %q",
+						ref.Hash,
+						ref.Index,
+						credentialKind,
+					)
+				}
+				resolved.PaymentCredentialHash = &credentialHash
+			}
+			outputs := publicationOutputs[publicationID]
+			if outputs == nil {
+				outputs = make(
+					map[publication.OutputRef][]publication.ResolvedOutput,
+				)
+				publicationOutputs[publicationID] = outputs
+			}
+			outputs[ref] = append(outputs[ref], resolved)
+			if _, found := candidateSet[publicationID]; !found {
+				candidateSet[publicationID] = struct{}{}
+				candidateIDs = append(candidateIDs, publicationID)
+			}
 		}
-		outputs := publicationOutputs[publicationID]
-		if outputs == nil {
-			outputs = make(
-				map[publication.OutputRef][]publication.ResolvedOutput,
-			)
-			publicationOutputs[publicationID] = outputs
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("iterate source output facts: %w", err)
 		}
-		outputs[ref] = append(outputs[ref], resolved)
-		if _, found := candidateSet[publicationID]; !found {
-			candidateSet[publicationID] = struct{}{}
-			candidateIDs = append(candidateIDs, publicationID)
+		if err := rows.Close(); err != nil {
+			return fmt.Errorf("close source output facts: %w", err)
 		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate source output facts: %w", err)
-	}
-	if err := rows.Close(); err != nil {
-		return nil, fmt.Errorf("close source output facts: %w", err)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	activeIDs, err := d.activeCandidatePublications(ctx, snapshot, candidateIDs)
 	if err != nil {
@@ -300,14 +312,9 @@ func (d *DB) activeConsumedOutputRefs(
 	refs []publication.OutputRef,
 ) (map[publication.OutputRef]uint64, error) {
 	ret := make(map[publication.OutputRef]uint64)
+	refs = uniqueOutputRefs(refs)
 	if len(refs) == 0 {
 		return ret, nil
-	}
-	hashes := make([]string, 0, len(refs))
-	indexes := make([]uint32, 0, len(refs))
-	for _, ref := range refs {
-		hashes = append(hashes, string(ref.Hash[:]))
-		indexes = append(indexes, ref.Index)
 	}
 	const query = `
 SELECT source_tx_hash, source_output_index, publication_id, count()
@@ -322,53 +329,66 @@ WHERE is_consumed
     )
 )
 GROUP BY source_tx_hash, source_output_index, publication_id`
-	rows, err := d.conn.Query(ctx, query, hashes, indexes)
-	if err != nil {
-		return nil, fmt.Errorf("query candidate consumed outputs: %w", err)
-	}
-	defer rows.Close()
 	byPublication := make(map[uint64]map[publication.OutputRef]uint64)
 	candidateSet := make(map[uint64]struct{})
 	var candidateIDs []uint64
-	for rows.Next() {
-		var hashBytes []byte
-		var index uint32
-		var publicationID uint64
-		var factCount uint64
-		if err := rows.Scan(
-			&hashBytes,
-			&index,
-			&publicationID,
-			&factCount,
-		); err != nil {
-			return nil, fmt.Errorf("scan candidate consumed output: %w", err)
-		}
-		hash, err := hash32(hashBytes)
+	err := forEachOutputRefChunk(refs, func(chunk []publication.OutputRef) error {
+		hashes, indexes := outputRefQueryParameters(chunk)
+		rows, err := d.conn.Query(ctx, query, hashes, indexes)
 		if err != nil {
-			return nil, err
+			return fmt.Errorf("query candidate consumed outputs: %w", err)
 		}
-		ref := publication.OutputRef{Hash: hash, Index: index}
-		facts := byPublication[publicationID]
-		if facts == nil {
-			facts = make(map[publication.OutputRef]uint64)
-			byPublication[publicationID] = facts
+		for rows.Next() {
+			var hashBytes []byte
+			var index uint32
+			var publicationID uint64
+			var factCount uint64
+			if err := rows.Scan(
+				&hashBytes,
+				&index,
+				&publicationID,
+				&factCount,
+			); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan candidate consumed output: %w", err)
+			}
+			hash, err := hash32(hashBytes)
+			if err != nil {
+				rows.Close()
+				return err
+			}
+			ref := publication.OutputRef{Hash: hash, Index: index}
+			facts := byPublication[publicationID]
+			if facts == nil {
+				facts = make(map[publication.OutputRef]uint64)
+				byPublication[publicationID] = facts
+			}
+			if _, duplicate := facts[ref]; duplicate {
+				rows.Close()
+				return fmt.Errorf(
+					"consumption query duplicated publication %d output %x#%d",
+					publicationID,
+					ref.Hash,
+					ref.Index,
+				)
+			}
+			facts[ref] = factCount
+			if _, found := candidateSet[publicationID]; !found {
+				candidateSet[publicationID] = struct{}{}
+				candidateIDs = append(candidateIDs, publicationID)
+			}
 		}
-		if _, duplicate := facts[ref]; duplicate {
-			return nil, fmt.Errorf(
-				"consumption query duplicated publication %d output %x#%d",
-				publicationID,
-				ref.Hash,
-				ref.Index,
-			)
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("iterate candidate consumed outputs: %w", err)
 		}
-		facts[ref] = factCount
-		if _, found := candidateSet[publicationID]; !found {
-			candidateSet[publicationID] = struct{}{}
-			candidateIDs = append(candidateIDs, publicationID)
+		if err := rows.Close(); err != nil {
+			return fmt.Errorf("close candidate consumed outputs: %w", err)
 		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate candidate consumed outputs: %w", err)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	activeIDs, err := d.activeCandidatePublications(ctx, snapshot, candidateIDs)
 	if err != nil {
@@ -400,6 +420,31 @@ GROUP BY source_tx_hash, source_output_index, publication_id`
 	return ret, nil
 }
 
+func forEachOutputRefChunk(
+	refs []publication.OutputRef,
+	visit func([]publication.OutputRef) error,
+) error {
+	for start := 0; start < len(refs); start += outputRefQueryChunkSize {
+		end := min(start+outputRefQueryChunkSize, len(refs))
+		if err := visit(refs[start:end]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func outputRefQueryParameters(
+	refs []publication.OutputRef,
+) ([]string, []uint32) {
+	hashes := make([]string, 0, len(refs))
+	indexes := make([]uint32, 0, len(refs))
+	for _, ref := range refs {
+		hashes = append(hashes, string(ref.Hash[:]))
+		indexes = append(indexes, ref.Index)
+	}
+	return hashes, indexes
+}
+
 func (d *DB) activeCandidatePublications(
 	ctx context.Context,
 	snapshot uint64,
@@ -428,31 +473,89 @@ FROM
       AND ce.event_kind = 'invalidation'
 )
 GROUP BY publication_id
-HAVING argMax(active, event_seq) = true`
-	activeRows, err := d.conn.Query(
-		ctx,
-		membershipQuery,
-		candidateIDs,
-		snapshot,
-		candidateIDs,
-		snapshot,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("query candidate publication membership: %w", err)
-	}
-	defer activeRows.Close()
+	HAVING argMax(active, event_seq) = true`
+	uniqueCandidateIDs := uniquePublicationIDs(candidateIDs)
 	var ret []uint64
-	for activeRows.Next() {
-		var publicationID uint64
-		if err := activeRows.Scan(&publicationID); err != nil {
-			return nil, fmt.Errorf("scan candidate publication membership: %w", err)
+	returned := make(map[uint64]struct{}, len(uniqueCandidateIDs))
+	for start := 0; start < len(uniqueCandidateIDs); start += candidatePublicationQueryChunkSize {
+		end := min(
+			start+candidatePublicationQueryChunkSize,
+			len(uniqueCandidateIDs),
+		)
+		chunk := uniqueCandidateIDs[start:end]
+		chunkSet := make(map[uint64]struct{}, len(chunk))
+		for _, publicationID := range chunk {
+			chunkSet[publicationID] = struct{}{}
 		}
-		ret = append(ret, publicationID)
-	}
-	if err := activeRows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate candidate publication membership: %w", err)
+		activeRows, err := d.conn.Query(
+			ctx,
+			membershipQuery,
+			chunk,
+			snapshot,
+			chunk,
+			snapshot,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("query candidate publication membership: %w", err)
+		}
+		for activeRows.Next() {
+			var publicationID uint64
+			if err := activeRows.Scan(&publicationID); err != nil {
+				activeRows.Close()
+				return nil, fmt.Errorf("scan candidate publication membership: %w", err)
+			}
+			if _, expected := chunkSet[publicationID]; !expected {
+				activeRows.Close()
+				return nil, fmt.Errorf(
+					"membership chunk returned unrequested publication %d",
+					publicationID,
+				)
+			}
+			if _, duplicate := returned[publicationID]; duplicate {
+				activeRows.Close()
+				return nil, fmt.Errorf(
+					"membership chunks returned publication %d more than once",
+					publicationID,
+				)
+			}
+			returned[publicationID] = struct{}{}
+			ret = append(ret, publicationID)
+		}
+		if err := activeRows.Err(); err != nil {
+			activeRows.Close()
+			return nil, fmt.Errorf("iterate candidate publication membership: %w", err)
+		}
+		if err := activeRows.Close(); err != nil {
+			return nil, fmt.Errorf("close candidate publication membership: %w", err)
+		}
 	}
 	return ret, nil
+}
+
+func uniqueOutputRefs(refs []publication.OutputRef) []publication.OutputRef {
+	ret := make([]publication.OutputRef, 0, len(refs))
+	seen := make(map[publication.OutputRef]struct{}, len(refs))
+	for _, ref := range refs {
+		if _, duplicate := seen[ref]; duplicate {
+			continue
+		}
+		seen[ref] = struct{}{}
+		ret = append(ret, ref)
+	}
+	return ret
+}
+
+func uniquePublicationIDs(candidateIDs []uint64) []uint64 {
+	ret := make([]uint64, 0, len(candidateIDs))
+	seen := make(map[uint64]struct{}, len(candidateIDs))
+	for _, publicationID := range candidateIDs {
+		if _, duplicate := seen[publicationID]; duplicate {
+			continue
+		}
+		seen[publicationID] = struct{}{}
+		ret = append(ret, publicationID)
+	}
+	return ret
 }
 
 func (d *DB) ExistingDatumBodies(
