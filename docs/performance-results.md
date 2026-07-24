@@ -133,6 +133,7 @@ in every run.
 | 3 | 2,048 | 481.07 | 488.24 | 1,047 ms |
 | 4 | 512 | 519.90 | 517.38 | 1,066 ms |
 | 5 | 2,048 | 410.30 | 415.50 | 1,055 ms |
+| 6 | 8,000, with 16,000 prefilled | 378.10 | 375.53 | 1,066 ms |
 
 Every sample had 32,768 unique block numbers, hashes, publication IDs, and
 adoption events, with valid two-operator provenance, zero mismatches, and zero
@@ -150,8 +151,18 @@ A separate actual-relay canary successfully fetched complete 8,000-block
 ranges, confirming that 512 is not a protocol limit. It then exhausted the
 header backlog, waited seconds for each next range, fell to roughly 184-208
 blocks/second, and caused a keepalive timeout and reconnect. Larger batches
-therefore reduce overlap on this single connection rather than increasing
-wire throughput. The production default remains 512 blocks.
+therefore reduce overlap on this single connection rather than increasing wire
+throughput.
+
+A follow-up canary explicitly waited for 16,000 headers before starting the
+first 8,000-block fetch. Only the preloaded second range was ready in advance;
+the following nine transitions waited for headers. Across its first 80,000
+blocks, throughput was 398.31 blocks/second including prefill and 406.20 after
+the reserve drained. Measuring only from the first arriving body hid the
+prefill cost and produced a misleading 461.31 blocks/second. At ten completed
+ranges, the slower relay's fetch duty was 54.2% with 7.19 seconds of average
+inter-range idle. The exact fixed-span row above remained below both 512
+controls. The production default remains 512 blocks.
 
 ## Crash and query contract
 

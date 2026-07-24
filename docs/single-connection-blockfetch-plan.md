@@ -559,6 +559,14 @@ actual-relay canary fell near 184-208 blocks/second and caused a keepalive
 reconnect after exhausting its header backlog. Larger ranges are supported,
 but are not a throughput optimization on the measured single connection.
 
+A second 8,000-block canary waited for two complete ranges (16,000 headers)
+before starting BlockFetch. The preloaded second range was ready immediately,
+but the following nine transitions all waited for headers. Its same-span rate
+was 378.10 blocks/second; over 80,000 blocks it sustained 398.31 including
+prefill and 406.20 after the reserve drained. The slower relay spent only 54.2%
+of wall time fetching and averaged 7.19 seconds idle between ranges. Initial
+backlog changes burst timing, not the steady-state header/body flow rate.
+
 ## 9. Test policy
 
 Testing stays deliberately small:
