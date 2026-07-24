@@ -1599,6 +1599,15 @@ func validateOutputEraCapabilities(
 			)
 		}
 	}
+	if level >= 4 {
+		if err := validateShelleyOutputAddressShape(output.Address, false); err != nil {
+			return transactionCorruption(
+				"%s output contains a non-canonical address: %v",
+				era,
+				err,
+			)
+		}
+	}
 	if level < 2 && len(output.Assets) != 0 {
 		return transactionCorruption(
 			"%s output contains multi-assets",

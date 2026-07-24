@@ -274,21 +274,20 @@ func paymentCredentialFromRawAddress(address []byte) (string, []byte, error) {
 	}
 	var (
 		kind string
-		want int
 	)
 	switch addressType {
 	case 0, 2:
-		kind, want = "key", 57
+		kind = "key"
 	case 1, 3:
-		kind, want = "script", 57
+		kind = "script"
 	case 4:
 		kind = "key"
 	case 5:
 		kind = "script"
 	case 6:
-		kind, want = "key", 29
+		kind = "key"
 	case 7:
-		kind, want = "script", 29
+		kind = "script"
 	case 14, 15:
 		return "", nil, fmt.Errorf(
 			"reward address type %d is not a transaction output address",
@@ -297,25 +296,57 @@ func paymentCredentialFromRawAddress(address []byte) (string, []byte, error) {
 	default:
 		return "", nil, fmt.Errorf("unsupported output address type %d", addressType)
 	}
-	if addressType == 4 || addressType == 5 {
-		if len(address) <= 29 {
-			return "", nil, errors.New("pointer output address is truncated")
+	if err := validateShelleyOutputAddressShape(address, true); err != nil {
+		return "", nil, err
+	}
+	return kind, bytes.Clone(address[1:29]), nil
+}
+
+func validateShelleyOutputAddressShape(
+	address []byte,
+	allowHistoricalSurplus bool,
+) error {
+	addressType := address[0] >> 4
+	var expected int
+	switch addressType {
+	case 0, 1, 2, 3:
+		expected = 57
+	case 4, 5:
+		if len(address) < 29 {
+			return fmt.Errorf(
+				"pointer output address has length %d, want at least 29",
+				len(address),
+			)
 		}
-		if err := validatePointerAddressSuffix(address[29:]); err != nil {
-			return "", nil, err
+		return validatePointerAddressSuffix(
+			address[29:],
+			allowHistoricalSurplus,
+		)
+	case 6, 7:
+		expected = 29
+	default:
+		return nil
+	}
+	if len(address) < expected ||
+		(!allowHistoricalSurplus && len(address) != expected) {
+		want := fmt.Sprintf("%d", expected)
+		if allowHistoricalSurplus {
+			want = fmt.Sprintf("at least %d", expected)
 		}
-	} else if len(address) != want {
-		return "", nil, fmt.Errorf(
-			"output address type %d has length %d, want %d",
+		return fmt.Errorf(
+			"output address type %d has length %d, want %s",
 			addressType,
 			len(address),
 			want,
 		)
 	}
-	return kind, bytes.Clone(address[1:29]), nil
+	return nil
 }
 
-func validatePointerAddressSuffix(suffix []byte) error {
+func validatePointerAddressSuffix(
+	suffix []byte,
+	allowHistoricalSurplus bool,
+) error {
 	offset := 0
 	componentLimits := [...]uint64{math.MaxUint32, math.MaxUint16, math.MaxUint16}
 	for component, limit := range componentLimits {
@@ -328,7 +359,10 @@ func validatePointerAddressSuffix(suffix []byte) error {
 			value := suffix[offset]
 			offset++
 			digit := uint64(value & 0x7f)
-			if offset == start+1 && value&0x80 != 0 && digit == 0 {
+			if !allowHistoricalSurplus &&
+				offset == start+1 &&
+				value&0x80 != 0 &&
+				digit == 0 {
 				return fmt.Errorf(
 					"pointer address component %d has a non-canonical leading zero",
 					component,
@@ -347,7 +381,7 @@ func validatePointerAddressSuffix(suffix []byte) error {
 			}
 		}
 	}
-	if offset != len(suffix) {
+	if !allowHistoricalSurplus && offset != len(suffix) {
 		return fmt.Errorf("pointer address has %d trailing bytes", len(suffix)-offset)
 	}
 	return nil

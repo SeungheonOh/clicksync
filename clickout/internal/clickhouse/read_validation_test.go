@@ -1,8 +1,10 @@
 package clickhouse
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"hash/crc32"
 	"testing"
 
@@ -136,15 +138,19 @@ func TestOutputAddressPaymentCredentialValidation(t *testing.T) {
 	}{
 		{"base key", append(append([]byte{0x01}, hash...), baseStake...), "key", &asString, true},
 		{"base script", append(append([]byte{0x11}, hash...), baseStake...), "script", &asString, true},
+		{"base trailing", append(append(append([]byte{0x01}, hash...), baseStake...), 0xaa), "key", &asString, true},
 		{"enterprise key", append([]byte{0x61}, hash...), "key", &asString, true},
 		{"enterprise script", append([]byte{0x71}, hash...), "script", &asString, true},
+		{"enterprise trailing", append(append([]byte{0x61}, hash...), 0xaa), "key", &asString, true},
 		{"pointer key", append(append([]byte{0x41}, hash...), 0, 0, 0), "key", &asString, true},
+		{"pointer trailing", append(append([]byte{0x41}, hash...), 0, 0, 0, 0xaa), "key", &asString, true},
+		{"pointer noncanonical", append(append([]byte{0x41}, hash...), 0x80, 0, 0, 0), "key", &asString, true},
 		{"Byron none", testByronAddress(), "none", nil, true},
 		{"wrong network", append([]byte{0x60}, hash...), "key", &asString, false},
 		{"reward output", append([]byte{0xe1}, hash...), "key", &asString, false},
 		{"pointer truncated", append(append([]byte{0x41}, hash...), 0, 0), "key", &asString, false},
-		{"pointer trailing", append(append([]byte{0x41}, hash...), 0, 0, 0, 0), "key", &asString, false},
-		{"pointer noncanonical", append(append([]byte{0x41}, hash...), 0x80, 0, 0, 0), "key", &asString, false},
+		{"base truncated", append(append([]byte{0x01}, hash...), baseStake[:27]...), "key", &asString, false},
+		{"enterprise truncated", append([]byte{0x61}, hash[:27]...), "key", &asString, false},
 		{"credential kind mismatch", append([]byte{0x61}, hash...), "script", &asString, false},
 		{"empty credential", append([]byte{0x61}, hash...), "none", nil, false},
 	}
@@ -172,6 +178,54 @@ func TestOutputAddressPaymentCredentialValidation(t *testing.T) {
 	}
 }
 
+func TestHistoricalTrailingAddressReadValidationIsEraAware(t *testing.T) {
+	t.Parallel()
+	raw, err := hex.DecodeString(
+		"015bad085057ac10ecc643450a2031ae566ff63b395153cea2d023ba67" +
+			"0e3a8d3f188fd573eca848a2380eb6d57cf698be9eb750d14816f5e1" +
+			"13d5f4a3fe0478b2241e0168e3cba5001a22c15a11",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != 78 {
+		t.Fatalf("fixture address has %d bytes, want 78", len(raw))
+	}
+	credential, err := hex.DecodeString(
+		"5bad085057ac10ecc643450a2031ae566ff63b395153cea2d023ba67",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentialString := string(credential)
+	output, err := makeOutput(outputValues{
+		txHash:      make([]byte, 32),
+		blockHash:   make([]byte, 32),
+		kind:        "regular",
+		address:     raw,
+		paymentKind: "key",
+		paymentHash: &credentialString,
+		datumKind:   "none",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(output.Address, raw) ||
+		!bytes.Equal(output.PaymentCredentialHash, credential) {
+		t.Fatalf(
+			"output address/credential = %x / %x",
+			output.Address,
+			output.PaymentCredentialHash,
+		)
+	}
+	if err := validateOutputEraCapabilities(output, "Alonzo", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateOutputEraCapabilities(output, "Babbage", false); !errors.Is(err, ErrConflictingRow) {
+		t.Fatalf("Babbage validation error = %v", err)
+	}
+}
+
 func TestPointerAddressCanonicalBounds(t *testing.T) {
 	t.Parallel()
 	valid := [][]byte{
@@ -180,7 +234,7 @@ func TestPointerAddressCanonicalBounds(t *testing.T) {
 		{0x8f, 0xff, 0xff, 0xff, 0x7f, 0, 0},
 	}
 	for _, suffix := range valid {
-		if err := validatePointerAddressSuffix(suffix); err != nil {
+		if err := validatePointerAddressSuffix(suffix, false); err != nil {
 			t.Fatalf("valid pointer suffix %x rejected: %v", suffix, err)
 		}
 	}
@@ -190,7 +244,7 @@ func TestPointerAddressCanonicalBounds(t *testing.T) {
 		{0, 0x84, 0x80, 0, 0},
 	}
 	for _, suffix := range invalid {
-		if err := validatePointerAddressSuffix(suffix); err == nil {
+		if err := validatePointerAddressSuffix(suffix, false); err == nil {
 			t.Fatalf("invalid pointer suffix %x accepted", suffix)
 		}
 	}
