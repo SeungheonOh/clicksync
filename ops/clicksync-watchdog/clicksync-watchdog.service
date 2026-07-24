@@ -1,0 +1,16 @@
+[Unit]
+Description=External Clicksync Docker storage and container watchdog
+After=docker.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/libexec/clicksync-watchdog
+EnvironmentFile=-%h/.config/clicksync-watchdog/environment
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
