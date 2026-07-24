@@ -2,6 +2,7 @@ package normalize
 
 import (
 	"bytes"
+	"encoding/hex"
 	"math"
 	"math/big"
 	"strings"
@@ -492,7 +493,7 @@ func TestCertificateAndProposalRedeemersPersistCompactTargetIdentity(t *testing.
 	}
 }
 
-func TestPaymentCredentialExtractionIsStrict(t *testing.T) {
+func TestPaymentCredentialExtractionIsLedgerCompatible(t *testing.T) {
 	address := func(header byte, payment byte, suffix []byte) []byte {
 		ret := append([]byte{header}, bytesOf(payment, 28)...)
 		return append(ret, suffix...)
@@ -510,6 +511,9 @@ func TestPaymentCredentialExtractionIsStrict(t *testing.T) {
 		{"pointer script", address(0x51, 0x44, []byte{0, 0, 0}), "script", 0x44},
 		{"enterprise key", address(0x61, 0x55, nil), "key", 0x55},
 		{"enterprise script", address(0x71, 0x66, nil), "script", 0x66},
+		{"base trailing", address(0x01, 0x77, append(baseStake, 0xaa)), "key", 0x77},
+		{"pointer trailing", address(0x41, 0x88, []byte{0, 0, 0, 0xaa}), "key", 0x88},
+		{"enterprise trailing", address(0x61, 0x99, []byte{0xaa}), "key", 0x99},
 	}
 	byron, err := lcommon.NewByronAddressFromParts(
 		lcommon.ByronAddressTypePubkey,
@@ -531,7 +535,7 @@ func TestPaymentCredentialExtractionIsStrict(t *testing.T) {
 	}{"Byron unsupported", byronRaw, "none", 0})
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			kind, hash, err := paymentCredentialFromAddress(test.raw)
+			kind, hash, err := paymentCredentialFromAddress(test.raw, "Alonzo")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -550,17 +554,65 @@ func TestPaymentCredentialExtractionIsStrict(t *testing.T) {
 	malformed := [][]byte{
 		address(0x60, 0x11, nil),
 		address(0x70, 0x11, nil),
-		address(0x61, 0x11, []byte{0}),
 		address(0x41, 0x11, []byte{0, 0}),
-		address(0x41, 0x11, []byte{0, 0, 0, 0}),
 		{0x91},
 		address(0xe1, 0x77, nil),
 		address(0xf1, 0x77, nil),
 	}
 	for _, raw := range malformed {
-		if _, _, err := paymentCredentialFromAddress(raw); err == nil {
+		if _, _, err := paymentCredentialFromAddress(raw, "Alonzo"); err == nil {
 			t.Fatalf("malformed address accepted: %x", raw)
 		}
+	}
+	for _, raw := range [][]byte{
+		address(0x01, 0x11, append(baseStake, 0xaa)),
+		address(0x41, 0x11, []byte{0, 0, 0, 0xaa}),
+		address(0x61, 0x11, []byte{0xaa}),
+	} {
+		if _, _, err := paymentCredentialFromAddress(raw, "Babbage"); err == nil {
+			t.Fatalf("Babbage trailing address accepted: %x", raw)
+		}
+	}
+}
+
+func TestPaymentCredentialFromHistoricalTrailingBaseAddress(t *testing.T) {
+	raw, err := hex.DecodeString(
+		"015bad085057ac10ecc643450a2031ae566ff63b395153cea2d023ba67" +
+			"0e3a8d3f188fd573eca848a2380eb6d57cf698be9eb750d14816f5e1" +
+			"13d5f4a3fe0478b2241e0168e3cba5001a22c15a11",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != 78 {
+		t.Fatalf("fixture address has %d bytes, want 78", len(raw))
+	}
+	want, err := hex.DecodeString(
+		"5bad085057ac10ecc643450a2031ae566ff63b395153cea2d023ba67",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kind, hash, err := paymentCredentialFromAddress(raw, "Alonzo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kind != "key" || hash == nil || !bytes.Equal(hash[:], want) {
+		t.Fatalf("credential = %q %x, want key %x", kind, hash, want)
+	}
+	if _, _, err := paymentCredentialFromAddress(raw, "Babbage"); err == nil {
+		t.Fatal("historical trailing address was accepted as Babbage")
+	}
+	decoded, err := lcommon.NewAddressFromBytes(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip, err := decoded.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(roundTrip, raw) {
+		t.Fatalf("raw address was not preserved: got %x, want %x", roundTrip, raw)
 	}
 }
 

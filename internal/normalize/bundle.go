@@ -149,6 +149,7 @@ func transactionBundle(
 				uint32(index),
 				uint32(index),
 				"regular",
+				era,
 				output,
 				datums,
 			)
@@ -168,6 +169,7 @@ func transactionBundle(
 			uint32(len(tx.Outputs())),
 			0,
 			"collateral_return",
+			era,
 			output,
 			datums,
 		)
@@ -290,19 +292,21 @@ func rejectSpendingReferenceOverlap(inputs []model.Input) error {
 
 func paymentCredentialFromAddress(
 	address []byte,
+	era string,
 ) (string, *model.Hash28, error) {
 	if len(address) == 0 {
 		return "", nil, errors.New("empty address")
 	}
-	if _, err := lcommon.NewAddressFromBytes(address); err != nil {
+	decoded, err := lcommon.NewAddressFromBytes(address)
+	if err != nil {
 		return "", nil, fmt.Errorf("decode address: %w", err)
 	}
-	addressType := address[0] >> 4
+	addressType := decoded.Type()
 	if addressType != lcommon.AddressTypeByron &&
-		address[0]&lcommon.AddressHeaderNetworkMask != lcommon.AddressNetworkMainnet {
+		decoded.NetworkId() != lcommon.AddressNetworkMainnet {
 		return "", nil, fmt.Errorf(
 			"Shelley-family output address network ID %d is not pinned mainnet",
-			address[0]&lcommon.AddressHeaderNetworkMask,
+			decoded.NetworkId(),
 		)
 	}
 	switch addressType {
@@ -318,7 +322,8 @@ func paymentCredentialFromAddress(
 		lcommon.AddressTypeKeyScript,
 		lcommon.AddressTypeScriptKey,
 		lcommon.AddressTypeScriptScript:
-		if len(address) != 1+2*lcommon.AddressHashSize {
+		if eraUsesStrictAddresses(era) &&
+			len(address) != 1+2*lcommon.AddressHashSize {
 			return "", nil, fmt.Errorf(
 				"base address type %d has length %d, want %d",
 				addressType,
@@ -328,7 +333,8 @@ func paymentCredentialFromAddress(
 		}
 	case lcommon.AddressTypeKeyNone,
 		lcommon.AddressTypeScriptNone:
-		if len(address) != 1+lcommon.AddressHashSize {
+		if eraUsesStrictAddresses(era) &&
+			len(address) != 1+lcommon.AddressHashSize {
 			return "", nil, fmt.Errorf(
 				"enterprise address type %d has length %d, want %d",
 				addressType,
@@ -338,14 +344,18 @@ func paymentCredentialFromAddress(
 		}
 	case lcommon.AddressTypeKeyPointer,
 		lcommon.AddressTypeScriptPointer:
-		if err := validatePointerAddressSuffix(address[1+lcommon.AddressHashSize:]); err != nil {
+		if err := validatePointerAddressSuffix(
+			address[1+lcommon.AddressHashSize:],
+			!eraUsesStrictAddresses(era),
+		); err != nil {
 			return "", nil, err
 		}
 	default:
 		return "", nil, fmt.Errorf("unknown address type %d", addressType)
 	}
+	paymentHash := decoded.PaymentKeyHash()
 	hash, err := hash28(
-		address[1:1+lcommon.AddressHashSize],
+		paymentHash.Bytes(),
 		"payment credential",
 	)
 	if err != nil {
@@ -362,10 +372,20 @@ func paymentCredentialFromAddress(
 	return kind, &hash, nil
 }
 
-func validatePointerAddressSuffix(suffix []byte) error {
+func eraUsesStrictAddresses(era string) bool {
+	switch era {
+	case "Shelley", "Allegra", "Mary", "Alonzo":
+		return false
+	default:
+		return true
+	}
+}
+
+func validatePointerAddressSuffix(suffix []byte, allowTrailing bool) error {
 	offset := 0
 	limits := [...]uint64{math.MaxUint32, math.MaxUint16, math.MaxUint16}
 	for component, limit := range limits {
+		start := offset
 		var accumulated uint64
 		for {
 			if offset >= len(suffix) {
@@ -374,6 +394,15 @@ func validatePointerAddressSuffix(suffix []byte) error {
 			value := suffix[offset]
 			offset++
 			digit := uint64(value & 0x7f)
+			if !allowTrailing &&
+				offset == start+1 &&
+				value&0x80 != 0 &&
+				digit == 0 {
+				return fmt.Errorf(
+					"pointer address component %d has a non-canonical leading zero",
+					component,
+				)
+			}
 			if accumulated > (limit-digit)>>7 {
 				return fmt.Errorf(
 					"pointer address component %d exceeds ledger bound %d",
@@ -387,7 +416,7 @@ func validatePointerAddressSuffix(suffix []byte) error {
 			}
 		}
 	}
-	if offset != len(suffix) {
+	if !allowTrailing && offset != len(suffix) {
 		return fmt.Errorf("pointer address has %d trailing bytes", len(suffix)-offset)
 	}
 	return nil
@@ -399,6 +428,7 @@ func outputBundle(
 	index uint32,
 	ordinal uint32,
 	kind string,
+	era string,
 	output lcommon.TransactionOutput,
 	datums bundleDatumCollector,
 ) (model.Output, []model.DatumObservation, error) {
@@ -420,7 +450,7 @@ func outputBundle(
 	if err != nil {
 		return model.Output{}, nil, err
 	}
-	paymentKind, paymentHash, err := paymentCredentialFromAddress(address)
+	paymentKind, paymentHash, err := paymentCredentialFromAddress(address, era)
 	if err != nil {
 		return model.Output{}, nil, fmt.Errorf("payment credential: %w", err)
 	}
