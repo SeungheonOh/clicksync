@@ -199,7 +199,7 @@ Initial defaults:
 | Boundary | Default |
 |---|---:|
 | gOuroboros BlockFetch receive queue | 512 messages |
-| headers per BlockFetch range | 512 |
+| headers per BlockFetch range | 512 initially; this is not a protocol maximum |
 | per-relay emitted events | 256 |
 | agreed raw blocks | 256 blocks / 256 MiB |
 | concurrent normalizers | `GOMAXPROCS` |
@@ -208,6 +208,12 @@ Initial defaults:
 
 Configuration may lower these values. Raising hard limits requires benchmark
 and memory evidence.
+
+The approved single-connection throughput refactor separates receive-queue
+capacity from BlockFetch range length and overlaps ChainSync header prefetch
+with sequential BlockFetch on the same N2N connection. Multiple connections
+per relay are explicitly out of scope. See
+[Single-connection BlockFetch throughput plan](single-connection-blockfetch-plan.md).
 
 Backpressure is end-to-end. When ClickHouse is slower, publication fills,
 then normalization fills, then agreement fills, then BlockFetch stops reading.

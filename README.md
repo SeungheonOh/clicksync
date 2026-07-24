@@ -166,6 +166,12 @@ The isolated ClickHouse writer published 100,352 generated-fact blocks at
 insertion—was the live bottleneck. See
 [Measured performance](docs/performance-results.md).
 
+The intake trace also identified a serialized ChainSync/BlockFetch range
+bubble. The approved follow-up keeps one N2N connection per relay, supports
+protocol-valid ranges larger than 512, and prefetches the next header range
+while the current body range streams. See the
+[single-connection BlockFetch throughput plan](docs/single-connection-blockfetch-plan.md).
+
 ## Supported data
 
 Checked-in real fixtures cover Byron main/EBB, Shelley, Allegra, Mary, Alonzo,
