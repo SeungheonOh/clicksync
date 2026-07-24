@@ -46,10 +46,11 @@ docker run --rm --network none \
 ## First run
 
 Copy `.env.example` to `.env` and replace the password. The example starts at
-the corroborated post-van-Rossem/PV11 point
-`193253841:e98663bea810a45b59bf2783e40dbd2c69f79e1594b4cd0e160646a3f587eb13`.
-Clicksync BlockFetches that boundary and derives its height; the resulting
-dataset is correctly reported as partial history.
+the predecessor of the Alonzo boundary, block `6236059` at
+`39916796:e72579ff89dc9ed325b723a33624b596c08141c7bd573ecfff56a1f7229e4d09`.
+Clicksync BlockFetches that boundary and derives its height, but excludes it
+from the dataset. The first persisted block is Alonzo block `6236060` at slot
+`39916975`; the resulting dataset is correctly reported as partial history.
 
 Build from a clean, committed tree so the image carries the exact source
 identity, migrate once, then start continuous ingestion:
@@ -62,12 +63,13 @@ docker compose run --rm clicksync migrate
 docker compose up
 ```
 
-The example publishes ClickHouse's password-authenticated native protocol on
-all host interfaces at port `19000` for an independently run Clickout client.
-The host port is controlled by `CLICKHOUSE_NATIVE_PORT` and defaults to `9000`
-when unset; Clicksync's container-to-container connection remains
-`clickhouse:9000`. Restrict the published port with the host firewall as
-appropriate. A host Clickout process uses:
+The example publishes ClickHouse's password-authenticated HTTP and native
+protocols on all host interfaces at ports `18125` and `19000`, respectively.
+The host ports are controlled by `CLICKHOUSE_HTTP_PORT` and
+`CLICKHOUSE_NATIVE_PORT`; their Compose defaults are `18125` and `9000`.
+Clicksync's container-to-container connection remains `clickhouse:9000`.
+Restrict both published ports with the host firewall as appropriate. A host
+Clickout process uses:
 
 ```sh
 export CLICKOUT_CLICKHOUSE_ADDR=127.0.0.1:19000

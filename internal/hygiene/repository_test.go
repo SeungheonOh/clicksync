@@ -248,16 +248,20 @@ func TestComposeStopGraceExceedsAggregateShutdownBudget(t *testing.T) {
 	}
 }
 
-func TestComposePublishesPasswordAuthenticatedNativePort(t *testing.T) {
+func TestComposePublishesClickHousePortsAndAlonzoStart(t *testing.T) {
 	_, file, _, _ := runtime.Caller(0)
 	root := filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
 	compose, err := os.ReadFile(filepath.Join(root, "compose.yaml"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	const hostMapping = `"0.0.0.0:${CLICKHOUSE_NATIVE_PORT:-9000}:9000"`
-	if !strings.Contains(string(compose), hostMapping) {
-		t.Fatalf("compose native host mapping does not contain %s", hostMapping)
+	const httpHostMapping = `"0.0.0.0:${CLICKHOUSE_HTTP_PORT:-18125}:8123"`
+	if !strings.Contains(string(compose), httpHostMapping) {
+		t.Fatalf("compose HTTP host mapping does not contain %s", httpHostMapping)
+	}
+	const nativeHostMapping = `"0.0.0.0:${CLICKHOUSE_NATIVE_PORT:-9000}:9000"`
+	if !strings.Contains(string(compose), nativeHostMapping) {
+		t.Fatalf("compose native host mapping does not contain %s", nativeHostMapping)
 	}
 	if !strings.Contains(
 		string(compose),
@@ -271,6 +275,13 @@ func TestComposePublishesPasswordAuthenticatedNativePort(t *testing.T) {
 	}
 	if !strings.Contains(string(example), "CLICKHOUSE_NATIVE_PORT=19000") {
 		t.Fatal("example must select the collision-free host native port 19000")
+	}
+	const alonzoPredecessor = "39916796:e72579ff89dc9ed325b723a33624b596c08141c7bd573ecfff56a1f7229e4d09"
+	if !strings.Contains(string(compose), alonzoPredecessor) {
+		t.Fatal("compose default must start at the Alonzo predecessor")
+	}
+	if !strings.Contains(string(example), "CLICKSYNC_START_POINT="+alonzoPredecessor) {
+		t.Fatal("example must start at the Alonzo predecessor")
 	}
 }
 
