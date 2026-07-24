@@ -176,7 +176,9 @@ an actual two-relay run writing to ClickHouse sustained about 545-585 agreed
 and published blocks/second, with no reconnects or mismatches in the measured
 run. A packet capture showed one 20-request refill write about every 29-31 ms.
 Public-relay conditions vary, so this is an observed range rather than a fixed
-service rate.
+service rate. A later, denser span ran near 380 blocks/second at about
+72 Mbit/second per relay; its byte rate predicted 380 blocks/second from the
+observed 23.6 kB mean block size.
 
 The isolated ClickHouse writer published 100,352 generated-fact blocks at
 87,402 blocks/second and 786,614 fact rows/second. Public-relay intake—not

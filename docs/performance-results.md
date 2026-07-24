@@ -97,6 +97,16 @@ those refill writes about every 29-31 ms on average. They were distributed
 throughout the response stream rather than delayed until all 100 responses
 had arrived.
 
+The final committed build later crossed a denser span at 380.17 agreed
+blocks/second. Mean raw size was 23,572 bytes/block and the limiting relay
+delivered 71.64 Mbit/second, which predicts 379.89 blocks/second from byte
+throughput alone. Its ChainSync rate was 381.82 headers/second, BlockFetch rate
+was 378.96 bodies/second, 278 headers were already pending, and BlockFetch duty
+was 94.5%. For comparison, the faster span averaged 14,741 bytes/block:
+64.39 Mbit/second predicts 546.00 blocks/second, matching its observed rate.
+This reconciles the block-rate variation with relay body bandwidth and block
+size; neither header starvation nor ClickHouse insertion explains it.
+
 During the continued integrity run, one snapshot contained 436,358 block rows
 and 436,358 unique block hashes across the inclusive block-number span
 10,781,331 through 11,217,688, with no malformed two-operator provenance.

@@ -29,6 +29,13 @@ packet capture showed one 20-request refill write about every 29-31 ms. Public
 relay and block-span variability make this an observed range, not a fixed
 throughput guarantee.
 
+A later, denser span averaged 23.6 kB/block and ran near 380 blocks/second at
+about 72 Mbit/second per relay. That byte rate predicts 380 blocks/second,
+while ChainSync headers remained ahead of bodies and the limiting BlockFetch
+worker stayed about 95% active. This ties the lower block count directly to
+relay body bandwidth and block size rather than insertion or an empty header
+pipeline.
+
 ## 2. Performance invariants
 
 Ordinary roll-forward must have:
