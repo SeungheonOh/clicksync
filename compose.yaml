@@ -1,0 +1,73 @@
+name: cardano-clicksync
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server@sha256:1f7cd090d5c4e2b8bfe0ea5d8ae6125937e1d932c6371b4d25fbd6088829dc9c
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clicksync}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "0.0.0.0:${CLICKHOUSE_HTTP_PORT:-18125}:8123"
+      - "127.0.0.1:${CLICKHOUSE_NATIVE_PORT:-19000}:9000"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - clickhouse-logs:/var/log/clickhouse-server
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          clickhouse-client
+          --user "$${CLICKHOUSE_USER}"
+          --password "$${CLICKHOUSE_PASSWORD}"
+          --query "SELECT 1"
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  migrate:
+    build:
+      context: .
+      args:
+        CLICKSYNC_BUILD_ID: ${CLICKSYNC_BUILD_ID:-development}
+    command: ["migrate"]
+    restart: "no"
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    environment: &clicksync-environment
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_NATIVE_PORT: "9000"
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clicksync}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DATABASE: clicksync
+      CLICKHOUSE_OPEN_CONNS: ${CLICKHOUSE_OPEN_CONNS:-16}
+
+  clicksync:
+    build:
+      context: .
+      args:
+        CLICKSYNC_BUILD_ID: ${CLICKSYNC_BUILD_ID:-development}
+    command: ["sync"]
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 60s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *clicksync-environment
+      CARDANO_NETWORK_NAME: ${CARDANO_NETWORK_NAME:-mainnet}
+      CARDANO_NETWORK_MAGIC: ${CARDANO_NETWORK_MAGIC:-764824073}
+      CARDANO_RELAYS: ${CARDANO_RELAYS:-backbone.cardano.iog.io:3001|iog,backbone.mainnet.cardanofoundation.org:3001|cardano-foundation}
+      CLICKSYNC_START: ${CLICKSYNC_START:-133660799:e757d57eb8dc9500a61c60a39fadb63d9be6973ba96ae337fd24453d4d15c343:10781330}
+      CLICKSYNC_LOCK_PATH: /var/lib/clicksync/writer.lock
+    volumes:
+      - clicksync-state:/var/lib/clicksync
+
+volumes:
+  clickhouse-data:
+  clickhouse-logs:
+  clicksync-state:

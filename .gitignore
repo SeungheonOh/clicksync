@@ -1,0 +1,6 @@
+/.tmp/
+/.env
+/clickhouse-data/
+/clicksync-state/
+/clicksync
+coverage.out
