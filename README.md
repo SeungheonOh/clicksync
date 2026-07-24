@@ -62,6 +62,20 @@ docker compose run --rm clicksync migrate
 docker compose up
 ```
 
+The example publishes ClickHouse's password-authenticated native protocol on
+all host interfaces at port `19000` for an independently run Clickout client.
+The host port is controlled by `CLICKHOUSE_NATIVE_PORT` and defaults to `9000`
+when unset; Clicksync's container-to-container connection remains
+`clickhouse:9000`. Restrict the published port with the host firewall as
+appropriate. A host Clickout process uses:
+
+```sh
+export CLICKOUT_CLICKHOUSE_ADDR=127.0.0.1:19000
+export CLICKOUT_CLICKHOUSE_USERNAME=clicksync
+export CLICKOUT_CLICKHOUSE_PASSWORD='<the configured ClickHouse password>'
+export CLICKOUT_CLICKHOUSE_DATABASE=clicksync
+```
+
 Clicksync has no cumulative block-count, tip, time, or storage stop. For a
 bounded validation run, an external harness may poll `clicksync status`, send
 `SIGTERM` after enough committed blocks, and verify the final staged prefix was

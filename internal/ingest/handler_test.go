@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -71,18 +72,89 @@ func (publisher *fakePublisher) Rollback(
 }
 
 type fakeChainState struct {
-	tip publication.Point
+	tip               publication.Point
+	effectiveSnapshot uint64
+	rawSnapshot       uint64
+	tips              map[uint64]publication.Point
+	snapshotCalls     []string
+	tipSnapshots      []uint64
 }
 
-func (*fakeChainState) CommittedSnapshot(context.Context) (uint64, error) {
+func (state *fakeChainState) CommittedSnapshot(context.Context) (uint64, error) {
+	state.snapshotCalls = append(state.snapshotCalls, "effective")
+	if state.effectiveSnapshot != 0 {
+		return state.effectiveSnapshot, nil
+	}
+	return 1, nil
+}
+
+func (state *fakeChainState) RawCommittedSnapshot(context.Context) (uint64, error) {
+	state.snapshotCalls = append(state.snapshotCalls, "raw")
+	if state.rawSnapshot != 0 {
+		return state.rawSnapshot, nil
+	}
 	return 1, nil
 }
 
 func (state *fakeChainState) CommittedTip(
-	context.Context,
-	uint64,
+	_ context.Context,
+	snapshot uint64,
 ) (publication.Point, error) {
+	state.tipSnapshots = append(state.tipSnapshots, snapshot)
+	if tip, exists := state.tips[snapshot]; exists {
+		return tip, nil
+	}
 	return state.tip, nil
+}
+
+func TestReconcileRollsBackPhysicalSuffixBeyondEffectiveIntersection(
+	t *testing.T,
+) {
+	effective := testAdapterChainPoint(10, 0x10)
+	physical := testAdapterChainPoint(20, 0x20)
+	state := &fakeChainState{
+		effectiveSnapshot: 1,
+		rawSnapshot:       513,
+		tips: map[uint64]publication.Point{
+			1:   publicationPoint(effective),
+			513: publicationPoint(physical),
+		},
+	}
+	publisher := &fakePublisher{}
+	handler := newTestHandlerWithState(t, publisher, state)
+	outcome, err := handler.Reconcile(
+		context.Background(),
+		effective,
+		syncer.SourceEvidence{
+			CheckpointMembers: []syncer.PeerEvidence{
+				{Peer: n2n.Peer{Host: "relay-a", Operator: "operator-a"}},
+				{Peer: n2n.Peer{Host: "relay-b", Operator: "operator-b"}},
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !outcome.Committed ||
+		len(publisher.rollbacks) != 1 ||
+		!samePublicationPoint(
+			publisher.rollbacks[0].To,
+			publicationPoint(effective),
+		) {
+		t.Fatalf(
+			"outcome=%+v rollbacks=%+v",
+			outcome,
+			publisher.rollbacks,
+		)
+	}
+	if !reflect.DeepEqual(state.snapshotCalls, []string{"raw"}) ||
+		!reflect.DeepEqual(state.tipSnapshots, []uint64{513}) {
+		t.Fatalf(
+			"snapshot calls=%v tip snapshots=%v",
+			state.snapshotCalls,
+			state.tipSnapshots,
+		)
+	}
 }
 
 func TestHandlerStagesThenFinalizesExactCommittedTail(t *testing.T) {

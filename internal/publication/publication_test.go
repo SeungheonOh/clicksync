@@ -43,6 +43,10 @@ func (lock *fakeLock) AssertHeld() error {
 type fakeBackend struct {
 	calls               []string
 	snapshot            uint64
+	rawSnapshot         *uint64
+	tips                map[uint64]Point
+	tipSnapshots        []uint64
+	resolutionSnapshots []uint64
 	resolved            map[OutputRef]ResolvedOutput
 	resolutions         map[OutputRef]OutputResolution
 	datums              map[model.Hash32][]byte
@@ -66,14 +70,21 @@ type fakeBackend struct {
 
 func (backend *fakeBackend) call(value string) { backend.calls = append(backend.calls, value) }
 func (backend *fakeBackend) CommittedSnapshot(context.Context) (uint64, error) {
-	backend.call("snapshot")
+	backend.call("effective_snapshot")
 	return backend.snapshot, nil
 }
 func (backend *fakeBackend) RawCommittedSnapshot(context.Context) (uint64, error) {
-	backend.call("snapshot")
+	backend.call("raw_snapshot")
+	if backend.rawSnapshot != nil {
+		return *backend.rawSnapshot, nil
+	}
 	return backend.snapshot, nil
 }
-func (backend *fakeBackend) CommittedTip(context.Context, uint64) (Point, error) {
+func (backend *fakeBackend) CommittedTip(_ context.Context, snapshot uint64) (Point, error) {
+	backend.tipSnapshots = append(backend.tipSnapshots, snapshot)
+	if tip, exists := backend.tips[snapshot]; exists {
+		return tip, nil
+	}
 	if backend.tip == (Point{}) {
 		return Point{Origin: true}, nil
 	}
@@ -84,10 +95,14 @@ func (backend *fakeBackend) GenesisState(context.Context) (bool, bool, error) {
 }
 func (backend *fakeBackend) ResolveOutputStates(
 	_ context.Context,
-	_ uint64,
+	snapshot uint64,
 	refs []OutputRef,
 ) (map[OutputRef]OutputResolution, error) {
 	backend.call("resolve")
+	backend.resolutionSnapshots = append(
+		backend.resolutionSnapshots,
+		snapshot,
+	)
 	ret := make(map[OutputRef]OutputResolution, len(refs))
 	for _, ref := range refs {
 		if resolution, found := backend.resolutions[ref]; found {
@@ -161,7 +176,12 @@ func (backend *fakeBackend) InsertAdoptionBatch(
 	backend.call("adoption")
 	if backend.adoptionInsertError == nil || backend.adoptionStatus {
 		backend.adoptions += len(attempts)
-		backend.snapshot = firstEvent + uint64(len(attempts)) - 1
+		committed := firstEvent + uint64(len(attempts)) - 1
+		if backend.rawSnapshot != nil {
+			*backend.rawSnapshot = committed
+		} else {
+			backend.snapshot = committed
+		}
 	}
 	return backend.adoptionInsertError
 }
@@ -348,7 +368,7 @@ func TestPublishBatchUsesOneTableCallAndResolvesEarlierStagedOutput(t *testing.T
 		t.Fatalf("batch result = %+v", result)
 	}
 	want := []string{
-		"snapshot", "resolve", "datums",
+		"raw_snapshot", "resolve", "datums",
 		"blocks", "transactions", "inputs", "outputs", "datum_bodies",
 		"datum_observations", "withdrawals", "redeemers", "metadata", "verify",
 		"adoption", "manifest",
@@ -362,6 +382,77 @@ func TestPublishBatchUsesOneTableCallAndResolvesEarlierStagedOutput(t *testing.T
 	}
 	if backend.adoptions != 2 || backend.snapshot != 2 {
 		t.Fatalf("adoption state = %d/%d", backend.adoptions, backend.snapshot)
+	}
+}
+
+func TestPublishBatchUsesPhysicalSnapshotWhileEffectiveIsClamped(
+	t *testing.T,
+) {
+	effectiveSnapshot := uint64(1)
+	rawSnapshot := uint64(513)
+	effectiveTip := Point{
+		Slot:        10,
+		Hash:        filled32(0x31),
+		BlockNumber: 10,
+	}
+	physicalTip := Point{
+		Slot:        20,
+		Hash:        filled32(0x32),
+		BlockNumber: 20,
+	}
+	next := validBlock()
+	next.Hash = filled32(0x33)
+	next.ParentHash = &physicalTip.Hash
+	next.Slot = physicalTip.Slot + 1
+	next.Number = physicalTip.BlockNumber + 1
+	backend := &fakeBackend{
+		snapshot:    effectiveSnapshot,
+		rawSnapshot: &rawSnapshot,
+		tips: map[uint64]Point{
+			effectiveSnapshot: effectiveTip,
+			rawSnapshot:       physicalTip,
+		},
+	}
+	coordinator := newFakeCoordinator(
+		t,
+		backend,
+		&fakeAllocator{event: rawSnapshot},
+		&fakeLock{held: true},
+		nil,
+	)
+	result, err := coordinator.PublishBatch(context.Background(), Batch{
+		Items: []BatchItem{{
+			Block:  next,
+			Source: validSource(),
+		}},
+		FirstStagedAt: testNow(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.FirstEventSeq != 514 ||
+		result.LastEventSeq != 514 ||
+		backend.lastAttempt.SnapshotEvent != 513 {
+		t.Fatalf(
+			"physical publication result=%+v attempt snapshot=%d",
+			result,
+			backend.lastAttempt.SnapshotEvent,
+		)
+	}
+	if !reflect.DeepEqual(backend.tipSnapshots, []uint64{513}) ||
+		!reflect.DeepEqual(backend.resolutionSnapshots, []uint64{513}) {
+		t.Fatalf(
+			"tip snapshots=%v resolution snapshots=%v",
+			backend.tipSnapshots,
+			backend.resolutionSnapshots,
+		)
+	}
+	if backend.snapshot != effectiveSnapshot || rawSnapshot != 514 {
+		t.Fatalf(
+			"effective snapshot=%d raw snapshot=%d",
+			backend.snapshot,
+			rawSnapshot,
+		)
 	}
 }
 

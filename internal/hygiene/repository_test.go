@@ -248,6 +248,32 @@ func TestComposeStopGraceExceedsAggregateShutdownBudget(t *testing.T) {
 	}
 }
 
+func TestComposePublishesPasswordAuthenticatedNativePort(t *testing.T) {
+	_, file, _, _ := runtime.Caller(0)
+	root := filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+	compose, err := os.ReadFile(filepath.Join(root, "compose.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const hostMapping = `"0.0.0.0:${CLICKHOUSE_NATIVE_PORT:-9000}:9000"`
+	if !strings.Contains(string(compose), hostMapping) {
+		t.Fatalf("compose native host mapping does not contain %s", hostMapping)
+	}
+	if !strings.Contains(
+		string(compose),
+		`CLICKHOUSE_NATIVE_PORT: "9000"`,
+	) {
+		t.Fatal("Clicksync internal native port must remain clickhouse:9000")
+	}
+	example, err := os.ReadFile(filepath.Join(root, ".env.example"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(example), "CLICKHOUSE_NATIVE_PORT=19000") {
+		t.Fatal("example must select the collision-free host native port 19000")
+	}
+}
+
 func durationConstant(t *testing.T, path string, name string) time.Duration {
 	t.Helper()
 	source, err := parser.ParseFile(

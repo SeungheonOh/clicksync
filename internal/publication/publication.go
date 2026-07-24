@@ -405,9 +405,9 @@ func (coordinator *Coordinator) PublishBatch(
 			return BatchResult{}, errors.New("normal chain publication is forbidden until the exact genesis bundle is complete")
 		}
 	}
-	snapshot, err := coordinator.backend.CommittedSnapshot(ctx)
+	snapshot, err := coordinator.backend.RawCommittedSnapshot(ctx)
 	if err != nil {
-		return BatchResult{}, fmt.Errorf("read committed snapshot: %w", err)
+		return BatchResult{}, fmt.Errorf("read physical committed snapshot: %w", err)
 	}
 	tip, err := coordinator.backend.CommittedTip(ctx, snapshot)
 	if err != nil {

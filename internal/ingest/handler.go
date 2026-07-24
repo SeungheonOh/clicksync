@@ -36,6 +36,7 @@ type Publisher interface {
 
 type ChainState interface {
 	CommittedSnapshot(context.Context) (uint64, error)
+	RawCommittedSnapshot(context.Context) (uint64, error)
 	CommittedTip(context.Context, uint64) (publication.Point, error)
 }
 
@@ -140,7 +141,7 @@ func (handler *Handler) Reconcile(
 			errors.New("reconciliation encountered an unfinalized physical batch"),
 		)
 	}
-	tip, err := handler.committedTip(ctx)
+	tip, err := handler.physicalTip(ctx)
 	if err != nil {
 		return syncer.CommitOutcome{}, handler.failLocked(err)
 	}
@@ -268,7 +269,7 @@ func (handler *Handler) RollBackward(
 	}
 	if handler.rollbackSeen != nil &&
 		handler.rollbackSeen.targetWasPending {
-		durable, durableErr := handler.committedTip(ctx)
+		durable, durableErr := handler.physicalTip(ctx)
 		if durableErr != nil {
 			handler.failLocked(durableErr)
 			return handler.terminalOutcomeLocked(false)
@@ -589,14 +590,14 @@ func (handler *Handler) rollbackRequest(
 	}, nil
 }
 
-func (handler *Handler) committedTip(ctx context.Context) (publication.Point, error) {
-	snapshot, err := handler.state.CommittedSnapshot(ctx)
+func (handler *Handler) physicalTip(ctx context.Context) (publication.Point, error) {
+	snapshot, err := handler.state.RawCommittedSnapshot(ctx)
 	if err != nil {
-		return publication.Point{}, fmt.Errorf("read authoritative snapshot: %w", err)
+		return publication.Point{}, fmt.Errorf("read physical committed snapshot: %w", err)
 	}
 	tip, err := handler.state.CommittedTip(ctx, snapshot)
 	if err != nil {
-		return publication.Point{}, fmt.Errorf("read authoritative tip: %w", err)
+		return publication.Point{}, fmt.Errorf("read physical committed tip: %w", err)
 	}
 	return tip, nil
 }
