@@ -18,8 +18,8 @@ vary. Every result also reports raw MiB/second and fact rows/second.
 The current relay path keeps one N2N connection per relay. Its internal
 ChainSync driver uses gOuroboros's public mux, protocol, decoder, and message
 types without a dependency fork. It permits at most 100 outstanding
-`RequestNext` messages, writes initial and refill groups of at most 20, and at
-the fixed maximum refills from 80 to 100 after each 20 completed callbacks.
+`RequestNext` messages, writes one request at a time, and refills from 99 to
+100 after every completed callback.
 ChainSync ingress and the sequential BlockFetch worker run independently.
 
 In an actual two-relay run writing to ClickHouse, this path sustained about

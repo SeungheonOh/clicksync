@@ -70,9 +70,8 @@ A relay session:
 The ChainSync driver is implemented in `internal/relay/chainsync_client.go`
 using gOuroboros's public mux, protocol, decoder, and ChainSync message types.
 It is not a dependency fork. It permits at most 100 outstanding `RequestNext`
-messages. Initial and refill writes contain up to 20 requests; with the default
-window of 100, each 20 completed callbacks changes the outstanding count from
-100 to 80 and then refills it to 100.
+messages. Initial and refill writes contain one request; with the fixed window
+of 100, every completed callback refills the outstanding count from 99 to 100.
 
 ChainSync ingress and BlockFetch use independent workers on the shared N2N
 connection. A one-slot fetch FIFO keeps one range prepared while one range

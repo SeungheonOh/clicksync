@@ -127,11 +127,10 @@ Clicksync now owns a small ChainSync driver in
 gOuroboros fork or module-cache patch is involved. The driver has an exact
 hard maximum of 100 outstanding `RequestNext` messages.
 
-Initial and refill writes contain up to 20 requests. Every 20 completed
-callbacks lowers the outstanding count from 100 to 80,
-then one refill write restores it to 100. This preserves a sliding 100-request
-window while keeping wire writes bounded. ChainSync ingress and the BlockFetch
-loop are independent workers on the same muxed N2N connection.
+Initial and refill writes contain one request. Every completed callback
+briefly lowers the outstanding count from 100 to 99, then immediately restores
+it to 100. ChainSync ingress and the BlockFetch loop are independent workers
+on the same muxed N2N connection.
 
 Response liveness uses one ticker-backed watchdog per ChainSync client.
 Callbacks update its deadline without allocating, stopping, or creating a
@@ -196,7 +195,7 @@ one N2N TCP connection per relay
   +-- ChainSync mini-protocol
   |     - internal sliding RequestNext window
   |     - at most 100 outstanding
-  |     - initial/refill writes of at most 20 requests
+  |     - one request per initial/refill write
   |     |
   |     +-- ordered callbacks
   |           - convert point
@@ -240,11 +239,10 @@ an independent internal driver built from gOuroboros's public mux, protocol,
 decoder, and message APIs, rather than a fork of the dependency.
 
 The outstanding window is fixed at the protocol maximum of 100. Startup fills
-it with writes of at most 20 encoded `MsgRequestNext` messages. Each completed
-roll-forward or rollback callback earns one refill credit; every
-20 credits trigger one 20-request write, taking the window from 80 back to
-100. A capture from the optimized live run observed one such write about
-every 29-31 ms.
+it with single encoded `MsgRequestNext` writes. Each completed roll-forward or
+rollback callback immediately sends one replacement request, taking the
+window from 99 back to 100. The earlier batch-20 live run emitted one
+20-request refill write about every 29-31 ms.
 
 For a roll forward the callback:
 
@@ -477,8 +475,8 @@ Selection rule:
 Requirements:
 
 - Use the internal ChainSync driver with at most 100 outstanding
-  `RequestNext` messages and writes of at most 20.
-- Refill 20 requests after each 20 completed callbacks.
+  `RequestNext` messages and one request per write.
+- Refill one request after each completed callback.
 - ChainSync callbacks enqueue ordered header and rollback events only.
 - One range builder owns batching and rollback barriers.
 - One fetch loop owns the one BlockFetch client.

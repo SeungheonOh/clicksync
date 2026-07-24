@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	chainSyncRequestBatch   = 20
+	chainSyncRequestBatch   = 1
 	chainSyncMaxOutstanding = chainsync.MaxPipelineLimit
 )
 

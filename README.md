@@ -137,8 +137,8 @@ ChainSync uses the small internal driver in
 `internal/relay/chainsync_client.go`. It is built on gOuroboros's public mux,
 protocol, decoder, and message types; it does not fork gOuroboros. The
 outstanding `RequestNext` window is fixed at its hard maximum of 100. Initial
-and refill writes contain up to 20 requests; every 20 completed
-callbacks moves the window from 100 to 80 and refills it to 100.
+and refill writes contain one request. Every completed callback immediately
+refills the window from 99 to 100.
 
 ChainSync ingress and the sequential BlockFetch worker run independently on
 the same N2N connection. The configurable BlockFetch range remains independent
