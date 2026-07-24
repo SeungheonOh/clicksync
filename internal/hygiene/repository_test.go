@@ -248,7 +248,7 @@ func TestComposeStopGraceExceedsAggregateShutdownBudget(t *testing.T) {
 	}
 }
 
-func TestComposePublishesClickHousePortsAndAlonzoStart(t *testing.T) {
+func TestComposePublishesClickHousePortsAndConwayStart(t *testing.T) {
 	_, file, _, _ := runtime.Caller(0)
 	root := filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
 	compose, err := os.ReadFile(filepath.Join(root, "compose.yaml"))
@@ -259,7 +259,7 @@ func TestComposePublishesClickHousePortsAndAlonzoStart(t *testing.T) {
 	if !strings.Contains(string(compose), httpHostMapping) {
 		t.Fatalf("compose HTTP host mapping does not contain %s", httpHostMapping)
 	}
-	const nativeHostMapping = `"0.0.0.0:${CLICKHOUSE_NATIVE_PORT:-9000}:9000"`
+	const nativeHostMapping = `"0.0.0.0:${CLICKHOUSE_NATIVE_PORT:-19000}:9000"`
 	if !strings.Contains(string(compose), nativeHostMapping) {
 		t.Fatalf("compose native host mapping does not contain %s", nativeHostMapping)
 	}
@@ -276,12 +276,12 @@ func TestComposePublishesClickHousePortsAndAlonzoStart(t *testing.T) {
 	if !strings.Contains(string(example), "CLICKHOUSE_NATIVE_PORT=19000") {
 		t.Fatal("example must select the collision-free host native port 19000")
 	}
-	const alonzoPredecessor = "39916796:e72579ff89dc9ed325b723a33624b596c08141c7bd573ecfff56a1f7229e4d09"
-	if !strings.Contains(string(compose), alonzoPredecessor) {
-		t.Fatal("compose default must start at the Alonzo predecessor")
+	const conwayPredecessor = "133660799:e757d57eb8dc9500a61c60a39fadb63d9be6973ba96ae337fd24453d4d15c343"
+	if !strings.Contains(string(compose), conwayPredecessor) {
+		t.Fatal("compose default must start at the Conway predecessor")
 	}
-	if !strings.Contains(string(example), "CLICKSYNC_START_POINT="+alonzoPredecessor) {
-		t.Fatal("example must start at the Alonzo predecessor")
+	if !strings.Contains(string(example), "CLICKSYNC_START_POINT="+conwayPredecessor) {
+		t.Fatal("example must start at the Conway predecessor")
 	}
 }
 

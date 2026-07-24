@@ -12,7 +12,7 @@ services:
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
     ports:
       - "0.0.0.0:${CLICKHOUSE_HTTP_PORT:-18125}:8123"
-      - "0.0.0.0:${CLICKHOUSE_NATIVE_PORT:-9000}:9000"
+      - "0.0.0.0:${CLICKHOUSE_NATIVE_PORT:-19000}:9000"
     volumes:
       - clickhouse-data:/var/lib/clickhouse
       - clickhouse-logs:/var/log/clickhouse-server
@@ -59,7 +59,7 @@ services:
       CARDANO_PEERS: ${CARDANO_PEERS:-backbone.cardano.iog.io:3001|iog,backbone.mainnet.cardanofoundation.org:3001|cardano-foundation}
       CARDANO_CORROBORATION: ${CARDANO_CORROBORATION:-2}
       CLICKSYNC_START: ${CLICKSYNC_START:-intersection}
-      CLICKSYNC_START_POINT: ${CLICKSYNC_START_POINT:-39916796:e72579ff89dc9ed325b723a33624b596c08141c7bd573ecfff56a1f7229e4d09}
+      CLICKSYNC_START_POINT: ${CLICKSYNC_START_POINT:-133660799:e757d57eb8dc9500a61c60a39fadb63d9be6973ba96ae337fd24453d4d15c343}
       CLICKSYNC_QUEUE_CAPACITY: ${CLICKSYNC_QUEUE_CAPACITY:-4}
       CLICKSYNC_HEADER_BATCH_SIZE: ${CLICKSYNC_HEADER_BATCH_SIZE:-32}
       CLICKSYNC_LOCK_PATH: /var/lib/clicksync-state/writer.lock

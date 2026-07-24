@@ -1,6 +1,6 @@
 -- Returns the total lovelace in currently unspent effective-chain UTxOs
 -- represented by this dataset. When dataset_manifest.complete_history = false
--- (as in the current Alonzo-start run), this is not the complete mainnet UTxO total.
+-- (as in the current Conway-start run), this is not the complete mainnet UTxO total.
 WITH
     (
         SELECT argMax((effective_event_seq, complete_history), revision)
