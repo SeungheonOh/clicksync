@@ -133,6 +133,10 @@ then one refill write restores it to 100. This preserves a sliding 100-request
 window while keeping wire writes bounded. ChainSync ingress and the BlockFetch
 loop are independent workers on the same muxed N2N connection.
 
+Response liveness uses one ticker-backed watchdog per ChainSync client.
+Callbacks update its deadline without allocating, stopping, or creating a
+runtime timer for every header.
+
 ## 3. Correcting the 512 assumption
 
 `blockfetch.MaxRecvQueueSize == 512` is a gOuroboros receive-message queue
@@ -544,6 +548,16 @@ earlier roughly 100 blocks/second. It recorded no reconnects or mismatches. A
 packet capture showed a 20-request ChainSync refill write about every 29-31 ms.
 This result demonstrates the scheduling improvement on that run; it does not
 replace the fixed-span procedure when changing range defaults.
+
+The fixed-span range trial retained the 512-block default. Repeated 512 and
+2,048 runs over the same 32,768 blocks reversed relative order as public-relay
+conditions moved (425.48 then 519.90 blocks/second at 512; 481.07 then 410.30
+at 2,048). The decisive phase metric was overlap: 512 sometimes prepared the
+next range and kept the limiting BlockFetch worker near 91% duty, while 2,048
+never prepared the next range and one relay fell near 65% duty. An 8,000-block
+actual-relay canary fell near 184-208 blocks/second and caused a keepalive
+reconnect after exhausting its header backlog. Larger ranges are supported,
+but are not a throughput optimization on the measured single connection.
 
 ## 9. Test policy
 

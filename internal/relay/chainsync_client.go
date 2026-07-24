@@ -53,11 +53,10 @@ type chainSyncClient struct {
 	outstanding   int
 	refillCredits int
 
-	responseTimerMu         sync.Mutex
-	responseTimer           *time.Timer
-	responseTimerGeneration uint64
-	responseTimerSuspended  bool
-	stopped                 bool
+	responseWatchMu   sync.Mutex
+	responseDeadline  time.Time
+	responseSuspended bool
+	stopped           bool
 }
 
 func newChainSyncClient(
@@ -71,6 +70,8 @@ func newChainSyncClient(
 		return nil, errors.New("ChainSync roll-forward callback is required")
 	case config.RollBackwardFunc == nil:
 		return nil, errors.New("ChainSync rollback callback is required")
+	case config.BlockTimeout <= 0:
+		return nil, errors.New("ChainSync block timeout must be positive")
 	case config.PipelineLimit < 1 ||
 		config.PipelineLimit > chainSyncMaxOutstanding:
 		return nil, fmt.Errorf(
@@ -192,15 +193,17 @@ func (c *chainSyncClient) Sync(intersectPoints []pcommon.Point) error {
 		}
 		remaining -= count
 	}
-	c.armResponseTimer()
+	c.armResponseWatch()
+	go c.watchResponses()
 	return nil
 }
 
 func (c *chainSyncClient) Stop() {
-	c.responseTimerMu.Lock()
+	c.responseWatchMu.Lock()
 	c.stopped = true
-	c.pauseResponseTimerLocked()
-	c.responseTimerMu.Unlock()
+	c.responseSuspended = true
+	c.responseDeadline = time.Time{}
+	c.responseWatchMu.Unlock()
 	c.Protocol.Stop()
 }
 
@@ -256,10 +259,10 @@ func (c *chainSyncClient) handleMessage(message protocol.Message) error {
 			err: chainsync.ErrIntersectNotFound,
 		})
 	case *chainsync.MsgAwaitReply:
-		c.suspendResponseTimer()
+		c.suspendResponseWatch()
 		return nil
 	case *chainsync.MsgRollForwardNtN:
-		c.suspendResponseTimer()
+		c.suspendResponseWatch()
 		if err := c.completeRequest(); err != nil {
 			return err
 		}
@@ -285,10 +288,10 @@ func (c *chainSyncClient) handleMessage(message protocol.Message) error {
 		if err := c.completeCallback(); err != nil {
 			return err
 		}
-		c.resumeResponseTimer()
+		c.resumeResponseWatch()
 		return nil
 	case *chainsync.MsgRollBackward:
-		c.suspendResponseTimer()
+		c.suspendResponseWatch()
 		if err := c.completeRequest(); err != nil {
 			return err
 		}
@@ -302,7 +305,7 @@ func (c *chainSyncClient) handleMessage(message protocol.Message) error {
 		if err := c.completeCallback(); err != nil {
 			return err
 		}
-		c.resumeResponseTimer()
+		c.resumeResponseWatch()
 		return nil
 	default:
 		return fmt.Errorf("unexpected ChainSync message %T", message)
@@ -366,56 +369,65 @@ func (c *chainSyncClient) completeCallback() error {
 	return nil
 }
 
-func (c *chainSyncClient) suspendResponseTimer() {
-	c.responseTimerMu.Lock()
-	defer c.responseTimerMu.Unlock()
-	c.responseTimerSuspended = true
-	c.pauseResponseTimerLocked()
-}
-
-func (c *chainSyncClient) resumeResponseTimer() {
-	c.responseTimerMu.Lock()
-	c.responseTimerSuspended = false
-	c.responseTimerMu.Unlock()
-	c.armResponseTimer()
-}
-
-func (c *chainSyncClient) pauseResponseTimerLocked() {
-	c.responseTimerGeneration++
-	if c.responseTimer != nil {
-		c.responseTimer.Stop()
-		c.responseTimer = nil
-	}
-}
-
-func (c *chainSyncClient) armResponseTimer() {
-	c.outstandingMu.Lock()
-	hasOutstanding := c.outstanding > 0
-	c.outstandingMu.Unlock()
-	if !hasOutstanding {
+func (c *chainSyncClient) suspendResponseWatch() {
+	c.responseWatchMu.Lock()
+	defer c.responseWatchMu.Unlock()
+	if c.stopped {
 		return
 	}
+	c.responseSuspended = true
+	c.responseDeadline = time.Time{}
+}
 
-	c.responseTimerMu.Lock()
-	defer c.responseTimerMu.Unlock()
-	if c.stopped || c.responseTimerSuspended {
+func (c *chainSyncClient) resumeResponseWatch() {
+	c.responseWatchMu.Lock()
+	defer c.responseWatchMu.Unlock()
+	if c.stopped {
 		return
 	}
-	c.responseTimerGeneration++
-	generation := c.responseTimerGeneration
-	if c.responseTimer != nil {
-		c.responseTimer.Stop()
+	c.responseSuspended = false
+	c.responseDeadline = time.Now().Add(c.config.BlockTimeout)
+}
+
+func (c *chainSyncClient) armResponseWatch() {
+	c.responseWatchMu.Lock()
+	defer c.responseWatchMu.Unlock()
+	if c.stopped || c.responseSuspended {
+		return
 	}
-	c.responseTimer = time.AfterFunc(c.config.BlockTimeout, func() {
-		c.responseTimerMu.Lock()
-		if generation != c.responseTimerGeneration {
-			c.responseTimerMu.Unlock()
+	c.responseDeadline = time.Now().Add(c.config.BlockTimeout)
+}
+
+func (c *chainSyncClient) watchResponses() {
+	interval := min(
+		time.Second,
+		max(10*time.Millisecond, c.config.BlockTimeout/10),
+	)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case now := <-ticker.C:
+			c.responseWatchMu.Lock()
+			expired := !c.stopped &&
+				!c.responseSuspended &&
+				!c.responseDeadline.IsZero() &&
+				!now.Before(c.responseDeadline)
+			if expired {
+				c.stopped = true
+				c.responseDeadline = time.Time{}
+			}
+			c.responseWatchMu.Unlock()
+			if expired {
+				c.SendError(errors.New(
+					"ChainSync timed out waiting for a response",
+				))
+				return
+			}
+		case <-c.DoneChan():
 			return
 		}
-		c.responseTimer = nil
-		c.responseTimerMu.Unlock()
-		c.SendError(errors.New("ChainSync timed out waiting for a response"))
-	})
+	}
 }
 
 func (c *chainSyncClient) reserve(count int) error {

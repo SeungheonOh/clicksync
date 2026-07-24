@@ -118,6 +118,41 @@ optimized runs. It nevertheless verifies that ClickHouse publication stayed
 with relay intake and that the previous roughly 100-block/s scheduling ceiling
 was removed.
 
+## BlockFetch range trial
+
+Range candidates used the same build, pinned relay IPs, fresh disposable
+ClickHouse volumes, and historical mainnet point. Each measured the exact
+32,768-block span 11,416,385 through 11,449,152 after a 16,384-block warm-up.
+The span had the same 14.634 transactions and 137.695 selected facts per block
+in every run.
+
+| Run order | Range | Observed blocks/s | Inserted blocks/s | p95 observe-to-insert |
+|---:|---:|---:|---:|---:|
+| 1 | 512 | 425.48 | 426.37 | 1,098 ms |
+| 2 | 1,024 | 435.48 | 439.04 | 1,143 ms |
+| 3 | 2,048 | 481.07 | 488.24 | 1,047 ms |
+| 4 | 512 | 519.90 | 517.38 | 1,066 ms |
+| 5 | 2,048 | 410.30 | 415.50 | 1,055 ms |
+
+Every sample had 32,768 unique block numbers, hashes, publication IDs, and
+adoption events, with valid two-operator provenance, zero mismatches, and zero
+reconnects. The large reversal between adjacent runs demonstrates that public
+relay/path variation is materially larger than any measured range-size gain.
+ClickHouse latency remained stable and publication kept pace.
+
+The phase counters provide the selection signal: with a 512-block range, the
+next range was often prepared before the current stream ended and the limiting
+relay spent roughly 91% of wall time fetching bodies. With 2,048 blocks, no
+next range was ever prepared; one relay spent only about 65% of wall time
+fetching because it repeatedly waited for enough headers.
+
+A separate actual-relay canary successfully fetched complete 8,000-block
+ranges, confirming that 512 is not a protocol limit. It then exhausted the
+header backlog, waited seconds for each next range, fell to roughly 184-208
+blocks/second, and caused a keepalive timeout and reconnect. Larger batches
+therefore reduce overlap on this single connection rather than increasing
+wire throughput. The production default remains 512 blocks.
+
 ## Crash and query contract
 
 The tagged integration test passed against the disposable ClickHouse:
