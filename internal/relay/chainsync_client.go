@@ -40,6 +40,7 @@ type chainSyncClient struct {
 	muxer              *muxer.Muxer
 	config             chainsync.Config
 	callbackContext    chainsync.CallbackContext
+	awaitReply         func() error
 	requestNextPayload []byte
 
 	intersectMu     sync.Mutex
@@ -62,10 +63,13 @@ type chainSyncClient struct {
 func newChainSyncClient(
 	options protocol.ProtocolOptions,
 	config chainsync.Config,
+	awaitReply func() error,
 ) (*chainSyncClient, error) {
 	switch {
 	case options.Muxer == nil:
 		return nil, errors.New("ChainSync muxer is required")
+	case awaitReply == nil:
+		return nil, errors.New("ChainSync await-reply callback is required")
 	case config.RollForwardFunc == nil:
 		return nil, errors.New("ChainSync roll-forward callback is required")
 	case config.RollBackwardFunc == nil:
@@ -90,6 +94,7 @@ func newChainSyncClient(
 		muxer:              options.Muxer,
 		config:             config,
 		callbackContext:    chainsync.CallbackContext{ConnectionId: options.ConnectionId},
+		awaitReply:         awaitReply,
 		requestNextPayload: requestNextPayload,
 	}
 	client.Protocol = protocol.New(protocol.ProtocolConfig{
@@ -260,7 +265,7 @@ func (c *chainSyncClient) handleMessage(message protocol.Message) error {
 		})
 	case *chainsync.MsgAwaitReply:
 		c.suspendResponseWatch()
-		return nil
+		return c.awaitReply()
 	case *chainsync.MsgRollForwardNtN:
 		c.suspendResponseWatch()
 		if err := c.completeRequest(); err != nil {

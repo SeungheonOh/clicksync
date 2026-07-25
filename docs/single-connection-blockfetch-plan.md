@@ -207,7 +207,7 @@ one N2N TCP connection per relay
   |                         v
   |                 one range builder
   |                   - batch headers
-  |                   - flush at range size or tip
+  |                   - flush at range size or AwaitReply
   |                   - preserve rollback barriers
   |                         |
   |                         v
@@ -261,8 +261,8 @@ A single range-builder goroutine consumes the ChainSync FIFO. It is the sole
 owner of the mutable pending header slice. It:
 
 1. appends forward headers in callback order;
-2. detaches an immutable range when the configured size is reached or the
-   advertised tip arrives;
+2. detaches an immutable range when the configured size is reached or
+   ChainSync sends `AwaitReply`;
 3. flushes a partial range before a rollback;
 4. enqueues the rollback after that partial range; and
 5. continues batching post-rollback headers only after the barrier.
@@ -355,8 +355,11 @@ fails. Clicksync closes the connection and restarts from its durable
 intersection candidates. It does not guess, skip, or retry an ambiguous
 partial range.
 
-At the live tip, partial ranges are small, so normal shallow rollbacks do not
-wait behind an 8,192-block historical request.
+`AwaitReply` is the authoritative live-tip boundary. Roll-forward tip metadata
+can lag the delivered header, so point equality is not used as a flush signal.
+The first `AwaitReply` switches the range builder into caught-up mode. Every
+later header is flushed immediately instead of waiting for either another
+`AwaitReply` or the historical range size.
 
 ### 6.3 Failure and shutdown
 

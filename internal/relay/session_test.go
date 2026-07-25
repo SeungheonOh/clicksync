@@ -154,15 +154,17 @@ func TestSelectIntersectionNotFound(t *testing.T) {
 	}
 }
 
-func TestSingleRangeAtTipRetainsOnlySourceRaw(t *testing.T) {
+func TestCaughtUpSessionFlushesEachHeaderWithStaleTip(t *testing.T) {
 	for _, relayIndex := range []int{0, 1} {
 		t.Run(string(rune('0'+relayIndex)), func(t *testing.T) {
 			session := newTestSession(t, relayIndex, 4, 4, 1<<20)
 			raw := []byte{0x82, 0x01, byte(relayIndex)}
 			header := testHeader(4, 40)
+			expectedHeader := header
+			staleTip := testHeader(3, 30)
 			armSession(t, session, func(start, end pcommon.Point) error {
 				if !sameProtocolPoint(start, end) ||
-					!sameProtocolPoint(start, pointForHeader(header)) {
+					!sameProtocolPoint(start, pointForHeader(expectedHeader)) {
 					t.Fatalf("requested range %v..%v", start, end)
 				}
 				if err := session.onRawBlock(
@@ -179,8 +181,11 @@ func TestSingleRangeAtTipRetainsOnlySourceRaw(t *testing.T) {
 				chainsync.CallbackContext{},
 				4,
 				header,
-				tipForHeader(header),
+				tipForHeader(staleTip),
 			); err != nil {
+				t.Fatal(err)
+			}
+			if err := session.onAwaitReply(); err != nil {
 				t.Fatal(err)
 			}
 			event := nextEvent(t, session)
@@ -198,6 +203,21 @@ func TestSingleRangeAtTipRetainsOnlySourceRaw(t *testing.T) {
 				}
 			} else if event.RawCBOR != nil {
 				t.Fatalf("follower retained raw: %x", event.RawCBOR)
+			}
+
+			expectedHeader = testHeader(5, 50)
+			raw[0] = 0x82
+			if err := session.onRollForward(
+				chainsync.CallbackContext{},
+				4,
+				expectedHeader,
+				tipForHeader(header),
+			); err != nil {
+				t.Fatal(err)
+			}
+			if event := nextEvent(t, session); event.Point !=
+				modelPointForHeader(expectedHeader) {
+				t.Fatalf("post-tip event = %+v", event)
 			}
 		})
 	}
@@ -451,6 +471,9 @@ func TestRollbackFlushesPendingForwardsBeforeTarget(t *testing.T) {
 		resumed,
 		tipForHeader(resumed),
 	); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.onAwaitReply(); err != nil {
 		t.Fatal(err)
 	}
 	if event := nextEvent(t, session); event.Point != modelPointForHeader(first) {

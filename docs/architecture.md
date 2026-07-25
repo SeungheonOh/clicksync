@@ -60,8 +60,8 @@ A relay session:
 1. negotiates node-to-node with the configured network magic;
 2. finds one of the supplied durable intersection candidates;
 3. starts a bounded sliding ChainSync request window from that exact point;
-4. puts ordered headers and rollbacks on a bounded session FIFO;
-5. batches headers in one range-builder worker;
+4. puts ordered headers, `AwaitReply` barriers, and rollbacks on a bounded session FIFO;
+5. batches headers while catching up, then flushes each live-tip header immediately;
 6. requests ranges from one independent, sequential BlockFetch worker;
 7. streams raw blocks directly into the existing bounded output;
 8. computes a content digest without decoding or validating the block;

@@ -46,14 +46,14 @@ func (m *fetchMetrics) start(now time.Time) {
 }
 
 func (m *fetchMetrics) observeChainEvent(
-	kind EventKind,
+	kind chainEventKind,
 	wait time.Duration,
 	depth int,
 ) {
 	if m == nil {
 		return
 	}
-	if kind == Forward {
+	if kind == chainForward {
 		m.headers.Add(1)
 	}
 	m.chainEvents.Add(1)

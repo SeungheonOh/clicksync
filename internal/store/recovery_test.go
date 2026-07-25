@@ -213,6 +213,38 @@ func TestStateAtFreshDatasetStart(t *testing.T) {
 	}
 }
 
+func TestIntersectionCandidatesIncludeRollbackWindowBoundary(t *testing.T) {
+	t.Parallel()
+	const maximumDepth = 2160
+	state := State{
+		Dataset: DatasetIdentity{Start: Point{Origin: true}},
+		Canonical: make(
+			[]CanonicalBlock,
+			maximumDepth+1,
+		),
+	}
+	for index := range state.Canonical {
+		state.Canonical[index].Point = Point{
+			Slot:        uint64(maximumDepth - index + 1),
+			Hash:        testHash(byte(index + 1)),
+			BlockNumber: uint64(maximumDepth - index + 1),
+		}
+	}
+	state.Tip = state.Canonical[0].Point
+
+	candidates := intersectionCandidates(state)
+	if len(candidates) < 2 {
+		t.Fatalf("intersection candidates = %#v", candidates)
+	}
+	if got, want := candidates[len(candidates)-2],
+		state.Canonical[maximumDepth].Point; got != want {
+		t.Fatalf("oldest rollback candidate = %#v, want %#v", got, want)
+	}
+	if !candidates[len(candidates)-1].Origin {
+		t.Fatalf("last intersection candidate = %#v, want origin", candidates[len(candidates)-1])
+	}
+}
+
 func TestInspectIsReadOnlyAndDoesNotRequireInitialization(t *testing.T) {
 	t.Parallel()
 	emptyConnection := newFakeConnection()

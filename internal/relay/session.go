@@ -36,11 +36,18 @@ type expectedHeader struct {
 	blockType uint
 }
 
+type chainEventKind uint8
+
+const (
+	chainForward chainEventKind = iota + 1
+	chainRollback
+	chainAwaitReply
+)
+
 type chainEvent struct {
-	kind       EventKind
+	kind       chainEventKind
 	header     expectedHeader
 	rollback   Event
-	atTip      bool
 	observedAt time.Time
 }
 
@@ -221,7 +228,7 @@ func (s *Session) Run(ctx context.Context, candidates []model.Point) (retErr err
 		ErrorChan:    chainSyncErrors,
 		Mode:         protocol.ProtocolModeNodeToNode,
 		Role:         protocol.ProtocolRoleClient,
-	}, chainConfig)
+	}, chainConfig, s.onAwaitReply)
 	if err != nil {
 		return wrapFailure("initialize ChainSync", s.config.Host, err)
 	}
@@ -500,13 +507,12 @@ func (s *Session) onRollForward(
 	}
 
 	event := chainEvent{
-		kind: Forward,
+		kind: chainForward,
 		header: expectedHeader{
 			point:     point,
 			tip:       tipPoint,
 			blockType: blockType,
 		},
-		atTip:      sameModelProtocolPoint(point, tip.Point),
 		observedAt: time.Now().UTC(),
 	}
 	if err := s.enqueueChainEvent(event); err != nil {
@@ -538,7 +544,7 @@ func (s *Session) onRollBackward(
 	}
 	observedAt := time.Now().UTC()
 	event := chainEvent{
-		kind:       Rollback,
+		kind:       chainRollback,
 		observedAt: observedAt,
 		rollback: Event{
 			Kind:       Rollback,
@@ -549,6 +555,15 @@ func (s *Session) onRollBackward(
 		},
 	}
 	if err := s.enqueueChainEvent(event); err != nil {
+		return s.callbackError(err)
+	}
+	return nil
+}
+
+func (s *Session) onAwaitReply() error {
+	if err := s.enqueueChainEvent(chainEvent{
+		kind: chainAwaitReply,
+	}); err != nil {
 		return s.callbackError(err)
 	}
 	return nil
@@ -580,9 +595,8 @@ func (s *Session) enqueueChainEvent(event chainEvent) error {
 	}
 }
 
-// runRangeBuilder is the sole owner of the pending header batch. The input
-// FIFO preserves ChainSync order; the output FIFO makes a rollback a strict
-// barrier between all ranges before and after it.
+// runRangeBuilder batches catch-up headers, then emits one-block ranges after
+// AwaitReply. The FIFOs keep rollbacks ordered between surrounding ranges.
 func (s *Session) runRangeBuilder(ctx context.Context) error {
 	if ctx == nil {
 		return protocolFailure(
@@ -597,6 +611,7 @@ func (s *Session) runRangeBuilder(ctx context.Context) error {
 		s.config.BlockFetchRangeBlocks,
 	)
 	var headerStarted time.Time
+	var caughtUp bool
 	flush := func() error {
 		if len(pending) == 0 {
 			return nil
@@ -626,19 +641,24 @@ func (s *Session) runRangeBuilder(ctx context.Context) error {
 		case event = <-s.chainEvents:
 		}
 		switch event.kind {
-		case Forward:
+		case chainForward:
 			if len(pending) == 0 {
 				headerStarted = event.observedAt
 			}
 			pending = append(pending, event.header)
 			s.fetchMetrics.observePending(len(pending))
-			if len(pending) >= s.config.BlockFetchRangeBlocks ||
-				event.atTip {
+			if caughtUp ||
+				len(pending) >= s.config.BlockFetchRangeBlocks {
 				if err := flush(); err != nil {
 					return err
 				}
 			}
-		case Rollback:
+		case chainAwaitReply:
+			caughtUp = true
+			if err := flush(); err != nil {
+				return err
+			}
+		case chainRollback:
 			if err := flush(); err != nil {
 				return err
 			}
@@ -1127,10 +1147,4 @@ func toProtocolPoint(point model.Point) pcommon.Point {
 
 func sameProtocolPoint(left, right pcommon.Point) bool {
 	return left.Slot == right.Slot && bytes.Equal(left.Hash, right.Hash)
-}
-
-func sameModelProtocolPoint(left model.Point, right pcommon.Point) bool {
-	return !left.Origin &&
-		left.Slot == right.Slot &&
-		bytes.Equal(left.Hash[:], right.Hash)
 }

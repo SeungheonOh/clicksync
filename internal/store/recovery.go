@@ -465,6 +465,11 @@ func intersectionCandidates(state State) []Point {
 	if len(candidates) == 0 && state.Tip != state.Dataset.Start {
 		appendPoint(state.Tip)
 	}
+	// Keep the configured rollback boundary intersectable even when it falls
+	// between the geometric samples.
+	if len(state.Canonical) > 0 {
+		appendPoint(state.Canonical[len(state.Canonical)-1].Point)
+	}
 	appendPoint(state.Dataset.Start)
 	return candidates
 }
